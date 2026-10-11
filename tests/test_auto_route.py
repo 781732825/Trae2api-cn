@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -175,6 +176,64 @@ class AutoRouteSettingsTests(unittest.TestCase):
         self.assertIn('id="auto-route-toggle"', html)
         self.assertIn("saveAutoRoute()", html)
         self.assertIn('value="auto-route"', html)
+
+    def _console_html(self, enabled: bool) -> str:
+        with (
+            patch.object(
+                auth,
+                "get_auto_route_settings",
+                side_effect=lambda: {"enabled": enabled, "source": "console"},
+            ),
+            patch.dict(os.environ, {"RELAY_API_KEYS": ""}, clear=False),
+        ):
+            client = TestClient(main_module.app)
+            return client.get("/web/login").text
+
+    def test_console_renders_endpoint_lock_contract(self):
+        """The settings panel must expose the lock hooks the JS drives."""
+
+        html = self._console_html(True)
+        # Every element ``applyEndpointLock`` toggles must exist, otherwise the
+        # lock silently no-ops and the form keeps accepting a dead selection.
+        for marker in (
+            'id="endpoint-fields"',
+            'id="endpoint-lock-note"',
+            'id="endpoint-lock-state"',
+            'id="settings-endpoint-preset"',
+            'id="settings-web"',
+            'id="settings-model-base"',
+        ):
+            self.assertIn(marker, html)
+        self.assertIn("function applyEndpointLock(enabled)", html)
+        self.assertIn("applyEndpointLock(true)", html)
+        self.assertIn("applyEndpointLock(d.enabled)", html)
+        # The lock must be visible before the first paint, not only after a save.
+        self.assertIn('class="state-pill lock"', html)
+
+    def test_console_endpoint_lock_follows_auto_route_state(self):
+        on_html = self._console_html(True)
+        off_html = self._console_html(False)
+        self.assertIn("applyEndpointLock(true)", on_html)
+        self.assertIn("applyEndpointLock(false)", off_html)
+        self.assertIn("自动路由已接管", on_html)
+        self.assertIn("手动选择", off_html)
+        self.assertIn('id="endpoint-fields" class="endpoint-locked"', on_html)
+        self.assertIn('id="endpoint-fields" class=""', off_html)
+        # The persisted enabled state must be non-interactive on the first
+        # response, before the browser runs applyEndpointLock().
+        for element_id in (
+            "settings-endpoint-preset",
+            "settings-web",
+            "settings-model-base",
+        ):
+            self.assertRegex(
+                on_html,
+                rf'<(?:select|input)[^>]*id="{element_id}"[^>]*\sdisabled(?:\s|=|>)',
+            )
+            self.assertNotRegex(
+                off_html,
+                rf'<(?:select|input)[^>]*id="{element_id}"[^>]*(?<!aria-)\sdisabled(?:\s|=|>)',
+            )
 
 
 if __name__ == "__main__":

@@ -933,6 +933,9 @@ _LUCIDE_ICONS = {
     'sigma': '<path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2"/>',
     'calendar': '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>',
     'server': '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>',
+    'lock': '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    'unlock': '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>',
+    'route': '<circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/>',
 }
 
 
@@ -1137,6 +1140,8 @@ a { color: var(--accent); }
 .state-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--line-strong); }
 .state-pill.on { color: var(--ok); background: var(--ok-soft); border-color: var(--ok-line); }
 .state-pill.on::before { background: var(--ok); box-shadow: 0 0 0 3px var(--ring); }
+.state-pill.lock { color: var(--warn); background: var(--warn-soft); border-color: var(--warn-line); }
+.state-pill.lock::before { background: var(--warn); }
 
 /* Overview stats */
 .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -1204,6 +1209,23 @@ a { color: var(--accent); }
 .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
 .field-note { font-size: 12px; color: var(--faint); margin-top: 6px; }
 .required { color: var(--danger); }
+
+/* Auto-route lock: while auto routing is on the manual endpoint fields are
+   read-only, so the effective upstream cannot contradict the switch. */
+.endpoint-locked { position: relative; }
+.endpoint-locked .form-group > label { color: var(--faint); }
+.form-group input:disabled, .form-group select:disabled, .form-group textarea:disabled {
+  background: var(--surface-2); color: var(--faint); border-color: var(--line);
+  cursor: not-allowed; opacity: .72; -webkit-text-fill-color: var(--faint);
+}
+.endpoint-locked .form-group input:disabled, .endpoint-locked .form-group select:disabled { border-style: dashed; }
+.lock-note {
+  display: flex; align-items: flex-start; gap: 8px; margin: 2px 0 12px;
+  padding: 10px 12px; border: 1px dashed var(--warn-line); border-radius: var(--radius-sm);
+  background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 1.5;
+}
+.lock-note svg { width: 15px; height: 15px; margin-top: 1px; }
+.lock-note strong { font-weight: 650; }
 
 /* Switch */
 .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 0; }
@@ -1740,6 +1762,18 @@ def _web_login_html() -> str:
     max_state_text = '已开启' if max_settings.get('enabled') else '已关闭'
     auto_route_checked = 'checked' if auto_route_on else ''
     auto_route_state_text = '已开启' if auto_route_on else '已关闭'
+    # While auto routing is enabled the dispatcher ignores the manual endpoint
+    # selection, so the settings form renders those fields read-only instead of
+    # letting the console show a channel that will never be used.
+    endpoint_lock_pill = ' lock' if auto_route_on else ''
+    endpoint_lock_text = '自动路由已接管' if auto_route_on else '手动选择'
+    endpoint_fields_class = 'endpoint-locked' if auto_route_on else ''
+    # Render the disabled state on the first response as well as in
+    # ``applyEndpointLock``.  This prevents a brief interactive window before
+    # the browser evaluates the settings script after a refresh.
+    endpoint_disabled_attr = (
+        ' disabled aria-disabled="true"' if auto_route_on else ' aria-disabled="false"'
+    )
     auto_checkin = auth.get_auto_checkin_settings()
     auto_checkin_checked = 'checked' if auto_checkin.get('enabled') else ''
     auto_checkin_time = html_mod.escape(auto_checkin.get('time') or '08:30')
@@ -2002,26 +2036,35 @@ def _web_login_html() -> str:
   <div id="poll-msg" class="msg" role="status" aria-live="polite"></div>
 </div>
 <div class="panel-card">
-  <div class="section-head"><div class="section-title">上游端点</div></div>
+  <div class="section-head">
+    <div class="section-title">上游端点</div>
+    <span id="endpoint-lock-state" class="state-pill{endpoint_lock_pill}">{endpoint_lock_text}</span>
+  </div>
+  <div id="endpoint-lock-note" class="lock-note" hidden>
+    {ic['lock']}
+    <div><strong>自动路由已开启，手动端点选择已锁定。</strong>当前由自动路由决定实际通道：带工具调用走 IDE Agent，纯聊天走 Remote，失败保底回落 Remote。如需手动指定端点，请先在下方关闭自动路由。</div>
+  </div>
+  <div id="endpoint-fields" class="{endpoint_fields_class}">
   <div class="form-group">
     <label for="settings-endpoint-preset">预设端点</label>
-    <select id="settings-endpoint-preset" onchange="applyEndpointPreset()">
+    <select id="settings-endpoint-preset"{endpoint_disabled_attr} onchange="applyEndpointPreset()">
       {endpoint_options_html}
     </select>
   </div>
   <div class="form-row">
     <div class="form-group">
       <label for="settings-web">自定义 Web Base URL</label>
-    <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1" oninput="markEndpointDirty()">
+    <input id="settings-web" class="mono-input" value="{html_mod.escape(settings_web)}" placeholder="https://trae-api-cn.mchost.guru/api/remote/v1"{endpoint_disabled_attr} oninput="markEndpointDirty()">
     </div>
   </div>
   <div class="form-row">
     <div class="form-group">
       <label for="settings-model-base">模型网关地址（IDE Agent / Solo）</label>
-    <input id="settings-model-base" class="mono-input" value="{html_mod.escape(settings_model_base)}" placeholder="https://trae-api-cn.mchost.guru" oninput="markEndpointDirty()">
+    <input id="settings-model-base" class="mono-input" value="{html_mod.escape(settings_model_base)}" placeholder="https://trae-api-cn.mchost.guru"{endpoint_disabled_attr} oninput="markEndpointDirty()">
     </div>
   </div>
   <p class="field-note" id="settings-endpoint-preview"></p>
+  </div>
   <div class="btn-group">
     <button class="btn btn-primary btn-sm" id="settings-save-btn" onclick="saveSettings()" disabled>{ic['save']}保存设置</button>
   </div>
@@ -3313,7 +3356,40 @@ function markRelayServiceDirty(){{
 function markAutoRouteDirty(){{
   var button=document.getElementById('auto-route-save-btn');
   if(button) button.disabled=false;
+  // Mirror the switch immediately: the endpoint panel must gray out as soon as
+  // auto routing is turned on, before the save round-trip completes.
+  var toggle=document.getElementById('auto-route-toggle');
+  applyEndpointLock(toggle&&toggle.checked);
   showMsg('auto-route-msg','自动路由设置已修改，点击“保存自动路由”后生效',true,0);
+}}
+// Auto routing owns the endpoint choice while it is on: the dispatcher ignores
+// the preset, so the form is locked instead of accepting a value that would
+// never be used.  Applied from server-rendered state on load, mirrored on every
+// switch change, and re-applied after each save so the two panels can never
+// disagree about which channel is actually in use.
+function applyEndpointLock(enabled){{
+  enabled=!!enabled;
+  var fields=document.getElementById('endpoint-fields');
+  var note=document.getElementById('endpoint-lock-note');
+  var pill=document.getElementById('endpoint-lock-state');
+  if(fields) fields.classList.toggle('endpoint-locked',enabled);
+  ['settings-endpoint-preset','settings-web','settings-model-base'].forEach(function(id){{
+    var el=document.getElementById(id);
+    if(!el) return;
+    el.disabled=enabled;
+    el.setAttribute('aria-disabled',enabled?'true':'false');
+    el.title=enabled?'自动路由开启时由路由自动决定端点':'';
+  }});
+  if(note) note.hidden=!enabled;
+  if(pill){{
+    pill.textContent=enabled?'自动路由已接管':'手动选择';
+    pill.classList.toggle('lock',enabled);
+  }}
+  var saveButton=document.getElementById('settings-save-btn');
+  // Keep endpoint drafts intact while the form is locked.  If the user turns
+  // auto routing back off without reloading, the explicit endpoint Save button
+  // must become available again instead of silently losing the draft.
+  if(saveButton) saveButton.disabled=enabled || !endpointDirty;
 }}
 async function saveAutoRoute(){{
   var toggle=document.getElementById('auto-route-toggle');
@@ -3323,7 +3399,8 @@ async function saveAutoRoute(){{
     var button=document.getElementById('auto-route-save-btn');
     if(button) button.disabled=true;
     setStatePill('auto-route-state',d.enabled?'已开启':'已关闭',d.enabled);
-    showMsg('auto-route-msg',d.enabled?'自动路由已开启，下一个请求生效':'自动路由已关闭，使用预设端点',true,3000);
+    applyEndpointLock(d.enabled);
+    showMsg('auto-route-msg',d.enabled?'自动路由已开启，上游端点选择已锁定':'自动路由已关闭，可手动选择上游端点',true,3000);
   }} else {{
     showMsg('auto-route-msg',d.error||'保存失败',false);
   }}
@@ -3387,6 +3464,10 @@ async function detectMaxModels(){{
 const ENDPOINT_PRESET_MAP = {endpoint_map_json};
 endpointLastGoodState=readEndpointSelection();
 renderEndpointPreview(endpointLastGoodState);
+// Server-rendered auto-route state decides whether the manual endpoint form
+// starts locked; the DOM attributes are applied here so both panels agree on
+// first paint.
+applyEndpointLock({str(auto_route_on).lower()});
 function applyEndpointPreset(){{
   var selector=document.getElementById('settings-endpoint-preset');
   var input=document.getElementById('settings-web');
