@@ -929,6 +929,17 @@ def build_web_headers(
 REMOTE_BASE_DEFAULT = "https://trae-api-cn.mchost.guru/api/remote/v1"
 
 
+def _is_trae_remote_host(hostname: Optional[str]) -> bool:
+    host = str(hostname or "").strip().lower().rstrip(".")
+    return (
+        host == "mchost.guru"
+        or host.endswith(".mchost.guru")
+        or host == "core-normal.trae.cn"
+        or host == "trae.ai"
+        or host.endswith(".trae.ai")
+    )
+
+
 def remote_base_url() -> str:
     """Return the Web/Remote base, repairing a host-only legacy value.
 
@@ -938,18 +949,25 @@ def remote_base_url() -> str:
     the canonical path for known Trae hosts and preserve custom gateways.
     """
 
-    value = str(os.environ.get("TRAE_WEB_BASE_URL") or REMOTE_BASE_DEFAULT).strip().rstrip("/")
+    value = str(os.environ.get("TRAE_WEB_BASE_URL") or REMOTE_BASE_DEFAULT).strip()
     if not value:
         return REMOTE_BASE_DEFAULT
-    lowered = value.lower()
-    if "/api/remote/" in lowered:
-        return value
-    if any(
-        host in lowered
-        for host in ("mchost.guru", "core-normal.trae.cn", "trae.ai")
-    ):
-        return value + "/api/remote/v1"
-    return value
+    try:
+        parsed = urlsplit(value)
+        path = (parsed.path or "").rstrip("/")
+    except ValueError:
+        return value.rstrip("/")
+    if path.startswith("/api/remote/") or not _is_trae_remote_host(parsed.hostname):
+        return value.rstrip("/")
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            path + "/api/remote/v1",
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 def web_origin() -> str:

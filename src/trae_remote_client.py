@@ -17,6 +17,7 @@ import os
 import re
 import uuid
 from typing import Any, AsyncIterator, Mapping, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -110,14 +111,24 @@ def _normalize_remote_base(value: str) -> str:
     value = str(value or "").strip().rstrip("/")
     if not value:
         return DEFAULT_BASE_URL
-    lowered = value.lower()
-    if "/api/remote/" in lowered:
+    try:
+        parsed = urlsplit(value)
+        path = (parsed.path or "").rstrip("/")
+    except ValueError:
         return value
-    if any(host in lowered for host in ("trae-api-cn.mchost.guru", "core-normal.trae.cn", "mchost.guru")):
-        return value + "/api/remote/v1"
-    if "trae.ai" in lowered:
-        return value + "/api/remote/v1"
-    return value
+    if path.startswith("/api/remote/") or not trae_client._is_trae_remote_host(
+        parsed.hostname
+    ):
+        return value
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            path + "/api/remote/v1",
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 def _provider_specific(options: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:

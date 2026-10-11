@@ -1837,6 +1837,18 @@ class RemoteClientTests(unittest.TestCase):
             trae_remote_client._normalize_remote_base("https://custom.example/v1"),
             "https://custom.example/v1",
         )
+        self.assertEqual(
+            trae_remote_client._normalize_remote_base(
+                "https://custom.example/proxy/trae.ai"
+            ),
+            "https://custom.example/proxy/trae.ai",
+        )
+        self.assertEqual(
+            trae_remote_client._normalize_remote_base(
+                "https://custom.example/v1?next=trae.ai"
+            ),
+            "https://custom.example/v1?next=trae.ai",
+        )
 
     def test_base_url_normalizes_a_legacy_bare_gateway_override(self):
         """``base_url()`` must repair a stale bare-domain option, not just env."""

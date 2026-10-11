@@ -138,9 +138,13 @@ def _restore_persisted_relay_settings() -> dict:
     if web_base:
         WEB_BASE = web_base
         os.environ["TRAE_WEB_BASE_URL"] = web_base
+    # Preserve an explicitly persisted custom gateway.  The preset value is
+    # only a migration fallback for stores written before model_base_url was
+    # introduced; preferring it would silently discard a custom gateway on
+    # every restart.
     model_base = str(
-        (endpoint or {}).get("model_base_url")
-        or settings.get("model_base_url")
+        settings.get("model_base_url")
+        or (endpoint or {}).get("model_base_url")
         or ""
     ).strip().rstrip("/")
     if model_base:
@@ -152,18 +156,14 @@ def _restore_persisted_relay_settings() -> dict:
         or str(settings.get("web_base_url") or "").strip().rstrip("/")
         != str(endpoint["base_url"]).rstrip("/")
         or str(settings.get("model_base_url") or "").strip().rstrip("/")
-        != str(endpoint.get("model_base_url") or "").rstrip("/")
+        != model_base
     ):
         try:
             auth.set_relay_settings(
                 web_base_url=str(endpoint["base_url"]),
                 upstream_mode=str(endpoint["mode"]),
                 endpoint_id=str(endpoint["id"]),
-                model_base_url=str(
-                    endpoint.get("model_base_url")
-                    or settings.get("model_base_url")
-                    or ""
-                ),
+                model_base_url=model_base,
             )
             # ``auth.set_relay_settings`` persists the canonical values, but
             # an older/custom store adapter may return a stale snapshot from
@@ -176,11 +176,7 @@ def _restore_persisted_relay_settings() -> dict:
                     "web_base_url": str(endpoint["base_url"]).rstrip("/"),
                     "upstream_mode": str(endpoint["mode"]).strip().lower(),
                     "endpoint_id": str(endpoint["id"]).strip().lower(),
-                    "model_base_url": str(
-                        endpoint.get("model_base_url")
-                        or settings.get("model_base_url")
-                        or ""
-                    ).rstrip("/"),
+                    "model_base_url": model_base,
                 }
             )
         except Exception:
@@ -10493,6 +10489,18 @@ async def api_settings(request: Request):
         # subsequent fallback keeps the ``/api/remote/v1`` prefix.
         if web_base_url == legacy_gateway:
             web_base_url = preset_web_base
+    elif endpoint_id == "":
+        # The custom entry represents a caller-supplied Web/Remote base.  Do
+        # not leave the previously selected IDE/Work mode active when the UI
+        # submits an empty preset id; that would make the preview and dispatch
+        # disagree after the next refresh or restart.
+        if not web_base_url:
+            return JSONResponse(
+                {"success": False, "error": "自定义端点需要 web_base_url"},
+                status_code=400,
+            )
+        upstream_mode = "remote"
+        model_base_url = explicit_model_base_url or ""
     elif explicit_model_base_url is not None:
         # No preset identity: the caller manages the model gateway directly.
         model_base_url = explicit_model_base_url

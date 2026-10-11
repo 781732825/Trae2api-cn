@@ -1160,6 +1160,12 @@ class IdeRequestContextTests(unittest.TestCase):
             self.assertEqual(
                 trae_client.remote_base_url(), "https://custom.example/v1"
             )
+        for value in (
+            "https://custom.example/proxy/trae.ai",
+            "https://custom.example/v1?next=trae.ai",
+        ):
+            with patch.dict("os.environ", {"TRAE_WEB_BASE_URL": value}, clear=False):
+                self.assertEqual(trae_client.remote_base_url(), value)
 
     def test_remote_base_url_defaults_when_unset(self):
         with patch.dict("os.environ", {"TRAE_WEB_BASE_URL": ""}, clear=False):

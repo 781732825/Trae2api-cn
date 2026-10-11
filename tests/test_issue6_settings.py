@@ -302,6 +302,30 @@ class Issue6SettingsTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(saved["endpoint_id"], "")
+
+                # The current UI sends an empty endpoint_id for the custom
+                # entry.  It must explicitly select Remote rather than leave
+                # the previously selected IDE tier active.
+                saved.update(
+                    {
+                        "web_base_url": "https://custom.example/v1",
+                        "upstream_mode": "ide",
+                        "endpoint_id": "ide",
+                    }
+                )
+                response = client.post(
+                    "/api/settings",
+                    json={
+                        "web_base_url": "https://custom.example/v1",
+                        "model_base_url": "",
+                        "upstream_mode": "",
+                        "endpoint_id": "",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(saved["endpoint_id"], "")
+                self.assertEqual(saved["upstream_mode"], "remote")
+                self.assertEqual(saved["model_base_url"], "")
         finally:
             main_module.UPSTREAM_MODE = old_mode
 
@@ -795,6 +819,60 @@ class Issue6SettingsTests(unittest.TestCase):
                 os.environ.pop("TRAE_WEB_BASE_URL", None)
             else:
                 os.environ["TRAE_WEB_BASE_URL"] = old_base
+
+    def test_startup_preserves_custom_model_gateway(self):
+        """A custom IDE/Solo gateway must survive endpoint restoration."""
+
+        original_mode = main_module.UPSTREAM_MODE
+        original_base = main_module.WEB_BASE
+        old_mode = os.environ.get("UPSTREAM_MODE")
+        old_base = os.environ.get("TRAE_WEB_BASE_URL")
+        old_model_base = os.environ.get("TRAE_MODEL_API_HOST")
+        persisted = {
+            "endpoint_id": "ide",
+            "upstream_mode": "ide",
+            "web_base_url": "https://trae-api-cn.mchost.guru/api/remote/v1",
+            "model_base_url": "https://custom-model.example",
+        }
+
+        try:
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_settings",
+                    return_value=dict(persisted),
+                ),
+                patch.object(main_module.auth, "set_relay_settings") as save,
+                patch.object(main_module, "UPSTREAM_MODE", "remote"),
+                patch.object(
+                    main_module,
+                    "WEB_BASE",
+                    "https://old.example",
+                ),
+            ):
+                settings = main_module._restore_persisted_relay_settings()
+
+            self.assertEqual(settings["model_base_url"], "https://custom-model.example")
+            self.assertEqual(
+                os.environ["TRAE_MODEL_API_HOST"],
+                "https://custom-model.example",
+            )
+            save.assert_not_called()
+        finally:
+            main_module.UPSTREAM_MODE = original_mode
+            main_module.WEB_BASE = original_base
+            if old_mode is None:
+                os.environ.pop("UPSTREAM_MODE", None)
+            else:
+                os.environ["UPSTREAM_MODE"] = old_mode
+            if old_base is None:
+                os.environ.pop("TRAE_WEB_BASE_URL", None)
+            else:
+                os.environ["TRAE_WEB_BASE_URL"] = old_base
+            if old_model_base is None:
+                os.environ.pop("TRAE_MODEL_API_HOST", None)
+            else:
+                os.environ["TRAE_MODEL_API_HOST"] = old_model_base
 
     def test_relay_env_update_is_partial_and_keeps_other_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
