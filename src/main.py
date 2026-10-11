@@ -142,13 +142,19 @@ def _restore_persisted_relay_settings() -> dict:
     # only a migration fallback for stores written before model_base_url was
     # introduced; preferring it would silently discard a custom gateway on
     # every restart.
+    persisted_model_base = settings.get("model_base_url")
     model_base = str(
-        settings.get("model_base_url")
-        or (endpoint or {}).get("model_base_url")
+        (
+            persisted_model_base
+            if persisted_model_base is not None
+            else (endpoint or {}).get("model_base_url")
+        )
         or ""
     ).strip().rstrip("/")
     if model_base:
         os.environ["TRAE_MODEL_API_HOST"] = model_base
+    else:
+        os.environ.pop("TRAE_MODEL_API_HOST", None)
     # Repair partially migrated stores once at startup.  This also makes the
     # settings API/UI observe the same canonical mode and URL as dispatch.
     if endpoint is not None and (

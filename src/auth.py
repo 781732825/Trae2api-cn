@@ -1320,7 +1320,13 @@ def get_settings() -> dict:
             # separately from the Web/Remote base URL.  Keeping them apart
             # prevents an IDE/SOLO preset selection from stripping the
             # ``/api/remote/v1`` path that the Remote transport requires.
-            'model_base_url': _settings.get('model_base_url', ''),
+            # ``None`` means this key predates the split; an empty string is an
+            # explicit request to clear a previously configured gateway.
+            'model_base_url': (
+                _settings.get('model_base_url')
+                if 'model_base_url' in _settings
+                else None
+            ),
             'upstream_mode': _settings.get('upstream_mode', ''),
             # ``web_base_url`` is shared by the IDE Raw/IDE Agent pair and by
             # Remote/Work Agent.  Keep the selected preset id separately so a
