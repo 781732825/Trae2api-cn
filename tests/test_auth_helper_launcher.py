@@ -15,17 +15,18 @@ from src import auth_helper
 
 @pytest.mark.parametrize("kind", ["bat", "sh"])
 @pytest.mark.parametrize(
-    "download_succeeds,existing_helper,replace_fails",
+    "download_succeeds,existing_helper,replace_fails,target_is_directory",
     [
-        (True, False, False),
-        (True, True, False),
-        (False, False, False),
-        (False, True, False),
-        (True, True, True),
+        (True, False, False, False),
+        (True, True, False, False),
+        (False, False, False, False),
+        (False, True, False, False),
+        (True, True, True, False),
+        (True, True, False, True),
     ],
 )
 def test_launcher_refreshes_next_to_itself_and_handles_partial_failure(
-    tmp_path, kind, download_succeeds, existing_helper, replace_fails
+    tmp_path, kind, download_succeeds, existing_helper, replace_fails, target_is_directory
 ):
     if kind == "bat" and os.name != "nt":
         pytest.skip("Windows batch launcher")
@@ -68,7 +69,10 @@ def test_launcher_refreshes_next_to_itself_and_handles_partial_failure(
         launcher = download_dir / f"start_auth.{kind}"
         helper = download_dir / "web_login.py"
         old_helper_source = b"print('STALE_HELPER_EXECUTED')\n"
-        if existing_helper:
+        if target_is_directory:
+            helper.mkdir()
+            (helper / "__main__.py").write_bytes(old_helper_source)
+        elif existing_helper:
             helper.write_bytes(old_helper_source)
         environment = os.environ.copy()
         if replace_fails:
@@ -99,11 +103,15 @@ def test_launcher_refreshes_next_to_itself_and_handles_partial_failure(
             errors="replace",
             timeout=15,
         )
-        assert requested == ["/web/login/download?as=py"]
+        assert requested == ([] if target_is_directory else ["/web/login/download?as=py"])
         assert not list(download_dir.glob("*.download*"))
         assert not (unrelated_dir / "web_login.py").exists()
         assert "STALE_HELPER_EXECUTED" not in result.stdout
-        if download_succeeds and not replace_fails:
+        if target_is_directory:
+            assert result.returncode != 0
+            assert "LAUNCH_RESULT=" not in result.stdout
+            assert (helper / "__main__.py").read_bytes() == old_helper_source
+        elif download_succeeds and not replace_fails:
             assert result.returncode == 0, result.stdout + result.stderr
             output = next(line for line in result.stdout.splitlines() if line.startswith("LAUNCH_RESULT="))
             assert json.loads(output.split("=", 1)[1]) == [

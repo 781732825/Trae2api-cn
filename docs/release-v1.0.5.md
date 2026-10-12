@@ -14,6 +14,7 @@ Python 模板；控制台点击下载后按当前部署生成 IP、外部端口�
 - 授权前检查本机助手目标，绑定其他部署时提示重新下载，不能由网页任意改写。
 - 下载目标必须匹配部署或可信代理；拒绝异常端口和脚本注入参数。
 - 用临时文件下载，失败时不执行残留文件；脚本不包含账号凭据。
+- 拒绝助手目标为文件夹，避免误执行目录中的旧 `__main__.py`。
 - 新增 `/web/login/helper-info`，返回当前配置与本地下载入口。
 - 可选 Release 备用助手默认仅指向本机；一般使用部署控制台下载的配置版。
 
@@ -35,10 +36,12 @@ SOLO / IDE 直连当前使用 `solo_work_lite` 的 `llm_utils_chat` 封装，没
 
 ## 验证
 
-- 本地全量测试：`859 passed, 386 subtests passed`（含动态助手下载、模拟授权回调、
-  JavaScript 地址匹配和 Windows 启动器的完整下载 / 下载中断测试）。
-- 部署实测：Chat 非流式 / 流式、Tool 调用、图片输入、`/v1/messages`
+- 本地全量测试：`863 passed, 6 skipped, 386 subtests passed`（含动态助手下载、
+  模拟授权回调、JavaScript 地址匹配，以及 Windows 启动器的新下载、旧文件
+  刷新、下载中断、替换失败和目录目标测试；POSIX 启动器由 Linux CI 验证）。
+- 此前部署实测：Chat 非流式 / 流式、Tool 调用、图片输入、`/v1/messages`
   流式与 `count_tokens` 均正常，无上游 4xx / 5xx。
+- 本次授权助手修复未启动 SOLO 客户端抓包，也未重做真实模型 A/B 调用。
 - GitHub Actions 会在本标签上重新运行测试，并构建 `linux/amd64`、
   `linux/arm64` 镜像。
 

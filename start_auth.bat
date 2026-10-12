@@ -13,6 +13,11 @@ set "PORT=8765"
 set "HELPER=%~dp0web_login.py"
 set "TMP_HELPER=%HELPER%.download-%RANDOM%"
 
+if exist "%HELPER%\" (
+  echo web_login.py 目标不能是文件夹，请更换授权助手目录后重试。
+  pause
+  exit /b 1
+)
 echo [1/2] 正在从中转站刷新授权助手脚本 web_login.py ...
 del /q "%TMP_HELPER%" >nul 2>nul
 curl -fsSL --max-time 20 -o "%TMP_HELPER%" "%RELAY%/web/login/download?as=py"

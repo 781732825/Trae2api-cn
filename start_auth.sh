@@ -13,6 +13,10 @@ RELAY="http://127.0.0.1:8000"
 PORT="8765"
 HELPER="$DIR/web_login.py"
 
+if [ -d "$HELPER" ]; then
+  echo "web_login.py 目标不能是文件夹，请更换授权助手目录后重试。"
+  exit 1
+fi
 echo "[1/2] 正在从中转站刷新授权助手脚本 web_login.py ..."
 TMP_HELPER="$HELPER.download.$$"
 rm -f "$TMP_HELPER"

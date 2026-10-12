@@ -192,6 +192,10 @@ class RenderTests(unittest.TestCase):
                 self.assertIn("--port", text)
                 self.assertNotIn('if not exist "%HELPER%"', text)
                 self.assertNotIn('if [ ! -f "$HELPER" ]', text)
+                if kind == "bat":
+                    self.assertIn('if exist "%HELPER%\\"', text)
+                else:
+                    self.assertIn('if [ -d "$HELPER" ]', text)
 
 
 class DownloadEndpointTests(unittest.TestCase):
