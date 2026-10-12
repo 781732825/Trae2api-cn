@@ -1056,6 +1056,30 @@ def flatten_query(messages: list[dict]) -> str:
     return json.dumps([{"type": "text", "data": {"content": text}}], ensure_ascii=False)
 
 
+def flatten_query_parts(messages: list[dict]) -> str:
+    """Flatten history to Trae ``query`` parts, keeping image attachments.
+
+    The plain text form above is the historical shape.  When the caller
+    attached images, the remote executor accepts the same renderer media
+    payload the native transports use, so the attachment reaches a multimodal
+    model instead of being described as text and then dropped.
+    """
+
+    media = images.query_parts(messages)
+    if not media:
+        return flatten_query(messages)
+    text = flatten_query(messages)
+    try:
+        text_parts = json.loads(text)
+    except Exception:
+        text_parts = []
+    if not isinstance(text_parts, list):
+        text_parts = []
+    # Text history first so the model reads the conversation, then the media
+    # payloads in the order the caller attached them.
+    return json.dumps([*text_parts, *media], ensure_ascii=False)
+
+
 def _web_image_items(content: Any) -> list[dict]:
     """Return renderer media parts for the images in one message's content.
 
@@ -1859,8 +1883,9 @@ def _ide_native_content(content: Any) -> Any:
                 converted.pop("value", None)
             elif block_type == "image" and not converted.get("value"):
                 # Anthropic-style ``{"type":"image","source":{...}}`` blocks
-                # become the renderer media block the native transport reads;
-                # OpenAI-style parts are already forwarded verbatim.
+                # become the renderer media block the native transport reads.
+                # IDE/Solo accepts OpenAI ``image_url`` parts natively, so keep
+                # that caller-owned wrapper unchanged for this endpoint.
                 renderer_block = images.to_renderer_block(block)
                 if renderer_block:
                     converted = renderer_block

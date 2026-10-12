@@ -9,7 +9,7 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 ## 特点
 
 - OpenAI 兼容接口：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/chat`、`POST /v1`
-- Anthropic Messages 接口：`POST /v1/messages`（Claude Code 直连），支持 `system`、`tool_use` / `tool_result`、`thinking` 与 `content_block` 流式事件，鉴权可用 `x-api-key`
+- Anthropic Messages 接口：`POST /v1/messages`、`POST /v1/messages/count_tokens`（Claude Code 直连），支持 `system`、`tool_use` / `tool_result`、`thinking` 与 `content_block` 流式事件，鉴权可用 `x-api-key`
 - 流式与非流式输出，SSE 心跳防止网关空闲断开
 - 截断自动续写：回答在代码块/括号/逗号中间结束时自动补一轮写完整（`TRAE_AUTO_CONTINUE`，默认开启 3 轮，工具回合与重复短回答不触发）
 - 图片输入：`image_url` / Anthropic `image` 块会转成 Trae 渲染层媒体块；所选模型不支持视觉时自动改用多模态模型
@@ -378,6 +378,7 @@ Claude Code 等 Anthropic 客户端使用 `POST /v1/messages`：
 ```
 
 - 鉴权：`x-api-key: <RELAY_API_KEYS 中的值>` 或 `Authorization: Bearer <key>`。
+- `POST /v1/messages/count_tokens` 只做本地输入 token 估算，不创建上游会话，也不会产生积分消费记录。
 - 流式返回标准 `message_start` / `content_block_start` / `content_block_delta` / `message_delta` / `message_stop`，`thinking` 走 `thinking_delta`，工具调用走 `tool_use` + `input_json_delta`。
 - `tool_choice` 的 `auto` / `any` / `tool` / `none` 分别映射到 `auto` / `required` / 指定函数 / `none`；`thinking.budget_tokens` 映射到原生思考档位。
 - 工具仍然只在调用端执行，relay 只负责协议翻译。
@@ -393,7 +394,7 @@ export ANTHROPIC_MODEL=glm-5.3
 ## 截断自动续写与图片输入
 
 - **截断自动续写**：上游因输出预算或连接中断把答案停在代码块、括号或逗号中间时，relay 会把已输出内容作为 assistant 轮次回放，并追加一轮“继续输出”把答案写完整；客户端只会收到一条连续的回答，完成帧只在最后一轮发出。工具调用回合、`finish_reason=length` 之后仍未闭合、以及反复重复的短回答都会停止续写，避免重复计费和死循环。用 `TRAE_AUTO_CONTINUE=0` 关闭，`TRAE_AUTO_CONTINUE_MAX` 调整轮数。
-- **图片输入**：`image_url`（OpenAI）与 `image`（Anthropic，base64 或 URL）都会转成 Trae 渲染层媒体块随请求发送。若所选模型不支持视觉，relay 会按账号实际可用的多模态模型自动切换，并在请求追踪中记录 `multimodal_switch`。用 `TRAE_MULTIMODAL_AUTO_SWITCH=0` 关闭，或用 `TRAE_MULTIMODAL_MODEL` 指定目标模型。
+- **图片输入**：`image_url`（OpenAI）与 `image`（Anthropic，base64 或 URL）都会转成 Trae 渲染层媒体块随请求发送。若所选模型不支持视觉，relay 会按账号实际可用的多模态模型自动切换，并在请求追踪中记录 `multimodal_switch`。用 `TRAE_MULTIMODAL_AUTO_SWITCH=0` 关闭，或用 `TRAE_MULTIMODAL_MODEL` 指定目标模型。远程图片 URL 会原样转发给上游，relay 不会代下载；需要确定性输入时请使用 base64 data URL。
 - **排队位置**：上游排队事件只作为 SSE 注释心跳和消费记录的“链路”列暴露，不再写入模型正文。
 
 ## 网页管理界面

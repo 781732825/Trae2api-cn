@@ -16,7 +16,15 @@ import os
 import unittest
 from unittest import mock
 
-from src import anthropic_api, continuation, images, raw_client, sse, trae_client
+from src import (
+    anthropic_api,
+    cli_client,
+    continuation,
+    images,
+    raw_client,
+    sse,
+    trae_client,
+)
 
 class QueueTelemetryTests(unittest.TestCase):
     """Queue position is transport telemetry, never answer text."""
@@ -269,6 +277,30 @@ class ImageInputTests(unittest.TestCase):
         self.assertEqual(len(media), 1)
         self.assertEqual(media[0]["value"]["mimeType"], "image/png")
 
+    def test_remote_query_keeps_image_media_block(self):
+        query = json.loads(
+            trae_client.flatten_query_parts(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "describe"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,QUJD"
+                                },
+                            },
+                        ],
+                    }
+                ]
+            )
+        )
+        media = [part for part in query if part.get("type") == "image_url"]
+        self.assertEqual(len(media), 1)
+        self.assertEqual(media[0]["data"]["mimeType"], "image/png")
+        self.assertEqual(media[0]["data"]["data"], "QUJD")
+
     def test_text_placeholder_never_inlines_the_payload(self):
         block = images.to_renderer_block(
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
@@ -286,6 +318,40 @@ class ImageInputTests(unittest.TestCase):
         self.assertIn("look", text)
         self.assertIn("image", text.lower())
         self.assertNotIn("Unsupported", text)
+
+
+class TextToolCallCompatibilityTests(unittest.TestCase):
+    """Cover the text/XML tool-call variants documented by ZedeX."""
+
+    def test_toolcall_without_underscore_and_trailing_comma(self):
+        calls = cli_client.extract_text_tool_calls(
+            '<toolcall>{"name":"read_file","arguments":{"path":"a.txt",}}</toolcall>'
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read_file")
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]), {"path": "a.txt"}
+        )
+
+    def test_arg_key_value_and_attribute_forms(self):
+        arg_calls = cli_client.extract_text_tool_calls(
+            "<tool_call>read_file"
+            "<arg_key>path</arg_key><arg_value>a.txt</arg_value>"
+            "</tool_call>"
+        )
+        self.assertEqual(arg_calls[0]["function"]["name"], "read_file")
+        self.assertEqual(
+            json.loads(arg_calls[0]["function"]["arguments"]), {"path": "a.txt"}
+        )
+
+        attr_calls = cli_client.extract_text_tool_calls(
+            '<tool_call name="read_file" path="a.txt"></tool_call>'
+        )
+        self.assertEqual(attr_calls[0]["function"]["name"], "read_file")
+        self.assertEqual(
+            json.loads(attr_calls[0]["function"]["arguments"]), {"path": "a.txt"}
+        )
+
 
 class AnthropicIngressTests(unittest.TestCase):
     def test_request_translation(self):
@@ -558,6 +624,31 @@ class AnthropicIngressTests(unittest.TestCase):
             if _event_name(event) == "error"
         ]
         self.assertEqual(errors, ["upstream exploded"])
+
+    def test_stream_translation_flushes_unterminated_final_sse_block(self):
+        async def chat_stream():
+            payload = {
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "tail"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            # Deliberately omit the SSE blank-line delimiter and [DONE].
+            yield "data: " + json.dumps(payload)
+
+        events = asyncio.run(
+            _collect(anthropic_api.translate_chat_stream(chat_stream(), "m"))
+        )
+        joined = "".join(events)
+        self.assertIn('"text_delta"', joined)
+        self.assertIn('"text":"tail"', joined)
+        self.assertIn("event: message_stop", joined)
 
 def _chunk(payload: dict, *, usage: dict | None = None) -> str:
     body = {

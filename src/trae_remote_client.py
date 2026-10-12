@@ -403,6 +403,10 @@ def flatten_query(messages: list[dict[str, Any]]) -> str:
     return trae_client.flatten_query(messages)
 
 
+def flatten_query_parts(messages: list[dict[str, Any]]) -> str:
+    return trae_client.flatten_query_parts(messages)
+
+
 def model_session_id(model: str, options: Optional[Mapping[str, Any]] = None) -> str:
     """Return a stable non-secret remote session key per account and model."""
 
@@ -842,7 +846,7 @@ async def create_session(
     initial_message: dict[str, Any] = {
         "chat_session_id": "",
         "content": [],
-        "query": flatten_query(messages),
+        "query": flatten_query_parts(messages),
         "model_name": model_name,
         "agent_type": agent_type,
         # TraeWork sends both fields.  ``agent_type`` selects the executor

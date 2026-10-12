@@ -146,3 +146,51 @@ def describe(block: Mapping[str, Any]) -> str:
     if size:
         return f"[image: {mime}, {size} bytes]"
     return f"[image: {mime}]"
+
+
+def query_parts(messages: Any) -> list[dict[str, Any]]:
+    """Return Trae's ``query`` part array for a message list.
+
+    The remote transport sends history as a JSON array of ``{"type","data"}``
+    parts.  Text is ``{"type":"text","data":{"content":...}}``; an image is the
+    renderer media payload wrapped the same way, which keeps the model's
+    multimodal input available instead of flattening the attachment to a
+    caption.  A short text placeholder accompanies every image so a
+    non-multimodal reader still knows something was attached.
+    """
+
+    if not isinstance(messages, (list, tuple)):
+        return []
+    parts: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if not is_image_part(part) and str(part.get("type") or "") != "image":
+                continue
+            block = to_renderer_block(part)
+            if not block:
+                continue
+            value = block.get("value")
+            value = value if isinstance(value, Mapping) else {}
+            parts.append(
+                {
+                    "type": "image_url",
+                    "data": {
+                        "mimeType": value.get("mimeType") or _DEFAULT_MIME,
+                        "data": value.get("data") or "",
+                    },
+                }
+            )
+            parts.append(
+                {
+                    "type": "text",
+                    "data": {"content": describe(block)},
+                }
+            )
+    return parts

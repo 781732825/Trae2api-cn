@@ -604,6 +604,32 @@ async def translate_chat_stream(
                         )
         return events
 
+    def terminal_events() -> list[str]:
+        """Build the Anthropic terminal envelope exactly once."""
+
+        events = close_blocks()
+        if not started:
+            events.extend(open_message())
+            events.extend(close_blocks())
+        events.append(
+            _event(
+                "message_delta",
+                {
+                    "delta": {
+                        "stop_reason": _stop_reason(
+                            finish_reason, has_tool_use=saw_tool_use
+                        ),
+                        "stop_sequence": None,
+                    },
+                    "usage": _usage(
+                        usage_values, input_fallback=request_input_tokens
+                    ),
+                },
+            )
+        )
+        events.append(_event("message_stop", {}))
+        return events
+
     # Emit the envelope before the first upstream token, but only after all
     # local event helpers have been defined (nested defs are runtime bindings).
     for event in open_message():
@@ -638,26 +664,8 @@ async def translate_chat_stream(
                 continue
             payload = "\n".join(data_lines).strip()
             if payload == "[DONE]":
-                for event in close_blocks():
+                for event in terminal_events():
                     yield event
-                if not started:
-                    for event in open_message():
-                        yield event
-                    for event in close_blocks():
-                        yield event
-                yield _event(
-                    "message_delta",
-                    {
-                        "delta": {
-                            "stop_reason": _stop_reason(
-                                finish_reason, has_tool_use=saw_tool_use
-                            ),
-                            "stop_sequence": None,
-                        },
-                        "usage": _usage(usage_values, input_fallback=request_input_tokens),
-                    },
-                )
-                yield _event("message_stop", {})
                 return
             try:
                 parsed = json.loads(payload)
@@ -671,6 +679,38 @@ async def translate_chat_stream(
                 return
             for event in handle_chunk(parsed):
                 yield event
+
+    # A few proxies close an SSE response after writing the final ``data:``
+    # line without the usual blank-line delimiter.  Process that buffered
+    # block before deciding whether the stream ended cleanly; otherwise the
+    # final text/finish reason would be silently discarded.
+    if buffer.strip():
+        block = buffer.strip()
+        if not block.startswith(":"):
+            data_lines = [
+                line[5:].lstrip()
+                for line in block.split("\n")
+                if line.startswith("data:")
+            ]
+            payload = "\n".join(data_lines).strip()
+            if payload == "[DONE]":
+                for event in terminal_events():
+                    yield event
+                return
+            if payload:
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, Mapping):
+                    error = parsed.get("error")
+                    if isinstance(error, Mapping) and error:
+                        yield error_event(
+                            str(error.get("message") or "upstream error")
+                        )
+                        return
+                    for event in handle_chunk(parsed):
+                        yield event
 
     # A final finish-reason frame is sufficient evidence of completion if a
     # proxy drops only the trailing [DONE]. Without it, report a broken stream
