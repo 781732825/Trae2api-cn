@@ -123,21 +123,40 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 
 1. 打开 `http://服务器:8000/web/login`
 2. 点击「使用 Trae 网页授权登录」，页面会自动检测本机助手是否在线
-3. 若提示「未检测到本机授权助手」，点击页面上的「下载一键启动 start_auth.bat」
-4. 双击运行 `start_auth.bat`（Windows，无需安装 Python 时会提示安装），保持窗口开启
+3. 若提示「未检测到本机授权助手」，点击页面上的下载按钮获取
+   `web_login.py` / `start_auth.bat` / `start_auth.sh`
+   （三个按钮都由服务端按当前部署实时生成，**IP 与端口已写好，无需手动修改**）
+4. 双击运行 `start_auth.bat`（Windows）或 `sh start_auth.sh`（macOS/Linux），保持窗口开启
 5. 回到页面重新点击授权，浏览器弹出 Trae 授权页，确认登录即可
 6. 凭据自动写入服务器，页面自动刷新显示「已登录」
 
-> 也可手动运行：`python web_login.py --relay http://服务器:8000`
+> 助手模板随 Docker 镜像打包，下载由当前部署直接提供，不需要访问 GitHub。
+> 一键脚本会自动从同一部署下载缺少的 `web_login.py`；本机需要 Python 3。
+> 下载版可直接运行 `python web_login.py`，无需指定 IP 或端口。
 
 ### 之后每次授权
 
-本机助手已在线时，直接点授权即可，无需重复下载和启动。
+本机助手已在线并绑定当前部署时，直接点授权即可。服务器地址、映射端口或助手
+监听端口变更后，关闭旧助手并从当前控制台重新下载，避免凭据送到旧地址。
 
 ### 助手端点
 
 - `GET http://127.0.0.1:8765/healthz` — 健康检查（供网页检测）
 - `GET http://127.0.0.1:8765/relay-url` — 返回配置的 relay 地址
+
+### 中转站侧的下载与生成接口
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /web/login/download?as=py\|bat\|sh` | 按当前部署实时生成授权助手，地址与端口已写入文件 |
+| `GET /web/login/helper-info` | 返回本次生成会写入的中转站地址、监听端口与本地下载入口 |
+
+生成顺序为：`TRAE_PUBLIC_BASE_URL` → 浏览器实际访问地址（`?relay=`）→
+`X-Forwarded-Proto/Host` → 请求 `Host` 头 → 默认回环地址。反向代理部署可显式设置
+`TRAE_PUBLIC_BASE_URL`，例如 `TRAE_PUBLIC_BASE_URL=http://gateway.internal:8000`。
+脚本保留 Docker 映射端口、HTTPS 与反向代理子路径，不使用容器内部端口替换外部
+端口。生成内容只包含部署地址、端口和公开 `client_id`，不含任何账号凭据。
+直接部署时可设置 `TRAE_TRUST_PROXY_HEADERS=0`，忽略未受信任的代理地址头。
 
 ## 配置
 

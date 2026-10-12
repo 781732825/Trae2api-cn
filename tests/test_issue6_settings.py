@@ -12,6 +12,11 @@ from src import main as main_module
 
 
 class Issue6SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.api_keys = patch.object(main_module, "API_KEYS", [])
+        self.api_keys.start()
+        self.addCleanup(self.api_keys.stop)
+
     def test_settings_api_round_trip_preserves_shared_url_preset_identity(self):
         """IDE/Work presets must survive the settings API, not just the UI."""
 

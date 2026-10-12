@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 import dotenv
 
@@ -53,7 +54,6 @@ import anyio
 import httpx
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from fastapi.responses import FileResponse
 
 from . import (
     anthropic_api,
@@ -67,6 +67,17 @@ from . import (
     trae_remote_client,
     traework_compat,
     traework_native_bridge,
+)
+from .auth_helper import (
+    SUPPORTED_KINDS as HELPER_KINDS,
+    RelayURLError,
+    candidate_hosts as _helper_candidate_hosts,
+    file_name as _helper_file_name,
+    media_type as _helper_media_type,
+    normalize_listener_port as _normalize_listener_port,
+    normalize_relay_url as _normalize_relay_url,
+    pick_relay_url as _pick_relay_url,
+    render as _render_auth_helper,
 )
 from .model_limits import (
     MULTIMODAL_FALLBACK_ORDER,
@@ -533,6 +544,7 @@ PUBLIC_PATHS = {
     "/models",
     "/web/login",
     "/web/login/download",
+    "/web/login/helper-info",
     "/authorize",
     "/api/web-auth",
     "/api/logout",
@@ -1939,13 +1951,14 @@ def _web_login_html() -> str:
   <div class="section-head"><div class="section-title" id="login-title">授权登录</div></div>
   <ol class="login-steps">
     <li>点击授权登录，自动检测本机授权助手（<code>127.0.0.1:{listener_port}</code>）。</li>
-    <li>未检测到时，下载 <code>web_login.py</code> 或 <code>start_auth.bat</code> 在<b>本机</b>运行后重试。</li>
+    <li>未检测到时，下载 <code>web_login.py</code> 或本机一键脚本（Windows <code>start_auth.bat</code> / macOS·Linux <code>start_auth.sh</code>）在<b>本机</b>运行后重试。</li>
     <li>浏览器需已登录 <a href="https://www.trae.cn" target="_blank" rel="noopener">trae.cn</a>，授权完成后凭据自动写入服务器。</li>
   </ol>
   <div class="btn-group">
     <button class="btn btn-primary" onclick="startAuth()" id="auth-btn">{ic['log-in']}使用 Trae 网页授权登录</button>
-    <a class="btn btn-secondary" href="/web/login/download" download>{ic['download']}授权助手 web_login.py</a>
-    <a class="btn btn-secondary" href="/web/login/download?as=bat" download id="bat-link" style="display:none">{ic['download']}start_auth.bat</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=py" download id="helper-py-link">{ic['download']}授权助手 web_login.py</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=bat" download id="bat-link">{ic['download']}start_auth.bat</a>
+    <a class="btn btn-secondary" href="/web/login/download?as=sh" download id="sh-link">{ic['download']}start_auth.sh</a>
     <a class="icon-btn" href="https://www.trae.cn" target="_blank" rel="noopener" title="访问 trae.cn" aria-label="访问 trae.cn">{ic['external-link']}</a>
   </div>
   <div id="loading" class="loading">等待授权中...</div>
@@ -2303,21 +2316,65 @@ async function buildAuthUrl() {{
   }});
   return '{auth_url}?'+p.toString();
 }}
+let localHelperError = '';
 async function checkLocalListener() {{
+  var timer;
+  localHelperError = '';
   try {{
     var ctrl = new AbortController();
-    var timer = setTimeout(function(){{ ctrl.abort(); }}, 1200);
+    timer = setTimeout(function(){{ ctrl.abort(); }}, 2500);
+    var expectedResponse = await fetch(helperEndpointPath('/web/login/helper-info') + '?relay=' + encodeURIComponent(currentDeploymentBase()), {{signal: ctrl.signal, cache: 'no-store'}});
+    if (!expectedResponse.ok) {{
+      localHelperError = '授权助手部署配置无效，请检查服务器配置后重新下载。';
+      return false;
+    }}
+    var expected = await expectedResponse.json();
     var r = await fetch('http://127.0.0.1:{listener_port}/healthz', {{signal: ctrl.signal, cache: 'no-store'}});
-    clearTimeout(timer);
-    return r.ok;
+    if (!r.ok) return false;
+    var helper = await r.json();
+    if (!helper.relay || normalizeHelperBase(helper.relay) !== normalizeHelperBase(expected.relay_url)) {{
+      localHelperError = '本机授权助手绑定了其他部署，请关闭旧助手，重新下载并运行当前页面的助手。';
+      return false;
+    }}
+    return true;
   }} catch(e) {{ return false; }}
+  finally {{ clearTimeout(timer); }}
 }}
+function helperEndpointPath(path) {{
+  return window.location.pathname.replace(/\\/web\\/login\\/?$/, '').replace(/\\/$/, '') + path;
+}}
+function currentDeploymentBase() {{
+  return window.location.origin + helperEndpointPath('');
+}}
+function normalizeHelperBase(value) {{
+  var url = new URL(value);
+  return url.origin + url.pathname.replace(/\\/+$/, '');
+}}
+function refreshHelperDownloadLinks() {{
+  var base = currentDeploymentBase();
+  var suffix = '&relay=' + encodeURIComponent(base);
+  [['helper-py-link', 'py'], ['bat-link', 'bat'], ['sh-link', 'sh']].forEach(function(item) {{
+    var link = document.getElementById(item[0]);
+    if (link) link.href = helperEndpointPath('/web/login/download') + '?as=' + item[1] + suffix;
+  }});
+  pickHelperPlatformScript();
+}}
+function pickHelperPlatformScript() {{
+  // 只显示与本机系统匹配的一键脚本，避免多下一个用不了的文件。
+  var probe = String(navigator.platform || '') + ' ' + String(navigator.userAgent || '');
+  var isWindows = /Win/i.test(probe);
+  var bat = document.getElementById('bat-link');
+  var sh = document.getElementById('sh-link');
+  if (bat) bat.style.display = isWindows ? 'inline-flex' : 'none';
+  if (sh) sh.style.display = isWindows ? 'none' : 'inline-flex';
+}}
+refreshHelperDownloadLinks();
 async function startAuth() {{
   try {{
   var ok = await checkLocalListener();
   if (!ok) {{
-    showMsg('auth-msg', '未检测到本机授权助手，请先下载并双击运行 web_login.py（需 Python）或 start_auth.bat：', false);
-    document.getElementById('bat-link').style.display='inline-flex';
+    showMsg('auth-msg', localHelperError || '未检测到本机授权助手，请先下载并运行当前页面的授权助手。', false);
+    pickHelperPlatformScript();
     return;
   }}
   state.traceId = uuid();
@@ -7345,10 +7402,9 @@ def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
         return None
     mode = str(trace.get("actual_mode") or trace.get("actual_endpoint") or "")
     if mode in {"ide", "solo"}:
-        # llm_utils_chat is the IDE/Solo utility route (titles/prompt tools); the
-        # real IDE sends strength only via the ai-agent task, so the field is
-        # ignored here.
-        return "llm_utils_chat 端点不接受强度字段"
+        # This utility-route adapter has no verified strength mapping. Do not
+        # mistake that implementation limit for a provider capability claim.
+        return "当前 IDE/SOLO llm_utils_chat 封装未转发强度字段；可使用 Remote Agent"
     if mode == "raw":
         return "raw 端点需要企业 PAT"
     return "该模型未声明 reasoning_effort_config"
@@ -10234,24 +10290,143 @@ async def web_login():
     return _web_login_html()
 
 
-START_AUTH_BAT = Path(__file__).resolve().parent.parent / "start_auth.bat"
+def _helper_generated_at() -> str:
+    return datetime.now(_CHECKIN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-@app.get("/web/login/download", response_class=FileResponse)
-async def web_login_download(as_param: str = Query("", alias="as")):
-    if as_param == "bat":
-        if not START_AUTH_BAT.exists():
-            return JSONResponse({"success": False, "error": "start_auth.bat not found"}, status_code=404)
-        return FileResponse(
-            START_AUTH_BAT,
-            media_type="application/octet-stream",
-            filename="start_auth.bat",
-        )
+
+def _helper_relay_url(request: Request, relay_param: str = "") -> str:
+    """Resolve the deployment address to bake into a downloaded helper.
+
+    Prefer an explicit public URL, then the browser address, proxy headers and
+    Host. Never substitute the container's listening port for a mapped port.
+    """
+    try:
+        scheme = str(request.url.scheme or "http").lower()
+    except (AttributeError, ValueError):
+        scheme = "http"
+    host_header = str(request.headers.get("host") or "").strip()
+    # 直连部署可以让 X-Forwarded-* 完全不参与判定，避免代理头被伪造后写进下载脚本。
+    trust_proxy = str(
+        os.environ.get("TRAE_TRUST_PROXY_HEADERS", "1")
+    ).strip().lower() not in ("0", "false", "no", "off")
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "") if trust_proxy else ""
+    forwarded_host = str(request.headers.get("x-forwarded-host") or "") if trust_proxy else ""
+    if forwarded_proto.split(",")[0].strip().lower() in ("http", "https"):
+        scheme = forwarded_proto.split(",")[0].strip().lower()
+    public_base = str(
+        os.environ.get("TRAE_PUBLIC_BASE_URL") or ""
+    ).strip()
+    if public_base:
+        # A typo in an explicit deployment URL should be reported rather than
+        # silently producing a helper bound to a different server.
+        return _normalize_relay_url(public_base)
+    prefix = str(request.scope.get("root_path") or "").rstrip("/")
+    candidates = _helper_candidate_hosts(
+        public_base=public_base,
+        forwarded_proto=forwarded_proto,
+        forwarded_host=forwarded_host + prefix if forwarded_host else "",
+        scheme=scheme,
+        host=host_header + prefix if host_header else "",
+    )
+    browser_origin = str(relay_param or "").strip()
+    if browser_origin:
+        try:
+            browser_base = _normalize_relay_url(browser_origin)
+        except RelayURLError:
+            browser_base = ""
+        if browser_base:
+            def origin(base: str) -> tuple[str, str, int]:
+                parsed = urlsplit(_normalize_relay_url(base))
+                return (
+                    parsed.scheme, parsed.hostname or "",
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                )
+
+            allowed_origins = set()
+            # Do not authorize an arbitrary target using the loopback fallback.
+            for candidate in candidates[:-1]:
+                try:
+                    allowed_origins.add(origin(candidate))
+                except RelayURLError:
+                    continue
+            if origin(browser_base) not in allowed_origins:
+                raise RelayURLError("relay URL must match the deployment host or trusted proxy")
+            candidates.insert(0, browser_base)
+    return _pick_relay_url(candidates)
+
+
+def _helper_payload(
+    request: Request, kind: str, relay_param: str = ""
+) -> tuple[str, str, str, str]:
+    kind = (kind or "py").strip().lower()
+    if kind not in HELPER_KINDS:
+        raise RelayURLError(f"unsupported helper kind: {kind}")
+    relay_url = _helper_relay_url(request, relay_param)
+    listener_port = _normalize_listener_port(
+        os.environ.get("WEB_LOGIN_LISTENER_PORT") or LOCAL_LISTENER_PORT
+    )
+    template = ""
     if not WEB_LOGIN_SCRIPT.exists():
-        return JSONResponse({"success": False, "error": "web_login.py not found"}, status_code=404)
-    return FileResponse(
-        WEB_LOGIN_SCRIPT,
-        media_type="text/plain; charset=utf-8",
-        filename="web_login.py",
+        raise FileNotFoundError("web_login.py 未随镜像打包")
+    if kind == "py":
+        template = WEB_LOGIN_SCRIPT.read_text(encoding="utf-8")
+    text = _render_auth_helper(
+        kind,
+        template=template,
+        relay_url=relay_url,
+        listener_port=listener_port,
+        client_id=TRAE_CLIENT_ID,
+        auth_url=TRAE_AUTH_URL,
+        generated_at=_helper_generated_at(),
+    )
+    filename = _helper_file_name(kind)
+    return text, filename, _helper_media_type(kind), relay_url
+
+
+@app.get("/web/login/download")
+async def web_login_download(
+    request: Request,
+    as_param: str = Query("py", alias="as"),
+    relay_param: str = Query("", alias="relay"),
+):
+    """Serve the local authorization helper with this deployment's address baked in."""
+    try:
+        payload, filename, media, relay_url = _helper_payload(request, as_param, relay_param)
+    except FileNotFoundError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=404)
+    except RelayURLError as exc:
+        return JSONResponse({"success": False, "error": f"授权助手生成参数无效: {exc}"}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"success": False, "error": f"读取模板失败: {exc}"}, status_code=500)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "X-Relay-Base-Url": relay_url,
+    }
+    return Response(content=payload.encode("utf-8"), media_type=media, headers=headers)
+
+
+@app.get("/web/login/helper-info")
+async def web_login_helper_info(request: Request, relay_param: str = Query("", alias="relay")):
+    """Report the address that generated downloads will embed."""
+    try:
+        relay_url = _helper_relay_url(request, relay_param)
+        listener_port = _normalize_listener_port(
+            os.environ.get("WEB_LOGIN_LISTENER_PORT") or LOCAL_LISTENER_PORT
+        )
+    except RelayURLError as exc:
+        return JSONResponse({"success": False, "error": str(exc)}, status_code=400)
+    return JSONResponse(
+        {
+            "success": True,
+            "relay_url": relay_url,
+            "listener_port": listener_port,
+            "generated_py": "/web/login/download?as=py",
+            "generated_bat": "/web/login/download?as=bat",
+            "generated_sh": "/web/login/download?as=sh",
+            "relay_version": APP_VERSION,
+            "revision": str(os.environ.get("RELAY_BUILD_REVISION") or "local"),
+        }
     )
 
 

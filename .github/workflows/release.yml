@@ -95,6 +95,16 @@ jobs:
             --version "${{ steps.version.outputs.version }}" \
             --ref "${GITHUB_SHA}" \
             --output dist
+      - name: Build authorization helper assets
+        run: |
+          python scripts/build_auth_helper_assets.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --output dist
+      - name: Verify helper assets
+        run: |
+          set -euo pipefail
+          python -c "import pathlib,zipfile; p=pathlib.Path('dist/trae-auth-helper-${{ steps.version.outputs.version }}.zip'); assert p.exists(), p; print('helper zip', zipfile.ZipFile(p).namelist())"
+          head -n 3 dist/web_login.py
       - name: Upload source archives as workflow artifact
         uses: actions/upload-artifact@v4
         with:
