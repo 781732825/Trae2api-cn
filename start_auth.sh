@@ -13,18 +13,17 @@ RELAY="http://127.0.0.1:8000"
 PORT="8765"
 HELPER="$DIR/web_login.py"
 
-if [ ! -f "$HELPER" ]; then
-  echo "[1/2] 正在从中转站下载授权助手脚本 web_login.py ..."
-  TMP_HELPER="$HELPER.download.$$"
+echo "[1/2] 正在从中转站刷新授权助手脚本 web_login.py ..."
+TMP_HELPER="$HELPER.download.$$"
+rm -f "$TMP_HELPER"
+if ! curl -fsSL --max-time 20 -o "$TMP_HELPER" "$RELAY/web/login/download?as=py"; then
   rm -f "$TMP_HELPER"
-  if curl -fsSL --max-time 20 -o "$TMP_HELPER" "$RELAY/web/login/download?as=py"; then
-    mv "$TMP_HELPER" "$HELPER"
-  else
-    rm -f "$TMP_HELPER"
-  fi
+  echo "授权助手脚本下载失败，请确认本机可以访问 $RELAY"
+  exit 1
 fi
-if [ ! -f "$HELPER" ]; then
-  echo "未取到 web_login.py，请在中转站页面下载后放到本目录重试。"
+if ! mv "$TMP_HELPER" "$HELPER"; then
+  rm -f "$TMP_HELPER"
+  echo "无法更新授权助手脚本，请检查本目录写入权限。"
   exit 1
 fi
 

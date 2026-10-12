@@ -121,7 +121,8 @@ jobs:
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" dist/* --clobber
             if [[ -f "docs/release-${RELEASE_TAG}.md" ]]; then
-              gh release edit "${RELEASE_TAG}" --notes-file "docs/release-${RELEASE_TAG}.md"
+              gh release edit "${RELEASE_TAG}" --target "${GITHUB_SHA}" \
+                --notes-file "docs/release-${RELEASE_TAG}.md"
             fi
           else
             notes=(--generate-notes)

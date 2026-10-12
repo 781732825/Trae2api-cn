@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,11 +13,24 @@ import pytest
 from src import auth_helper
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows batch launcher")
-@pytest.mark.parametrize("download_succeeds", [True, False])
-def test_windows_launcher_downloads_next_to_itself_and_handles_partial_failure(
-    tmp_path, download_succeeds
+@pytest.mark.parametrize("kind", ["bat", "sh"])
+@pytest.mark.parametrize(
+    "download_succeeds,existing_helper,replace_fails",
+    [
+        (True, False, False),
+        (True, True, False),
+        (False, False, False),
+        (False, True, False),
+        (True, True, True),
+    ],
+)
+def test_launcher_refreshes_next_to_itself_and_handles_partial_failure(
+    tmp_path, kind, download_succeeds, existing_helper, replace_fails
 ):
+    if kind == "bat" and os.name != "nt":
+        pytest.skip("Windows batch launcher")
+    if kind == "sh" and (os.name == "nt" or not shutil.which("sh")):
+        pytest.skip("POSIX shell launcher")
     if not shutil.which("curl"):
         pytest.skip("curl is not installed")
     requested = []
@@ -51,12 +65,32 @@ def test_windows_launcher_downloads_next_to_itself_and_handles_partial_failure(
         download_dir.mkdir()
         unrelated_dir = tmp_path / "unrelated"
         unrelated_dir.mkdir()
-        launcher = download_dir / "start_auth.bat"
+        launcher = download_dir / f"start_auth.{kind}"
+        helper = download_dir / "web_login.py"
+        old_helper_source = b"print('STALE_HELPER_EXECUTED')\n"
+        if existing_helper:
+            helper.write_bytes(old_helper_source)
+        environment = os.environ.copy()
+        if replace_fails:
+            if kind == "bat":
+                helper.chmod(stat.S_IREAD)
+            else:
+                bin_dir = tmp_path / "bin"
+                bin_dir.mkdir()
+                failed_move = bin_dir / "mv"
+                failed_move.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                failed_move.chmod(0o755)
+                environment["PATH"] = str(bin_dir) + os.pathsep + environment["PATH"]
         launcher.write_bytes(
-            auth_helper.render("bat", relay_url=relay_url, listener_port=9321).encode("utf-8")
+            auth_helper.render(kind, relay_url=relay_url, listener_port=9321).encode("utf-8")
+        )
+        command = (
+            [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher)]
+            if kind == "bat" else [shutil.which("sh"), str(launcher)]
         )
         result = subprocess.run(
-            [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", str(launcher)],
+            command,
+            env=environment,
             cwd=unrelated_dir,
             input="",
             capture_output=True,
@@ -68,18 +102,24 @@ def test_windows_launcher_downloads_next_to_itself_and_handles_partial_failure(
         assert requested == ["/web/login/download?as=py"]
         assert not list(download_dir.glob("*.download*"))
         assert not (unrelated_dir / "web_login.py").exists()
-        if download_succeeds:
+        assert "STALE_HELPER_EXECUTED" not in result.stdout
+        if download_succeeds and not replace_fails:
             assert result.returncode == 0, result.stdout + result.stderr
             output = next(line for line in result.stdout.splitlines() if line.startswith("LAUNCH_RESULT="))
             assert json.loads(output.split("=", 1)[1]) == [
                 "--relay", relay_url, "--port", "9321"
             ]
-            assert (download_dir / "web_login.py").read_bytes() == helper_source
+            assert helper.read_bytes() == helper_source
         else:
             assert result.returncode != 0
             assert "LAUNCH_RESULT=" not in result.stdout
-            assert not (download_dir / "web_login.py").exists()
+            if existing_helper:
+                assert helper.read_bytes() == old_helper_source
+            else:
+                assert not helper.exists()
     finally:
+        if replace_fails and kind == "bat" and helper.exists():
+            helper.chmod(stat.S_IREAD | stat.S_IWRITE)
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

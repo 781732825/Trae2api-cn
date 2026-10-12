@@ -190,6 +190,8 @@ class RenderTests(unittest.TestCase):
                 self.assertNotIn('-o "$HELPER"', text)
                 self.assertIn("--relay", text)
                 self.assertIn("--port", text)
+                self.assertNotIn('if not exist "%HELPER%"', text)
+                self.assertNotIn('if [ ! -f "$HELPER" ]', text)
 
 
 class DownloadEndpointTests(unittest.TestCase):

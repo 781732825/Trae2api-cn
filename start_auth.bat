@@ -13,15 +13,19 @@ set "PORT=8765"
 set "HELPER=%~dp0web_login.py"
 set "TMP_HELPER=%HELPER%.download-%RANDOM%"
 
-if not exist "%HELPER%" (
-  echo [1/2] 正在从中转站下载授权助手脚本 web_login.py ...
+echo [1/2] 正在从中转站刷新授权助手脚本 web_login.py ...
+del /q "%TMP_HELPER%" >nul 2>nul
+curl -fsSL --max-time 20 -o "%TMP_HELPER%" "%RELAY%/web/login/download?as=py"
+if errorlevel 1 (
   del /q "%TMP_HELPER%" >nul 2>nul
-  curl -fsSL --max-time 20 -o "%TMP_HELPER%" "%RELAY%/web/login/download?as=py"
-  if not errorlevel 1 move /y "%TMP_HELPER%" "%HELPER%" >nul
-  del /q "%TMP_HELPER%" >nul 2>nul
+  echo 授权助手脚本下载失败，请确认本机可以访问 %RELAY%
+  pause
+  exit /b 1
 )
-if not exist "%HELPER%" (
-  echo 未取到 web_login.py，请在中转站页面点“授权助手 web_login.py”下载到本目录后重试。
+move /y "%TMP_HELPER%" "%HELPER%" >nul
+if errorlevel 1 (
+  del /q "%TMP_HELPER%" >nul 2>nul
+  echo 无法更新授权助手脚本，请检查本目录写入权限。
   pause
   exit /b 1
 )

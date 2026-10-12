@@ -131,7 +131,8 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 6. 凭据自动写入服务器，页面自动刷新显示「已登录」
 
 > 助手模板随 Docker 镜像打包，下载由当前部署直接提供，不需要访问 GitHub。
-> 一键脚本会自动从同一部署下载缺少的 `web_login.py`；本机需要 Python 3。
+> 一键脚本每次启动都会从同一部署刷新 `web_login.py`，下载失败不执行旧副本；
+> 本机需要 Python 3。
 > 下载版可直接运行 `python web_login.py`，无需指定 IP 或端口。
 
 ### 之后每次授权
