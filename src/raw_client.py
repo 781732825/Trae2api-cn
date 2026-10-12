@@ -26,6 +26,7 @@ from .cli_client import (
     strip_tool_call_blocks,
     tool_result_is_failed,
 )
+from . import images
 
 
 logger = logging.getLogger(__name__)
@@ -618,12 +619,46 @@ def _content_to_text(content: Any) -> str:
                 nested = renderer_block_text(block)
                 if nested:
                     parts.append(nested)
-            elif block.get("type") in ("image", "image_url", "file"):
-                parts.append(f"[Unsupported {block.get('type')} input omitted]")
+            elif images.is_image_part(block) or str(block.get("type") or "") == "image":
+                converted = images.to_renderer_block(block)
+                parts.append(images.describe(converted) if converted else "[image omitted]")
+            elif block.get("type") == "file":
+                parts.append("[Unsupported file input omitted]")
         return "\n".join(part for part in parts if part)
     if isinstance(content, Mapping):
         return json.dumps(content, ensure_ascii=False, default=str)
     return str(content)
+
+
+def _without_native_images(content: Any) -> Any:
+    """Drop image parts that :func:`_native_image_blocks` forwards natively."""
+
+    if not isinstance(content, list):
+        return content
+    kept: list[Any] = []
+    for part in content:
+        if isinstance(part, Mapping):
+            if images.is_image_part(part) or str(part.get("type") or "") == "image":
+                continue
+        kept.append(part)
+    return kept
+
+
+def _native_image_blocks(content: Any) -> list[dict[str, Any]]:
+    """Return renderer media blocks for any images in one message's content."""
+
+    if not isinstance(content, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            continue
+        if not images.is_image_part(part) and str(part.get("type") or "") != "image":
+            continue
+        converted = images.to_renderer_block(part)
+        if converted:
+            blocks.append(converted)
+    return blocks
 
 
 def _normalized_tools(tools: Any) -> list[dict[str, Any]]:
@@ -1390,7 +1425,12 @@ def build_raw_messages(
                 if candidate not in (None, "", [], {}):
                     content = candidate
                     break
-        text = _content_to_text(content)
+        image_blocks = _native_image_blocks(content)
+        # The native content channel already carries the media block, so the
+        # flattened text must not repeat a placeholder for the same image.
+        text = _content_to_text(
+            _without_native_images(content) if image_blocks else content
+        )
         renderer_results = _renderer_tool_result_blocks(content)
         # ZCode may replay a truncated relay history preamble as assistant
         # text.  Forwarding that residue to Trae makes the model echo it again
@@ -1430,7 +1470,15 @@ def build_raw_messages(
                 text = "\n\n".join(part for part in (text, call_context) if part)
         native_message: dict[str, Any] = {"role": role}
         if text:
-            native_message["content"] = [{"type": "text", "text": text}]
+            native_message["content"] = [
+                {"type": "text", "text": text},
+                *image_blocks,
+            ]
+        elif image_blocks:
+            # A message whose only payload is an image still has to reach the
+            # multimodal model; the raw transport carries media as renderer
+            # ``image_url`` blocks beside (or instead of) text.
+            native_message["content"] = image_blocks
         elif role in ("system", "user"):
             continue
         if role == "assistant" and not text:

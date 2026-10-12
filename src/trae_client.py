@@ -29,7 +29,7 @@ from typing import Any, AsyncIterator, Mapping, Optional
 import anyio
 import httpx
 
-from . import auth, raw_client
+from . import auth, images, raw_client
 from .cli_client import (
     renderer_block_text,
     sanitize_assistant_history_messages,
@@ -315,7 +315,14 @@ def _content_to_text(content: Any) -> str:
                     # Trae's renderer stores text/tool_result payloads under
                     # ``value`` instead of ``text``/``content``.
                     text = renderer_block_text(c)
-                parts.append(text or "")
+                if text:
+                    parts.append(text)
+                    continue
+                if images.is_image_part(c) or str(c.get("type") or "") == "image":
+                    block = images.to_renderer_block(c)
+                    parts.append(images.describe(block) if block else "[image omitted]")
+                    continue
+                parts.append("")
             elif isinstance(c, str):
                 parts.append(c)
         return "\n".join(parts)
@@ -1049,6 +1056,28 @@ def flatten_query(messages: list[dict]) -> str:
     return json.dumps([{"type": "text", "data": {"content": text}}], ensure_ascii=False)
 
 
+def _web_image_items(content: Any) -> list[dict]:
+    """Return renderer media parts for the images in one message's content.
+
+    The remote ``content`` array is the structured half of the session body
+    (``query`` is the flattened text half), so an image belongs here as a
+    native renderer block instead of being flattened into the query string.
+    """
+
+    if not isinstance(content, list):
+        return []
+    items: list[dict] = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            continue
+        if not images.is_image_part(part) and str(part.get("type") or "") != "image":
+            continue
+        converted = images.to_renderer_block(part)
+        if converted:
+            items.append(converted)
+    return items
+
+
 def build_web_content(messages: list[dict]) -> list[dict]:
     """Build a structured content array from OpenAI messages for the web remote endpoint.
 
@@ -1066,6 +1095,11 @@ def build_web_content(messages: list[dict]) -> list[dict]:
                 if candidate not in (None, "", [], {}):
                     content = candidate
                     break
+        image_items = _web_image_items(content)
+        if image_items:
+            # Media travels as its own renderer part; the flattened ``query``
+            # only carries the text half of the same turn.
+            items.extend(image_items)
         tool_calls = m.get("tool_calls")
         renderer_results = raw_client._renderer_tool_result_blocks(content)
         if role == "assistant" and not tool_calls:
@@ -1812,8 +1846,9 @@ def _ide_native_content(content: Any) -> Any:
         if isinstance(block, str):
             blocks.append({"type": "text", "text": block})
         elif isinstance(block, Mapping):
+            block_type = str(block.get("type") or "").strip().lower()
             converted = copy.deepcopy(dict(block))
-            if str(block.get("type") or "").lower() in {"text", "input_text"}:
+            if block_type in {"text", "input_text"}:
                 converted["type"] = "text"
                 text = block.get("text")
                 if not isinstance(text, str):
@@ -1822,6 +1857,13 @@ def _ide_native_content(content: Any) -> Any:
                     text if isinstance(text, str) else renderer_block_text(block)
                 )
                 converted.pop("value", None)
+            elif block_type == "image" and not converted.get("value"):
+                # Anthropic-style ``{"type":"image","source":{...}}`` blocks
+                # become the renderer media block the native transport reads;
+                # OpenAI-style parts are already forwarded verbatim.
+                renderer_block = images.to_renderer_block(block)
+                if renderer_block:
+                    converted = renderer_block
             blocks.append(converted)
         else:
             blocks.append(copy.deepcopy(block))

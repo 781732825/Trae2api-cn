@@ -205,9 +205,12 @@ class TranslateCliStreamTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        self.assertIn("位置：1", content)
-        self.assertTrue(content.endswith("ready"))
+        # Queue position is transport telemetry: it must never reach the
+        # assistant text, only the wire keepalive.
+        self.assertNotIn("排队", content)
+        self.assertEqual(content, "ready")
         self.assertTrue(done)
+        self.assertIn(": relay-keepalive\n\n", chunks)
 
     def test_ide_provider_mismatch_is_not_presented_as_requested_model(self):
         response = _LineResponse(
@@ -750,8 +753,10 @@ class TranslateCliStreamTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        self.assertEqual(content.count("位置：2"), 1)
-        self.assertEqual(content.count("位置：1"), 1)
+        # No queue text in the answer; only distinct positions reach the wire
+        # as keepalive comments (the duplicate position 2 is coalesced).
+        self.assertNotIn("排队", content)
+        self.assertEqual(chunks.count(": relay-keepalive\n\n"), 2)
 
     def test_ide_empty_probe_emits_nothing_before_retry_signal(self):
         response = _LineResponse(
@@ -892,18 +897,21 @@ class TranslateCliStreamTests(unittest.TestCase):
             ]
         )
 
-        async def first_three():
+        async def first_two():
             stream = sse.translate_ide_stream(
                 response, "m", True, fail_on_empty=True
             )
-            chunks = [await anext(stream), await anext(stream), await anext(stream)]
+            chunks = [await anext(stream), await anext(stream)]
             await stream.aclose()
             return chunks
 
-        parsed, _ = _parse_chunks(asyncio.run(first_three()))
+        chunks = asyncio.run(first_two())
+        parsed, _ = _parse_chunks(chunks)
+        # A probe stream stays silent while queued (a keepalive would make a
+        # doomed probe look started), then opens with the role frame and the
+        # first real delta as soon as text arrives.
         self.assertEqual(parsed[0]["choices"][0]["delta"], {"role": "assistant"})
-        self.assertIn("位置：1", parsed[1]["choices"][0]["delta"]["content"])
-        self.assertEqual(parsed[2]["choices"][0]["delta"]["content"], "ready")
+        self.assertEqual(parsed[1]["choices"][0]["delta"]["content"], "ready")
 
     def test_ide_error_event_is_propagated(self):
         response = _LineResponse(

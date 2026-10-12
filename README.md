@@ -9,7 +9,10 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 ## 特点
 
 - OpenAI 兼容接口：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`、`POST /v1/chat`、`POST /v1`
+- Anthropic Messages 接口：`POST /v1/messages`（Claude Code 直连），支持 `system`、`tool_use` / `tool_result`、`thinking` 与 `content_block` 流式事件，鉴权可用 `x-api-key`
 - 流式与非流式输出，SSE 心跳防止网关空闲断开
+- 截断自动续写：回答在代码块/括号/逗号中间结束时自动补一轮写完整（`TRAE_AUTO_CONTINUE`，默认开启 3 轮，工具回合与重复短回答不触发）
+- 图片输入：`image_url` / Anthropic `image` 块会转成 Trae 渲染层媒体块；所选模型不支持视觉时自动改用多模态模型
 - 完整工具调用：`tools` / `tool_choice`（auto / none / required / 指定函数）/ `parallel_tool_calls`，流式输出标准 `delta.tool_calls`
 - Codex Responses API：文本流、`function_call`、`custom_tool_call`、namespace 工具、`*_call_output` 续轮和 `previous_response_id`
 - thinking 与正文分离：思考内容只进 `reasoning_content` / Responses reasoning 事件，不混入正文，且默认压缩为关键结论
@@ -356,13 +359,50 @@ requires_openai_auth = true
 
 relay 支持两种连续会话方式：客户端可以在每轮重放完整 `input` 历史，也可以只发送新的输入或工具结果并携带上一轮返回的 `previous_response_id`。后一种方式会从有 TTL 和容量上限的进程内缓存恢复用户消息、assistant 输出、工具调用及绑定；客户端即使同时重放完整历史也会进行重叠去重。`store: false` 不写入缓存，未知、过期、容器重启后失效或超过缓存上限的 response id 会返回明确的 `400 previous_response_id` 错误。
 
+## Anthropic Messages API
+
+Claude Code 等 Anthropic 客户端使用 `POST /v1/messages`：
+
+```json
+{
+  "model": "glm-5.3",
+  "max_tokens": 32000,
+  "system": "be concise",
+  "tools": [{"name": "read_file", "description": "read", "input_schema": {"type": "object"}}],
+  "messages": [
+    {"role": "user", "content": [{"type": "text", "text": "读一下 a.txt"}]},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.txt"}}]},
+    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "文件内容"}]}
+  ]
+}
+```
+
+- 鉴权：`x-api-key: <RELAY_API_KEYS 中的值>` 或 `Authorization: Bearer <key>`。
+- 流式返回标准 `message_start` / `content_block_start` / `content_block_delta` / `message_delta` / `message_stop`，`thinking` 走 `thinking_delta`，工具调用走 `tool_use` + `input_json_delta`。
+- `tool_choice` 的 `auto` / `any` / `tool` / `none` 分别映射到 `auto` / `required` / 指定函数 / `none`；`thinking.budget_tokens` 映射到原生思考档位。
+- 工具仍然只在调用端执行，relay 只负责协议翻译。
+
+Claude Code 环境变量示例：
+
+```bash
+export ANTHROPIC_BASE_URL=http://服务器:8000
+export ANTHROPIC_API_KEY=<RELAY_API_KEYS 中的值>
+export ANTHROPIC_MODEL=glm-5.3
+```
+
+## 截断自动续写与图片输入
+
+- **截断自动续写**：上游因输出预算或连接中断把答案停在代码块、括号或逗号中间时，relay 会把已输出内容作为 assistant 轮次回放，并追加一轮“继续输出”把答案写完整；客户端只会收到一条连续的回答，完成帧只在最后一轮发出。工具调用回合、`finish_reason=length` 之后仍未闭合、以及反复重复的短回答都会停止续写，避免重复计费和死循环。用 `TRAE_AUTO_CONTINUE=0` 关闭，`TRAE_AUTO_CONTINUE_MAX` 调整轮数。
+- **图片输入**：`image_url`（OpenAI）与 `image`（Anthropic，base64 或 URL）都会转成 Trae 渲染层媒体块随请求发送。若所选模型不支持视觉，relay 会按账号实际可用的多模态模型自动切换，并在请求追踪中记录 `multimodal_switch`。用 `TRAE_MULTIMODAL_AUTO_SWITCH=0` 关闭，或用 `TRAE_MULTIMODAL_MODEL` 指定目标模型。
+- **排队位置**：上游排队事件只作为 SSE 注释心跳和消费记录的“链路”列暴露，不再写入模型正文。
+
 ## 网页管理界面
 
 启动后访问 `http://服务器:8000/web/login`，左侧纵向导航五个页面，右上角可切换浅色 / 夜间主题：
 
 - **概览**（默认首页）：总 tokens、输入 / 输出 / 缓存 tokens、今日用量、有效账号数；按日期堆叠柱状图（7 / 14 / 30 天）、服务状态（版本、运行时长、上游端点、自动路由、轮询、1M、自动签到、并发中请求）和按日期汇总表。数据来自 `GET /api/overview?days=N`，每日汇总持久化在 `data/usage_stats.json`，不受消费明细保留上限影响
 - **账号与签到**：上方是授权登录（网页授权、本机助手下载、手动填写凭证），中间是自动签到（启用开关、每日时间、立即执行，以及下次执行 / 上次执行 / 上次结果），下方是整宽账号列表（账号、用户 ID、状态、有效期、通用积分、签到状态，单账号签到 / 切换 / 删除，以及查询签到状态、查询全部积分、一键轮询签到）
-- **消费记录**：按请求显示模型、tokens、单次积分、状态、思考强度、上下文模式，以及是否携带工具参数和本轮是否返回工具调用
+- **消费记录**：按请求显示模型、tokens、单次积分、状态、思考强度、上下文模式，以及是否携带工具参数、本轮是否返回工具调用和链路（排队位置 / 自动续写轮数）
 - **轮询与设置**：多账号轮询开关、顺序 / 积分优先模式、上游端点预设与自定义 URL、Relay 端口、1M 上下文（Max 模式）开关与生效模型（可一键检测账号支持 Max 的模型）
 - **模型测试**：批量测试模型连通性，可选文本 / 工具探针、思考强度、thinking 输出和 1M Max，并可指定端点（测试期间禁止跨端点回落）
 
@@ -372,6 +412,7 @@ relay 支持两种连续会话方式：客户端可以在每轮重放完整 `inp
 - **敏感数据**：`.env` 与 `data/`（`accounts.json`、`usage_records.json`）包含 JWT、刷新令牌和账号信息，已在 `.gitignore` 和 `.dockerignore` 中排除，切勿提交或分享。
 - **工具执行在调用端**：relay 只转发工具调用和结果，不会替客户端执行命令或写文件。模型声称“已下载 / 已写入”但本地没有文件，说明客户端没有真正执行工具，请检查客户端是否把 `tools` 发给 relay、是否回传了 `role: "tool"` 结果。
 - **端点选择**：不想手动切换时打开「自动路由」；需要工具调用时优先用 IDE Agent 或 Remote。IDE Raw 已从正式控制台和打包预设中移除，个人账号不要选择 `UPSTREAM_MODE=raw`。切换端点或开关后无需重启，立即生效。
+- **自动续写**：默认开启，会把被截断的答案补完。若客户端自己管理轮次（例如自己拼接续写提示），用 `TRAE_AUTO_CONTINUE=0` 关闭，避免两边同时续写。
 - **上下文长度**：remote 扁平化 query 约 500K 字符时上游会静默断流，relay 默认在 480K 字符处裁剪最早的历史。长会话建议客户端自行压缩上下文。
 - **并发**：每账号默认 2 个并行会话（`TRAE_WEB_PARALLEL_LIMIT`），多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。
 - **签到 9074**：9074 是上游风控码。relay 会自动轮换签到设备 ID 并指数退避重试，无需手动反复点击；若长期失败，可在 `TRAE_CHECKIN_DEVICE_IDS_JSON` 中填入真实客户端的设备 ID。

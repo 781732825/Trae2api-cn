@@ -56,8 +56,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.responses import FileResponse
 
 from . import (
+    anthropic_api,
     auth,
     cli_client,
+    continuation,
+    images,
     raw_client,
     responses_api,
     trae_client,
@@ -65,7 +68,12 @@ from . import (
     traework_compat,
     traework_native_bridge,
 )
-from .model_limits import clamp_max_completion_tokens
+from .model_limits import (
+    MULTIMODAL_FALLBACK_ORDER,
+    clamp_max_completion_tokens,
+    configured_multimodal_model,
+    is_multimodal_model,
+)
 from .sse import (
     EmptyUpstreamResponse,
     ModelProviderMismatch,
@@ -1570,6 +1578,7 @@ def _web_login_html() -> str:
             <th class="numeric">Tokens（入 / 出 / 总）</th>
             <th class="numeric">消耗积分</th>
             <th>状态</th>
+            <th>链路</th>
           </tr>
         </thead>
         <tbody id="usage-records-body"></tbody>
@@ -2463,6 +2472,19 @@ function usageModelFlags(maxMode,tool){{
   return '<span class="usage-flag'+maxClass+'" title="'+escapeHtml(maxMode.title)+'">Max: '+maxText+'</span>'
     + '<span class="usage-flag'+toolClass+'" title="'+escapeHtml(tool.title)+'">Tool: '+toolText+'</span>';
 }}
+function usageTransportMeta(record){{
+  // Queue position and continuation rounds are transport telemetry: they must
+  // never appear in the model answer, but operators still need them to explain
+  // a slow turn or a completion that took more than one upstream round.
+  var position=Number(usageRecordField(record,['queue_position'])||0);
+  var rounds=Number(usageRecordField(record,['auto_continue_rounds'])||0);
+  var parts=[];
+  var title=[];
+  if(position>0){{ parts.push('排队 #'+position); title.push('上游队列位置 '+position); }}
+  if(rounds>0){{ parts.push('续写 '+rounds); title.push('自动续写 '+rounds+' 轮'); }}
+  if(!parts.length) return null;
+  return {{text:parts.join(' · '),title:title.join('；')}};
+}}
 async function refreshUsage() {{
   if(usageRefreshing) return;
   usageRefreshing=true;
@@ -2489,6 +2511,7 @@ async function refreshUsage() {{
          var context=usageContextMeta(record);
          var maxMode=usageMaxMeta(record);
          var tool=usageToolMeta(record);
+         var transport=usageTransportMeta(record);
         var input=Number(record.input_tokens!==undefined?record.input_tokens:(record.prompt_tokens||0));
         var output=Number(record.output_tokens!==undefined?record.output_tokens:(record.completion_tokens||0));
         var total=Number(record.total_tokens!==undefined?record.total_tokens:(input+output));
@@ -2512,6 +2535,7 @@ async function refreshUsage() {{
           + '<td class="numeric">'+escapeHtml(tokenText)+'</td>'
           + '<td class="numeric" title="'+escapeHtml(source)+'">'+escapeHtml(creditText)+'</td>'
           + '<td class="usage-status"><span class="badge '+badge+'">'+escapeHtml(statusText)+'</span></td>'
+          + '<td class="usage-meta usage-transport"'+(transport?(' title="'+escapeHtml(transport.title)+'"'):'')+'>'+(transport?escapeHtml(transport.text):'--')+'</td>'
           + '</tr>';
       }}).join('');
     }}
@@ -4047,6 +4071,462 @@ async def _deferred_dispatch_stream(
         )
 
 
+def _continuation_allowed(options: Optional[Mapping[str, Any]]) -> bool:
+    """Whether this request may transparently continue a truncated answer."""
+
+    if not continuation.enabled():
+        return False
+    options = options or {}
+    if options.get("_disable_auto_continue"):
+        return False
+    # TraeWork's custom-model ingress already owns its own turn loop; a relay
+    # continuation there would double-bill a client-managed conversation.
+    if options.get("_traework_custom_model"):
+        return False
+    return True
+
+
+async def _stream_with_continuation(
+    messages: list[dict],
+    model: str,
+    options: dict,
+    first_response,
+):
+    """Forward one streamed turn, continuing it while the answer is cut off.
+
+    The public response is a single OpenAI SSE stream: continued rounds append
+    deltas, and only the last round emits the finish frame and ``[DONE]``.  Any
+    tool call, an explicit ``finish_reason=length`` on the client's request
+    budget, or a repeated short answer stops the loop so a caller never sees a
+    duplicated or unbounded answer.
+    """
+
+    limit = continuation.max_continues()
+    if not _continuation_allowed(options) or limit <= 0:
+        async for chunk in first_response:
+            yield chunk
+        return
+
+    threshold = continuation.text_threshold()
+    similarity_limit = continuation.similarity_threshold()
+    current_messages = list(messages)
+    current_response = _response_body_iterator(first_response)
+    text_total = ""
+    last_short_text = ""
+    finish_chunks: list[str] = []
+    saw_tool_call = False
+    finish_reason = "stop"
+    reasoning_total = ""
+    request_id = str((options or {}).get("_relay_request_id") or "")
+    # Upstream/proxies may coalesce several SSE blocks into one network
+    # chunk. Keep an incomplete block between reads so a terminal block never
+    # causes the preceding text block to be held back or dropped.
+    sse_buffer = ""
+
+    def complete_blocks(raw: Any, *, flush: bool = False) -> list[str]:
+        nonlocal sse_buffer
+        if isinstance(raw, (bytes, bytearray)):
+            text = bytes(raw).decode("utf-8", errors="replace")
+        else:
+            text = str(raw or "")
+        if text:
+            sse_buffer += text.replace("\r\n", "\n")
+        blocks: list[str] = []
+        while "\n\n" in sse_buffer:
+            block, sse_buffer = sse_buffer.split("\n\n", 1)
+            if block.strip():
+                blocks.append(block + "\n\n")
+        if flush and sse_buffer.strip():
+            blocks.append(sse_buffer)
+            sse_buffer = ""
+        return blocks
+
+    for attempt in range(limit + 1):
+        finish_chunks = []
+        round_text = ""
+        round_reasoning = ""
+        saw_tool_call = False
+        finish_reason = "stop"
+        async for raw_chunk in current_response:
+            for chunk in complete_blocks(raw_chunk):
+                parsed = _chunk_finish_reason(chunk)
+                if parsed:
+                    finish_reason = parsed
+                if _chunk_has_tool_calls(chunk):
+                    saw_tool_call = True
+                state = _chunk_stream_state(chunk)
+                if state is not None:
+                    # Hold only the terminal SSE block. If a proxy coalesced
+                    # text + finish + [DONE], the text block was already
+                    # yielded above instead of being lost with the finish.
+                    finish_chunks.append(chunk)
+                    continue
+                round_text += _chunk_text_delta(chunk)
+                round_reasoning += _chunk_reasoning_delta(chunk)
+                yield chunk
+
+        # Flush a final non-blank fragment for upstreams that close without a
+        # blank-line delimiter. A terminal [DONE] block is always delimited.
+        for chunk in complete_blocks("", flush=True):
+            parsed = _chunk_finish_reason(chunk)
+            if parsed:
+                finish_reason = parsed
+            if _chunk_has_tool_calls(chunk):
+                saw_tool_call = True
+            state = _chunk_stream_state(chunk)
+            if state is not None:
+                finish_chunks.append(chunk)
+                continue
+            round_text += _chunk_text_delta(chunk)
+            round_reasoning += _chunk_reasoning_delta(chunk)
+            yield chunk
+
+        text_total += round_text
+        reasoning_total += round_reasoning
+        truncated = continuation.looks_truncated(
+            text_total,
+            finish_reason,
+            has_tool_calls=saw_tool_call,
+            reasoning=round_reasoning,
+        )
+        reasoning_only = continuation.looks_reasoning_only(
+            round_text,
+            has_tool_calls=saw_tool_call,
+            reasoning=round_reasoning,
+        )
+        if not truncated and not reasoning_only:
+            break
+        if attempt >= limit:
+            logger.info(
+                "auto-continue limit reached id=%s rounds=%d finish=%s",
+                request_id,
+                attempt + 1,
+                finish_reason,
+            )
+            break
+
+        # A short round that repeats the previous round verbatim means the
+        # model is looping; continuing again would only duplicate it.  Compare
+        # per-round text, never the accumulated answer, so a legitimate
+        # continuation that shares a prefix is not mistaken for a loop.
+        current_text = round_text.strip()
+        if len(current_text) < threshold and last_short_text:
+            if continuation.similarity(last_short_text, current_text) > similarity_limit:
+                logger.warning(
+                    "auto-continue stopped on repeated short answer id=%s", request_id
+                )
+                break
+        if len(current_text) < threshold:
+            last_short_text = current_text
+
+        logger.info(
+            "auto-continue round=%d id=%s model=%s reason=%s finish=%s chars=%d",
+            attempt + 1,
+            request_id,
+            model,
+            "reasoning-only" if reasoning_only else "truncated",
+            finish_reason,
+            len(round_text),
+        )
+        active_tracker = _USAGE_TRACKER.get()
+        bind_rounds = getattr(active_tracker, "bind_auto_continue", None)
+        if callable(bind_rounds):
+            bind_rounds(attempt + 1)
+        current_messages = continuation.continued_messages(
+            messages, text_total, reasoning_only=reasoning_only
+        )
+        # Re-enter the deferred dispatcher so a continuation round keeps the
+        # same endpoint fallback and pre-output retry guarantees as the first
+        # round.  It is an async generator, so a mid-stream failure surfaces as
+        # a stream error frame instead of an exception at this call site.
+        current_response = _deferred_dispatch_stream(
+            current_messages, model, dict(options)
+        )
+
+    if not finish_chunks:
+        # A continued round that closed without its own terminal frame must not
+        # leave the caller waiting on a half-open stream.
+        finish_chunks = [
+            _stream_error_event_free_finish(model),
+            "data: [DONE]\n\n",
+        ]
+    for chunk in finish_chunks:
+        yield chunk
+
+
+def _stream_error_event_free_finish(model: str) -> str:
+    """A terminal Chat Completions frame for a stream that ended silently."""
+
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+
+
+async def _nonstream_with_continuation(
+    messages: list[dict],
+    model: str,
+    options: dict,
+    tracker: "_UsageTracker",
+):
+    """Non-streaming twin of :func:`_stream_with_continuation`.
+
+    Completion objects are merged in place: the continued text is appended to
+    the first answer's message, usage is summed, and the terminal finish reason
+    comes from the final round.
+    """
+
+    limit = continuation.max_continues()
+    threshold = continuation.text_threshold()
+    similarity_limit = continuation.similarity_threshold()
+    request_id = str((options or {}).get("_relay_request_id") or "")
+    current_messages = list(messages)
+    merged: Optional[dict[str, Any]] = None
+    text_total = ""
+    reasoning_total = ""
+    last_short_text = ""
+    # One tracker owns the whole multi-round turn: begin once, fold every
+    # round's usage into it, and finish once so the console still records a
+    # single billable request with the summed token counts.
+    context_token = _USAGE_TRACKER.set(tracker)
+    status = "completed"
+    try:
+        await tracker.begin()
+        for attempt in range(limit + 1):
+            response = await _dispatch_chat(current_messages, model, False, options)
+            if getattr(response, "status_code", 200) >= 400:
+                status = "error"
+                return response
+            try:
+                completion = json.loads(getattr(response, "body", b"{}"))
+            except Exception:
+                return response
+            if not isinstance(completion, dict):
+                return response
+            _track_usage_from_result(completion, model)
+            choices = completion.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            choice = choice if isinstance(choice, Mapping) else {}
+            message = choice.get("message")
+            message = message if isinstance(message, Mapping) else {}
+            tool_calls = message.get("tool_calls")
+            tool_calls = tool_calls if isinstance(tool_calls, list) else []
+            round_text = str(message.get("content") or "")
+            round_reasoning = str(
+                message.get("reasoning_content") or message.get("reasoning") or ""
+            )
+            finish_reason = str(choice.get("finish_reason") or "stop")
+
+            if merged is None:
+                merged = completion
+            else:
+                merged_choices = merged.setdefault("choices", [{}])
+                merged_choice = (
+                    merged_choices[0] if isinstance(merged_choices, list) and merged_choices else {}
+                )
+                if not isinstance(merged_choice, dict):
+                    merged_choice = {}
+                    merged_choices.insert(0, merged_choice)
+                merged_message = merged_choice.setdefault("message", {})
+                if not isinstance(merged_message, dict):
+                    merged_message = {}
+                    merged_choice["message"] = merged_message
+                combined = str(merged_message.get("content") or "") + round_text
+                merged_message["content"] = combined or None
+                if round_reasoning:
+                    merged_message["reasoning_content"] = (
+                        str(merged_message.get("reasoning_content") or "")
+                        + round_reasoning
+                    )
+                if tool_calls:
+                    merged_message["tool_calls"] = tool_calls
+                merged_choice["finish_reason"] = finish_reason
+                merged_usage = merged.get("usage")
+                round_usage = completion.get("usage")
+                if isinstance(merged_usage, dict) and isinstance(round_usage, Mapping):
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        merged_usage[key] = int(merged_usage.get(key) or 0) + int(
+                            round_usage.get(key) or 0
+                        )
+
+            text_total += round_text
+            reasoning_total += round_reasoning
+            truncated = continuation.looks_truncated(
+                text_total,
+                finish_reason,
+                has_tool_calls=bool(tool_calls),
+                reasoning=round_reasoning,
+            )
+            reasoning_only = continuation.looks_reasoning_only(
+                round_text,
+                has_tool_calls=bool(tool_calls),
+                reasoning=round_reasoning,
+            )
+            if not truncated and not reasoning_only:
+                break
+            if attempt >= limit:
+                break
+            current_text = round_text.strip()
+            if len(current_text) < threshold and last_short_text:
+                if (
+                    continuation.similarity(last_short_text, current_text)
+                    > similarity_limit
+                ):
+                    logger.warning(
+                        "auto-continue stopped on repeated short answer id=%s",
+                        request_id,
+                    )
+                    break
+            if len(current_text) < threshold:
+                last_short_text = current_text
+            logger.info(
+                "auto-continue round=%d id=%s model=%s nonstream reason=%s chars=%d",
+                attempt + 1,
+                request_id,
+                model,
+                "reasoning-only" if reasoning_only else "truncated",
+                len(round_text),
+            )
+            bind_auto_continue = getattr(tracker, "bind_auto_continue", None)
+            if callable(bind_auto_continue):
+                bind_auto_continue(attempt + 1)
+            current_messages = continuation.continued_messages(
+                messages, text_total, reasoning_only=reasoning_only
+            )
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        _USAGE_TRACKER.reset(context_token)
+        await tracker.finish(status)
+
+    if merged is None:
+        return _openai_error(502, "Upstream returned no completion", "api_error")
+    return JSONResponse(content=merged)
+
+
+def _response_body_iterator(response):
+    if hasattr(response, "__aiter__"):
+        return response
+    if hasattr(response, "__iter__") and not isinstance(response, (str, bytes, Mapping)):
+        return _as_async(response)
+    iterator = getattr(response, "body_iterator", None)
+    if iterator is not None:
+        return iterator
+    body = getattr(response, "body", b"") or b""
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+
+    async def single():
+        if text:
+            yield text
+
+    return single()
+
+
+async def _as_async(iterable):
+    """Adapt a plain (sync) iterator to an async one for the stream helpers."""
+
+    for item in iterable:
+        yield item
+
+
+def _chunk_text_delta(chunk: Any) -> str:
+    return _chunk_delta_field(chunk, "content")
+
+
+def _chunk_reasoning_delta(chunk: Any) -> str:
+    text = _chunk_delta_field(chunk, "reasoning_content")
+    return text or _chunk_delta_field(chunk, "reasoning")
+
+
+def _chunk_delta_field(chunk: Any, field: str) -> str:
+    for value in _iter_sse_payloads(chunk):
+        choices = value.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get("delta")
+                if isinstance(delta, Mapping):
+                    text = delta.get(field)
+                    if isinstance(text, str) and text:
+                        return text
+        text = value.get(field)
+        if isinstance(text, str) and text:
+            return text
+    return ""
+
+
+def _chunk_finish_reason(chunk: Any) -> str:
+    for value in _iter_sse_payloads(chunk):
+        choices = value.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            reason = choice.get("finish_reason")
+            if reason not in (None, ""):
+                return str(reason)
+    return ""
+
+
+def _chunk_has_tool_calls(chunk: Any) -> bool:
+    for value in _iter_sse_payloads(chunk):
+        if _tool_call_count(value) > 0:
+            return True
+        choices = value.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, Mapping) and delta.get("tool_calls"):
+                return True
+    return False
+
+
+def _iter_sse_payloads(chunk: Any):
+    if isinstance(chunk, (bytes, bytearray)):
+        text = bytes(chunk).decode("utf-8", errors="replace")
+    else:
+        text = str(chunk or "")
+    if not text:
+        return
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        if not block.strip():
+            continue
+        data_lines = [
+            line[5:].lstrip()
+            for line in block.split("\n")
+            if line.startswith("data:")
+        ]
+        if not data_lines:
+            continue
+        payload = "\n".join(data_lines).strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            value = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(value, Mapping):
+            yield value
+
+
 def _tool_translation_options(
     options: Optional[dict], messages: Optional[list[dict]] = None
 ) -> dict:
@@ -5399,6 +5879,8 @@ class _UsageTracker:
         self.tools_requested = _tools_requested_from_options(options)
         self.tool_used: bool | None = None
         self.tool_calls_returned: bool | None = None
+        self.queue_position: int | None = None
+        self.auto_continue_rounds: int | None = None
         self.status = "in_progress"
         self._finished = False
         self._credit_snapshot_started = bool(
@@ -5449,6 +5931,24 @@ class _UsageTracker:
         value = str(usage_turn_id or "").strip()
         if value and (replace or not self.usage_turn_id):
             self.usage_turn_id = value
+
+    def bind_queue_position(self, position: Any) -> None:
+        """Record the deepest queue position observed for this request."""
+
+        if isinstance(position, bool) or not isinstance(position, (int, float)):
+            return
+        value = int(position)
+        if self.queue_position is None or value > self.queue_position:
+            self.queue_position = value
+
+    def bind_auto_continue(self, rounds: Any) -> None:
+        """Record how many automatic continuation rounds completed the answer."""
+
+        if isinstance(rounds, bool) or not isinstance(rounds, (int, float)):
+            return
+        value = int(rounds)
+        if value > 0:
+            self.auto_continue_rounds = value
 
     async def rebind(self, options: Optional[Mapping[str, Any]] = None) -> None:
         """Move billing/credit tracking to the account used by a retry.
@@ -5577,6 +6077,8 @@ class _UsageTracker:
             tool_used=self.tool_used,
             tool_calls_returned=self.tool_calls_returned,
             tool_called=self.tool_used,
+            queue_position=self.queue_position,
+            auto_continue_rounds=self.auto_continue_rounds,
         )
         if explicit_credits is not None:
             try:
@@ -5720,6 +6222,11 @@ def _bind_usage_turn(usage_turn_id: Any, *, replace: bool = False) -> None:
 def _bind_usage_turn_from_metadata(metadata: Any) -> None:
     if isinstance(metadata, Mapping):
         _bind_usage_turn(metadata.get("usage_turn_id"))
+        position = metadata.get("queue_position")
+        tracker = _USAGE_TRACKER.get()
+        bind_position = getattr(tracker, "bind_queue_position", None)
+        if callable(bind_position) and isinstance(position, (int, float)):
+            bind_position(position)
 
 
 def _remote_only_models() -> set[str]:
@@ -7477,6 +7984,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         or record.get("_usage_turn_id")
         or ""
     ).strip() or None
+    queue_position = _number_value(record.get("queue_position"))
+    auto_continue_rounds = _number_value(record.get("auto_continue_rounds"))
     normalized.update(
         {
             "account_id": str(record.get("account_id") or "default"),
@@ -7564,6 +8073,10 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             "tool_calls_returned": tool_calls_returned,
             "tool_called": tool_called,
             "tool": tool_called,
+            # Transport telemetry: how long the request waited in Trae's queue
+            # and how many automatic continuation rounds completed the answer.
+            "queue_position": queue_position,
+            "auto_continue_rounds": auto_continue_rounds,
         }
     )
     return normalized
@@ -7811,6 +8324,8 @@ def _record_usage(
     tool_used: bool | None = None,
     tool_calls_returned: bool | None = None,
     tool_called: bool | None = None,
+    queue_position: int | None = None,
+    auto_continue_rounds: int | None = None,
 ) -> dict[str, Any]:
     """Record one API request (newest first) and persist it independently."""
     global _USAGE_HISTORY
@@ -7846,6 +8361,8 @@ def _record_usage(
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
             "tool_called": tool_called,
+            "queue_position": queue_position,
+            "auto_continue_rounds": auto_continue_rounds,
         }
     )
     with _USAGE_LOCK:
@@ -7991,6 +8508,78 @@ def _auto_route_enabled() -> bool:
         return False
 
 
+def _multimodal_fallback_model(model: str) -> str:
+    """Pick a vision-capable model for an image-bearing request.
+
+    Trae's text-only configs cannot read an attached image; forwarding the
+    request unchanged makes the model answer as if no image existed.  Prefer
+    the operator's explicit override, then the account's live catalog, then the
+    built-in preference order.
+    """
+
+    requested = str(model or "").strip()
+    if is_multimodal_model(requested):
+        return ""
+    # Models the active account actually advertises as multimodal win over the
+    # static preference order, so an account without a given model still gets
+    # a working switch instead of a 404 on the substituted name.
+    available: set[str] = set()
+    for cached in list(trae_client._WEB_MODEL_CACHE.values()):
+        configs = cached[1] if isinstance(cached, tuple) and len(cached) > 1 else {}
+        if not isinstance(configs, Mapping):
+            continue
+        for name, config in configs.items():
+            if isinstance(config, Mapping) and config.get("multimodal"):
+                available.add(str(name).strip().lower())
+    candidates: list[str] = []
+    override = configured_multimodal_model()
+    if override:
+        candidates.append(override)
+    if available:
+        candidates.extend(
+            name for name in MULTIMODAL_FALLBACK_ORDER if name.lower() in available
+        )
+    if not candidates:
+        candidates.extend(MULTIMODAL_FALLBACK_ORDER)
+    for candidate in candidates:
+        name = str(candidate or "").strip()
+        if name and name.lower() != requested.lower():
+            return name
+    return ""
+
+
+def _apply_multimodal_switch(
+    messages: Optional[list[dict]], model: str, options: Optional[dict]
+) -> str:
+    """Re-point an image request at a vision model; returns the effective model."""
+
+    if not images.messages_have_images(messages):
+        return model
+    if is_multimodal_model(model):
+        return model
+    if str(os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH", "1")).strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return model
+    fallback = _multimodal_fallback_model(model)
+    if not fallback:
+        logger.warning(
+            "image request kept on text-only model=%s (no multimodal model available)",
+            model,
+        )
+        return model
+    logger.info(
+        "image request re-pointed model=%s -> %s", model, fallback
+    )
+    trace = (options or {}).get("_upstream_trace")
+    if isinstance(trace, dict):
+        trace["multimodal_switch"] = {"from": model, "to": fallback}
+    return fallback
+
+
 def _apply_auto_route(
     messages: Optional[list[dict]], options: Optional[dict]
 ) -> dict:
@@ -8062,6 +8651,9 @@ def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
 
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
     options = _apply_auto_route(messages, options)
+    # A text-only config cannot read an attached image, so an image request is
+    # re-pointed at a multimodal model before any routing decision is made.
+    model = _apply_multimodal_switch(messages, model, options)
     try:
         _ensure_model_account_enabled(
             str(options.get("_account_id") or ""),
@@ -8627,12 +9219,22 @@ async def handle_chat(req: Request):
         return StreamingResponse(
             _tracked_stream(
                 _lease_stream(
-                    _deferred_dispatch_stream(messages, model, options), session_id
+                    _stream_with_continuation(
+                        messages,
+                        model,
+                        options,
+                        _deferred_dispatch_stream(messages, model, options),
+                    ),
+                    session_id,
                 ),
                 tracker,
             ),
             media_type="text/event-stream",
             headers=_sse_headers(),
+        )
+    if _continuation_allowed(options) and continuation.max_continues() > 0:
+        return await _nonstream_with_continuation(
+            messages, model, options, tracker
         )
     return await _tracked_dispatch(messages, model, options, tracker)
 
@@ -8731,6 +9333,177 @@ async def handle_responses(req: Request):
         )
     return JSONResponse(
         content=responses_api.completion_to_response(completion, context)
+    )
+
+
+async def handle_anthropic_messages(req: Request):
+    """Anthropic Messages API ingress for Claude Code and compatible clients."""
+
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _body_bytes = await _read_json_body(
+            req,
+            endpoint="messages",
+            trace_id=request_id,
+        )
+    except _RequestBodyError as exc:
+        logger.warning(
+            "request body rejected id=%s endpoint=messages bytes=%d error=%s",
+            request_id,
+            exc.raw_bytes,
+            exc,
+        )
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+    try:
+        messages, options = anthropic_api.normalize_request(body)
+    except anthropic_api.AnthropicRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+
+    messages = cli_client.sanitize_assistant_history_messages(messages)
+    model = str(body.get("model") or "auto")
+    options = _apply_tool_header_hints(req, options)
+    option_error = _validate_chat_options(options)
+    if option_error is not None:
+        return option_error
+    for key in ("max_tokens", "maxTokens", "max_completion_tokens"):
+        if key in options:
+            options[key] = clamp_max_completion_tokens(options[key], model)
+    options = _with_auto_client_context(req, body, messages, options)
+    options = _bind_chat_session(
+        messages,
+        options,
+        requested_session_id=_request_session_hint(req, body),
+    )
+    stream = bool(body.get("stream", False))
+    tracker = _UsageTracker(model, req.url.path, stream, options, messages)
+    tracker.request_id = request_id
+    options["_relay_request_id"] = request_id
+    input_tokens = anthropic_api.estimate_input_tokens(
+        messages, body.get("system"), options.get("tools")
+    )
+    logger.info(
+        "request received id=%s path=%s keys=%s messages=%d input_chars=%d stream=%s",
+        request_id,
+        req.url.path,
+        ",".join(sorted(str(key) for key in body.keys())),
+        len(messages),
+        sum(
+            len(str(item.get("content") or ""))
+            for item in messages
+            if isinstance(item, Mapping)
+        ),
+        stream,
+    )
+    logger.info(
+        "request binding id=%s account=%s billing=%s session=%s",
+        request_id,
+        str(options.get("_account_id") or "default"),
+        str(options.get("_billing_id") or options.get("_account_id") or "default"),
+        str(options.get("session_id") or options.get("sessionId") or "")[:32],
+    )
+    if stream:
+        session_id = str(options.get("session_id") or options.get("sessionId") or "")
+        return StreamingResponse(
+            _tracked_stream(
+                _lease_stream(
+                    anthropic_api.translate_chat_stream(
+                        _stream_with_continuation(
+                            messages,
+                            model,
+                            options,
+                            _deferred_dispatch_stream(messages, model, options),
+                        ),
+                        model,
+                        request_input_tokens=input_tokens,
+                    ),
+                    session_id,
+                ),
+                tracker,
+            ),
+            media_type="text/event-stream",
+            headers=_sse_headers(),
+        )
+    if _continuation_allowed(options) and continuation.max_continues() > 0:
+        chat_response = await _nonstream_with_continuation(
+            messages, model, options, tracker
+        )
+    else:
+        chat_response = await _tracked_dispatch(messages, model, options, tracker)
+    if getattr(chat_response, "status_code", 200) >= 400:
+        detail = _upstream_response_error(chat_response) or "Upstream request failed"
+        return JSONResponse(
+            status_code=getattr(chat_response, "status_code", 502),
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": detail},
+            },
+        )
+    try:
+        completion = json.loads(chat_response.body)
+    except Exception:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "Invalid Chat Completions response",
+                },
+            },
+        )
+    return JSONResponse(
+        content=anthropic_api.completion_to_message(
+            completion, model, request_input_tokens=input_tokens
+        )
+    )
+
+
+async def handle_anthropic_count_tokens(req: Request):
+    """Anthropic-compatible token count estimate; this endpoint does not bill."""
+
+    request_id = "req-" + uuid_mod.uuid4().hex
+    try:
+        body, _body_bytes = await _read_json_body(
+            req,
+            endpoint="messages/count_tokens",
+            trace_id=request_id,
+        )
+    except _RequestBodyError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+    try:
+        messages, options = anthropic_api.normalize_request(body)
+    except anthropic_api.AnthropicRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": str(exc)},
+            },
+        )
+    return JSONResponse(
+        content={
+            "input_tokens": anthropic_api.estimate_input_tokens(
+                messages, body.get("system"), options.get("tools")
+            )
+        }
     )
 
 
@@ -9074,6 +9847,10 @@ async def auth_middleware(request: Request, call_next):
         token = header[7:].strip()
     else:
         token = header.strip()
+    if not token:
+        # Anthropic clients (Claude Code) authenticate with ``x-api-key``
+        # instead of a bearer Authorization header.
+        token = request.headers.get("x-api-key", "").strip()
     if token not in API_KEYS:
         return _openai_error(401, "Invalid API key", "authentication_error")
     return await call_next(request)
@@ -9224,6 +10001,16 @@ async def traework_custom_connectivity(req: Request):
 @app.post("/v1/responses")
 async def responses(req: Request):
     return await handle_responses(req)
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(req: Request):
+    return await handle_anthropic_messages(req)
+
+
+@app.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(req: Request):
+    return await handle_anthropic_count_tokens(req)
 
 
 @app.post("/api/model-test")

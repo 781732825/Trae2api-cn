@@ -197,6 +197,12 @@ def _capture_upstream_metadata(target: Any, payload: Any) -> None:
     turn_id = _usage_turn_id(payload)
     if turn_id:
         target["usage_turn_id"] = turn_id
+    # Queue position is transport telemetry.  Record it for the console and
+    # request trace instead of leaking it into assistant text.
+    if isinstance(payload, dict):
+        position = payload.get("position")
+        if isinstance(position, (int, float)) and not isinstance(position, bool):
+            target["queue_position"] = int(position)
 
 
 def _provider_model_name(payload: Any) -> str:
@@ -1546,7 +1552,6 @@ async def translate_ide_stream(
     saw_terminal = False
     terminal_event_pending = False
     started = not fail_on_empty
-    pending_queue_chunks: list[str] = []
 
     if started:
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1600,17 +1605,20 @@ async def translate_ide_stream(
         if event_type == "request_wait_in_queue" or obj.get("position") is not None:
             position = obj.get("position", 0)
             if position != last_queue_position:
-                queue_chunk = openai_chunk(
-                    prefix_id,
-                    model,
-                    {"content": f"排队中，当前位置：{position}\n"},
-                )
-                if started:
-                    yield queue_chunk
-                    content_count += 1
-                else:
-                    pending_queue_chunks.append(queue_chunk)
+                # Queue position is transport telemetry, never assistant text.
+                # Emitting it as ``content`` polluted every caller's context
+                # (and made the relay look like it answered with a status
+                # line).  Keep the wire alive with an SSE comment instead;
+                # the position remains visible in the relay log.
                 last_queue_position = position
+                logger.info(
+                    "upstream queue position model=%s position=%s", model, position
+                )
+                # A probe stream (``fail_on_empty``) must stay silent until the
+                # upstream proves it will answer; a keepalive here would make a
+                # doomed probe look like a started turn and defeat the retry.
+                if started:
+                    yield _STREAM_HEARTBEAT_LINE
             continue
         if event_type == "token_usage":
             final_usage = _map_usage(obj.get("usage") or obj)
@@ -1651,9 +1659,6 @@ async def translate_ide_stream(
         if tool_chunks and not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
         for chunk in tool_chunks:
             yield chunk
 
@@ -1662,9 +1667,6 @@ async def translate_ide_stream(
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
-                for pending in pending_queue_chunks:
-                    yield pending
-                pending_queue_chunks.clear()
             completion_bytes += len(text_delta.encode("utf-8"))
             content_count += 1
             yield openai_chunk(prefix_id, model, {"content": text_delta})
@@ -1703,9 +1705,6 @@ async def translate_ide_stream(
     if final_tool_chunks and not started:
         started = True
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
-        for pending in pending_queue_chunks:
-            yield pending
-        pending_queue_chunks.clear()
     for chunk in final_tool_chunks:
         yield chunk
 
@@ -1714,9 +1713,6 @@ async def translate_ide_stream(
         if not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
         completion_bytes += len(final_text_delta.encode("utf-8"))
         content_count += 1
         yield openai_chunk(prefix_id, model, {"content": final_text_delta})
@@ -1728,9 +1724,6 @@ async def translate_ide_stream(
         if not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
         yield openai_chunk(
             prefix_id,
             model,
