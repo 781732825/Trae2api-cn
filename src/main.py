@@ -2713,7 +2713,7 @@ function usageBoolean(value){{
 }}
 function usageEffortLabel(value){{
   if(value===undefined || value===null || value==='') return '';
-  var text=String(value).trim().toLowerCase().replace(/[\s-]+/g,'_');
+  var text=String(value).trim().toLowerCase().replace(/[\\s-]+/g,'_');
   if(text==='none' || text==='minimal' || text==='min') return '最低';
   if(text==='low' || text==='light') return '低';
   if(text==='medium' || text==='mid' || text==='normal' || text==='default') return '中';
@@ -2763,7 +2763,7 @@ function usageContextMeta(record){{
   // the separate Max column for actual activation evidence.
   if(value===null && requested!==null) value=requested;
   if(value===null) return {{text:'--',title:'未记录上下文模式'+(requested!==null?'；请求: '+String(requested):''),unknown:true}};
-  var text=String(value).trim().toLowerCase().replace(/[\s_-]+/g,'');
+  var text=String(value).trim().toLowerCase().replace(/[\\s_-]+/g,'');
   var label;
   if(['max','max1m','1m','1000000','agent','agentmax','maxmode'].indexOf(text)>=0 || size>=1000000) label='1M Max';
   else if(['standard','default','work','dev','200k','200000','normal'].indexOf(text)>=0) label='标准';
@@ -2780,14 +2780,14 @@ function usageMaxMeta(record){{
   if(requested===null){{
     var requestedContext=usageRecordField(record,['context_mode_requested','requested_context_mode']);
     if(requestedContext!==null){{
-      var normalized=String(requestedContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      var normalized=String(requestedContext).trim().toLowerCase().replace(/[\\s_-]+/g,'');
       requested=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(normalized)>=0;
     }}
   }}
   if(enabled===null){{
     var actualContext=usageRecordField(record,['context_mode_actual','actual_context_mode','context_mode']);
     if(actualContext!==null){{
-      var actual=String(actualContext).trim().toLowerCase().replace(/[\s_-]+/g,'');
+      var actual=String(actualContext).trim().toLowerCase().replace(/[\\s_-]+/g,'');
       enabled=['max','max1m','1m','1000000','agentmax','maxmode'].indexOf(actual)>=0;
     }}
   }}
