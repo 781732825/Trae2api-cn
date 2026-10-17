@@ -1152,9 +1152,10 @@ _KNOWN_MODELS = {
     # These names are the exact raw ids used by TraeWork's bundled client.
     "auto": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
     "coding": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),
-    # The raw transport uses the shared GLM v2 model id even though the
-    # public config is glm-5.2 (captured TraeWork Extra/body contract).
-    "glm-5.2": RawModel("glm-5.2", "glm-5__v2", "GLM-5.2"),
+    # GLM-5.2 has its own raw provider id.  ``glm-5__v2`` belongs to the
+    # GLM-5.1/coding config; sending it for GLM-5.2 lets the upstream bind the
+    # session to its default provider (observed as an unexpected Kimi model).
+    "glm-5.2": RawModel("glm-5.2", "glm-5.2", "GLM-5.2"),
     # glm-5.3 is resolved against the account model list when available.
     "glm-5.3": RawModel("glm-5.3", "glm-5.3", "GLM-5.3"),
     "glm-5.1": RawModel("glm-5.1", "glm-5__v2", "GLM-5.1"),

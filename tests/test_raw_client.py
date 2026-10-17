@@ -296,7 +296,7 @@ class RawClientBuildTests(unittest.TestCase):
 
         expected = {
             "auto": ("glm-5.2", "glm-5.2", "GLM-5.2"),
-            "glm-5.2": ("glm-5.2", "glm-5__v2", "GLM-5.2"),
+            "glm-5.2": ("glm-5.2", "glm-5.2", "GLM-5.2"),
             "glm-5.3": ("glm-5.3", "glm-5.3", "GLM-5.3"),
             "coding": ("glm-5.1", "glm-5__v2", "GLM-5.1"),
             "deepseek-v4-pro": (
@@ -511,7 +511,7 @@ class RawClientBuildTests(unittest.TestCase):
     def test_model_aliases_use_shared_trae_mapping(self):
         self.assertEqual(
             raw_client.resolve_raw_model("claude-sonnet-4").raw_model_name,
-            "glm-5__v2",
+            "glm-5.2",
         )
         self.assertEqual(
             raw_client.resolve_raw_model("gpt-4o").raw_model_name,
@@ -522,6 +522,33 @@ class RawClientBuildTests(unittest.TestCase):
             raw_client.resolve_raw_model("glm-5.3").raw_model_name,
             "glm-5.3",
         )
+
+    def test_glm52_model_lock_is_consistent_in_body_and_extra(self):
+        """GLM-5.2 must be bound identically in body and legacy Extra."""
+        model = raw_client.resolve_raw_model("glm-5.2")
+        body = raw_client.build_raw_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "glm-5.2",
+            session_id="glm52-session",
+        )
+        with (
+            patch.object(raw_client.auth, "get_user_id", return_value="user-1"),
+            patch("src.trae_client.build_headers", return_value={}),
+        ):
+            headers = raw_client.build_raw_headers(
+                "https://raw.example",
+                "token",
+                model,
+                "request-id",
+                session_id="glm52-session",
+            )
+
+        extra = json.loads(headers["Extra"])
+        self.assertEqual(body["config_name"], "glm-5.2")
+        self.assertEqual(body["model_name"], "glm-5.2")
+        self.assertEqual(extra["config_name"], "glm-5.2")
+        self.assertEqual(extra["model_name"], "glm-5.2")
+        self.assertNotIn("kimi", json.dumps({"body": body, "extra": extra}).lower())
 
     def test_deepseek_v4_flash_raw_model_mappings_are_pinned(self):
         flash = raw_client.resolve_raw_model("trae/DeepSeek-V4-Flash")
