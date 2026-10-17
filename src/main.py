@@ -10802,6 +10802,31 @@ def _apply_multimodal_switch(
         return model
     if is_multimodal_model(model):
         return model
+    # An explicitly selected model is part of the API contract.  Re-pointing
+    # it to a vision model silently changes both the provider fingerprint and
+    # the billable model (for example glm-5.2 -> kimi-k2.6).  Automatic model
+    # selection may still choose a vision-capable candidate, but an explicit
+    # request must stay pinned unless the operator opts into the legacy
+    # behaviour with TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT=1.
+    options = options if isinstance(options, dict) else {}
+    requested_model = str(options.get("_requested_model") or "").strip()
+    explicit_request = requested_model and not _task_model_is_automatic(requested_model)
+    explicit_switch = str(
+        os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if explicit_request and not explicit_switch:
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace["multimodal_switch_skipped"] = {
+                "requested": requested_model,
+                "effective": model,
+                "reason": "explicit_model_pinned",
+            }
+        logger.info(
+            "image request keeps explicitly selected model=%s",
+            model,
+        )
+        return model
     if str(os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH", "1")).strip().lower() in {
         "0",
         "false",
@@ -10896,12 +10921,15 @@ def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
 
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
     requested_model = model
+    options = dict(options or {})
+    options.setdefault("_requested_model", str(requested_model or "").strip())
     options = _apply_auto_route(messages, options)
     # Resolve the concrete endpoint before selecting an automatic task model.
     # Model availability is product/account scoped; choosing from a global
     # alias table before this point can send an otherwise valid ``auto``
     # request to a model unsupported by the selected executor.
     model, options = _apply_task_model_routing(messages, model, options)
+    trace = options.get("_upstream_trace")
     active_tracker = _USAGE_TRACKER.get()
     if active_tracker is not None:
         # Automatic endpoint/model selection happens at dispatch time. Keep
@@ -10914,6 +10942,19 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     # A text-only config cannot read an attached image, so an image request is
     # re-pointed at a multimodal model before any routing decision is made.
     model = _apply_multimodal_switch(messages, model, options)
+    trace = options.get("_upstream_trace")
+    if active_tracker is not None:
+        # Keep billing/history metadata aligned with the model that will
+        # actually be sent upstream.  This matters when automatic multimodal
+        # selection is enabled; otherwise the row can say glm-5.2 while the
+        # provider fingerprint is kimi-k2.6.
+        active_tracker.model = model
+        active_tracker.options = options
+    if isinstance(trace, dict):
+        trace["requested_model"] = str(
+            options.get("_requested_model") or requested_model or ""
+        ).strip() or "auto"
+        trace["effective_model"] = str(model or "").strip()
     try:
         _ensure_model_account_enabled(
             str(options.get("_account_id") or ""),
@@ -10922,7 +10963,6 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     except _ModelAccountUnavailable as exc:
         return _openai_error(503, str(exc), "model_account_unavailable")
     active_mode = str(options.get("_upstream_mode") or _current_upstream_mode()).lower()
-    trace = options.get("_upstream_trace")
     fallback_from = str(options.get("_upstream_fallback_from") or "").strip().lower()
     if isinstance(trace, dict):
         if fallback_from:

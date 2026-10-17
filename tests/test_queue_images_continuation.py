@@ -237,6 +237,35 @@ class ImageNormalizationTests(unittest.TestCase):
             "glm-5.3",
         )
 
+    def test_explicit_model_is_not_silently_repointed_for_images(self):
+        trace = {}
+        image_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,QUJD"},
+                    }
+                ],
+            }
+        ]
+        with patch.dict(
+            main_module.os.environ,
+            {"TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT": ""},
+            clear=False,
+        ):
+            selected = main_module._apply_multimodal_switch(
+                image_messages,
+                "glm-5.2",
+                {"_requested_model": "glm-5.2", "_upstream_trace": trace},
+            )
+        self.assertEqual(selected, "glm-5.2")
+        self.assertEqual(
+            trace["multimodal_switch_skipped"]["reason"],
+            "explicit_model_pinned",
+        )
+
 
 class TruncationDetectionTests(unittest.TestCase):
     def test_unclosed_code_fence_is_truncated(self):
