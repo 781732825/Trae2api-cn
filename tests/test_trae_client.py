@@ -211,6 +211,74 @@ class CheckinDeviceTests(unittest.TestCase):
 
 
 class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_catalog_is_retried_instead_of_cached(self):
+        fetch = AsyncMock(
+            side_effect=[
+                {},
+                {
+                    "glm-5.3-flash": {
+                        "config_name": "GLM-5.3-Flash",
+                        "model_name": "glm-5.3-flash",
+                    }
+                },
+            ]
+        )
+
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=fetch),
+            patch.object(
+                trae_client, "_fetch_solo_model_configs", new=AsyncMock(return_value={})
+            ),
+        ):
+            first = await trae_client._get_web_custom_model(
+                "glm-5.3-flash",
+                token_override="token-retry",
+                user_id_override="account-retry",
+            )
+            second = await trae_client._get_web_custom_model(
+                "glm-5.3-flash",
+                token_override="token-retry",
+                user_id_override="account-retry",
+            )
+
+        self.assertIsNone(first)
+        self.assertEqual(second["config_name"], "GLM-5.3-Flash")
+        self.assertEqual(fetch.await_count, 2)
+
+    async def test_lowercase_request_matches_wire_config_without_model_list_warmup(self):
+        """A lower-case public id must resolve the exact live config directly."""
+
+        async def fetch(_token, **_kwargs):
+            # Older catalog payloads used a display label in ``name`` while
+            # exposing the request identifiers in separate fields.
+            return {
+                "GLM-5.3 Flash": {
+                    "name": "GLM-5.3 Flash",
+                    "config_name": "GLM-5.3-Flash",
+                    "model_name": "glm-5.3-flash",
+                    "display_name": "GLM-5.3 Flash",
+                }
+            }
+
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", side_effect=fetch),
+            patch.object(
+                trae_client, "_fetch_solo_model_configs", new=AsyncMock(return_value={})
+            ) as solo_fetch,
+        ):
+            resolved = await trae_client._get_web_custom_model(
+                "glm-5.3-flash",
+                token_override="token-lower",
+                user_id_override="account-lower",
+            )
+
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["config_name"], "GLM-5.3-Flash")
+        self.assertEqual(resolved["model_name"], "glm-5.3-flash")
+        solo_fetch.assert_not_awaited()
+
     async def test_bound_account_model_config_cache_does_not_cross_contaminate(self):
         token_a = _fake_jwt("account-a", 100)
         token_b = _fake_jwt("account-b", 100)
@@ -1212,6 +1280,48 @@ class IdeRequestContextTests(unittest.TestCase):
 
 
 class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_catalog_indexes_exact_config_name_when_name_is_display_label(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "list": [
+                            {
+                                "function": "solo_agent_remote",
+                                "models": [
+                                    {
+                                        "name": "GLM-5.3 Flash",
+                                        "config_name": "GLM-5.3-Flash",
+                                        "model_name": "glm-5.3-flash",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, _url):
+                return FakeResponse()
+
+        with patch.object(trae_client.httpx, "AsyncClient", return_value=FakeClient()):
+            configs = await trae_client._fetch_web_model_configs(
+                token_override="token-catalog"
+            )
+
+        self.assertIn("GLM-5.3-Flash", configs)
+        self.assertEqual(configs["GLM-5.3-Flash"]["config_name"], "GLM-5.3-Flash")
+        self.assertEqual(configs["GLM-5.3-Flash"]["model_name"], "glm-5.3-flash")
+
     async def test_agent_remote_group_wins_over_same_name_work(self):
         class FakeResponse:
             status_code = 200
@@ -1312,6 +1422,9 @@ class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "config_name": "glm-5.3-flash",
                             "usage": "chat_completion",
+                            "model_detail_list": [
+                                {"model_name": "glm-5.3-flash__dev"},
+                            ],
                             "display_config": {
                                 "display_name": "GLM-5.3-Flash",
                                 "max_mode": False,
@@ -1360,11 +1473,55 @@ class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("custom_model_1M_text", configs)
         self.assertEqual(configs["glm-5.3-flash"]["display_name"], "GLM-5.3-Flash")
         self.assertEqual(
+            configs["glm-5.3-flash"]["model_name"],
+            "glm-5.3-flash__dev",
+        )
+        self.assertEqual(
+            configs["glm-5.3-flash"]["_traecode_model_detail_list"][0]["model_name"],
+            "glm-5.3-flash__dev",
+        )
+        self.assertEqual(
             calls["url"],
             "https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param",
         )
         self.assertEqual(calls["body"]["function"], "solo_work_lite")
         self.assertLessEqual(calls["timeout"], 20)
+
+    async def test_native_catalog_resolves_dev_and_max_provider_ids(self):
+        async def fake_fetch(*, token_override="", provider_specific=None, user_id_override=""):
+            return {
+                "glm-5.2": {
+                    "config_name": "glm-5.2",
+                    "display_name": "GLM-5.2",
+                    "config_source": 1,
+                    "model_detail_list": [
+                        {"model_name": "glm-5.2__max"},
+                        {"model_name": "glm-5.2__dev"},
+                    ],
+                    "_traecode_model_detail_list": [
+                        {"model_name": "glm-5.2__max"},
+                        {"model_name": "glm-5.2__dev"},
+                    ],
+                }
+            }
+
+        with patch.object(trae_client, "_fetch_solo_model_configs", fake_fetch):
+            dev = await trae_client.resolve_traecode_model_config(
+                "glm-5.2",
+                token_override="token-x",
+                user_id_override="user-x",
+                max_mode=False,
+            )
+            max_cfg = await trae_client.resolve_traecode_model_config(
+                "glm-5.2",
+                token_override="token-x",
+                user_id_override="user-x",
+                max_mode=True,
+            )
+
+        self.assertEqual(dev["config_name"], "glm-5.2")
+        self.assertEqual(dev["raw_model_name"], "glm-5.2__dev")
+        self.assertEqual(max_cfg["raw_model_name"], "glm-5.2__max")
 
 
 if __name__ == "__main__":

@@ -1032,6 +1032,172 @@ def merge_account_credits(account_id: str, data: dict) -> dict:
         return dict(checkin)
 
 
+def get_account_credit_state(account_id: str) -> dict:
+    """Return the persisted credit projection for one account.
+
+    The returned mapping is a copy and never contains credentials.  Credit
+    reconciliation keeps the upstream ``official_*`` values separate from
+    the locally projected ``remaining`` value so delayed billing can be shown
+    immediately without permanently double-counting the next upstream poll.
+    """
+
+    with _STORE_LOCK:
+        rec = _accounts.get(str(account_id or ""))
+        checkin = (rec or {}).get("checkin") or {}
+        credits = checkin.get("account_credits")
+        return dict(credits) if isinstance(credits, dict) else {}
+
+
+def reconcile_account_credits(
+    account_id: str,
+    data: dict,
+    *,
+    effective_remaining: object = None,
+    local_debit: object = 0,
+    status: str = "ok",
+    source: str = "upstream",
+    confidence: object = 1.0,
+    observed_at: object = None,
+) -> dict:
+    """Persist an upstream credit snapshot plus its local projection.
+
+    ``data`` is the parsed entitlement response.  ``remaining`` remains the
+    public/effective balance consumed by the console, while
+    ``official_remaining`` and ``official_used`` preserve the last upstream
+    observation.  ``local_debit`` is only the weighted, post-snapshot usage
+    that the upstream balance has not reflected yet.
+    """
+
+    account_id = str(account_id or "")
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get("checkin") or {})
+        existing = dict(checkin.get("account_credits") or {})
+        incoming = dict(data or {})
+        parsed = dict(
+            incoming.get("account_credits")
+            if isinstance(incoming.get("account_credits"), dict)
+            else incoming
+        )
+        # Keep the private, post-snapshot debit ledger while replacing the
+        # public entitlement fields with the newest upstream observation.
+        # The ledger is deliberately separate from upstream ``remaining``:
+        # billing may settle one or more polls after a response completes.
+        for key in (
+            "credits_pending_debits",
+            "credits_absorbed_debits",
+            "credits_last_settled_at",
+        ):
+            if key not in parsed and key in existing:
+                parsed[key] = existing[key]
+        now = time.time() if observed_at in (None, "") else observed_at
+        try:
+            now = float(now)
+        except (TypeError, ValueError):
+            now = time.time()
+        official_remaining = parsed.get("remaining")
+        parsed["official_remaining"] = official_remaining
+        if "used" in parsed:
+            parsed["official_used"] = parsed.get("used")
+        if effective_remaining is None:
+            effective_remaining = official_remaining
+        try:
+            local_value = max(0.0, float(local_debit or 0))
+        except (TypeError, ValueError):
+            local_value = 0.0
+        try:
+            confidence_value = min(1.0, max(0.0, float(confidence)))
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        parsed["remaining"] = effective_remaining
+        parsed["local_debit"] = round(local_value, 4)
+        parsed["credits_anchor_at"] = now
+        parsed["credits_anchor_used"] = parsed.get("used")
+        parsed["credits_reconciled_at"] = now
+        parsed["reconcile_status"] = str(status or "ok")
+        parsed["reconcile_source"] = str(source or "upstream")
+        parsed["reconcile_confidence"] = round(confidence_value, 4)
+        checkin["account_credits"] = parsed
+        rec["checkin"] = checkin
+        rec["credits_updated_at"] = now
+        rec["credits_reconciled_at"] = now
+        rec["credits_reconcile_status"] = parsed["reconcile_status"]
+        _save_accounts()
+        return dict(checkin)
+
+
+def update_account_credit_projection(
+    account_id: str,
+    *,
+    effective_remaining: object = None,
+    local_debit: object = 0,
+    status: str = "projected",
+    source: str = "usage_weighted",
+    confidence: object = 0.0,
+    settled_at: object = None,
+) -> dict:
+    """Atomically update only the locally projected balance.
+
+    This is called whenever a usage row moves from pending to a confirmed
+    charge.  It never changes the official upstream snapshot or its anchor.
+    """
+
+    account_id = str(account_id or "")
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get("checkin") or {})
+        credits = dict(checkin.get("account_credits") or {})
+        if not credits:
+            return {}
+        if effective_remaining is not None:
+            credits["remaining"] = effective_remaining
+        try:
+            credits["local_debit"] = round(max(0.0, float(local_debit or 0)), 4)
+        except (TypeError, ValueError):
+            credits["local_debit"] = 0.0
+        try:
+            credits["reconcile_confidence"] = round(
+                min(1.0, max(0.0, float(confidence))), 4
+            )
+        except (TypeError, ValueError):
+            pass
+        credits["reconcile_status"] = str(status or "projected")
+        credits["reconcile_source"] = str(source or "usage_weighted")
+        if settled_at not in (None, ""):
+            try:
+                credits["credits_last_settled_at"] = float(settled_at)
+            except (TypeError, ValueError):
+                pass
+        checkin["account_credits"] = credits
+        rec["checkin"] = checkin
+        _save_accounts()
+        return dict(credits)
+
+
+def mark_account_credit_reconcile_stale(account_id: str) -> dict:
+    """Keep the last balance while marking an unsuccessful poll as stale."""
+
+    account_id = str(account_id or "")
+    with _STORE_LOCK:
+        rec = _accounts.get(account_id)
+        if not rec:
+            return {}
+        checkin = dict(rec.get("checkin") or {})
+        credits = dict(checkin.get("account_credits") or {})
+        if not credits:
+            return {}
+        credits["reconcile_status"] = "stale"
+        checkin["account_credits"] = credits
+        rec["checkin"] = checkin
+        rec["credits_reconcile_status"] = "stale"
+        _save_accounts()
+        return dict(credits)
+
+
 def sync_account_label_from_credits(account_id: str, user_name: str) -> str:
     """Fill the account label with the upstream 用户名 when none was chosen.
 
@@ -1122,6 +1288,10 @@ def list_accounts() -> list[dict]:
         result = []
         for aid, rec in _accounts.items():
             checkin = rec.get('checkin') or {}
+            account_credits = checkin.get('account_credits')
+            account_credits = (
+                dict(account_credits) if isinstance(account_credits, dict) else {}
+            )
             result.append({
                 'id': aid,
                 'user_id': rec.get('user_id', aid),
@@ -1140,7 +1310,27 @@ def list_accounts() -> list[dict]:
                     'checkin_status_updated_at', rec.get('checkin_updated_at', 0)
                 ),
                 'credits_updated_at': rec.get('credits_updated_at', 0),
-                'account_credits': checkin.get('account_credits'),
+                'account_credits': account_credits,
+                'credits_official_remaining': account_credits.get(
+                    'official_remaining',
+                    account_credits.get('remaining'),
+                ),
+                'credits_official_used': account_credits.get('official_used'),
+                'credits_local_debit': account_credits.get('local_debit', 0),
+                'credits_reconciled_at': account_credits.get(
+                    'credits_reconciled_at',
+                    rec.get('credits_reconciled_at', 0),
+                ),
+                'credits_reconcile_status': account_credits.get(
+                    'reconcile_status',
+                    rec.get('credits_reconcile_status', 'unknown'),
+                ),
+                'credits_reconcile_source': account_credits.get(
+                    'reconcile_source', 'unknown'
+                ),
+                'credits_reconcile_confidence': account_credits.get(
+                    'reconcile_confidence'
+                ),
             })
         return result
 

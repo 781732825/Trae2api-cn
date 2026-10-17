@@ -1,10 +1,9 @@
-"""Truncation detection and auto-continuation for relayed model turns.
+"""Optional truncation helpers for explicit caller-managed diagnostics.
 
-An upstream Trae turn can stop mid-answer (output budget, provider disconnect,
-or a model that only emitted reasoning).  Mirrors ZedeX/trae-local-api's
-post-processing: detect the incomplete tail, re-issue the turn with the partial
-answer plus a continue instruction, and keep streaming into the same public
-response instead of handing the caller a half-written answer.
+Production Chat/Anthropic handlers do not implicitly re-issue a model turn:
+the caller owns continuation so a truncated response cannot silently duplicate
+billable work or replay a tool turn.  The detection and message-building
+helpers remain available for tests and explicitly opted-in internal callers.
 """
 
 from __future__ import annotations
@@ -79,7 +78,12 @@ def _env_float(name: str, default: float) -> float:
 def enabled() -> bool:
     """Whether the relay may transparently continue a truncated answer."""
 
-    return _env_flag("TRAE_AUTO_CONTINUE", True)
+    # Automatic re-issue was introduced by the Zedex compatibility layer.
+    # It can duplicate billable turns and causes providers that require a
+    # single tool turn to reject the follow-up.  Keep the helper available for
+    # explicit diagnostics, but production defaults to the provider's terminal
+    # response; operators must opt in with TRAE_AUTO_CONTINUE=1.
+    return _env_flag("TRAE_AUTO_CONTINUE", False)
 
 
 def max_continues() -> int:

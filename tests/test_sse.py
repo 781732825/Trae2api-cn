@@ -205,12 +205,11 @@ class TranslateCliStreamTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        # Queue position is transport telemetry: it must never reach the
-        # assistant text, only the wire keepalive.
-        self.assertNotIn("排队", content)
-        self.assertEqual(content, "ready")
+        # Preserve the pre-Zedex raw compatibility contract: queue notices
+        # are assistant content and arrive before the first model text.
+        self.assertEqual(content, "排队中，当前位置：1\nready")
         self.assertTrue(done)
-        self.assertIn(": relay-keepalive\n\n", chunks)
+        self.assertNotIn(": relay-keepalive\n\n", chunks)
 
     def test_ide_provider_mismatch_is_not_presented_as_requested_model(self):
         response = _LineResponse(
@@ -753,10 +752,13 @@ class TranslateCliStreamTests(unittest.TestCase):
             for event in parsed
             for choice in event.get("choices", [])
         )
-        # No queue text in the answer; only distinct positions reach the wire
-        # as keepalive comments (the duplicate position 2 is coalesced).
-        self.assertNotIn("排队", content)
-        self.assertEqual(chunks.count(": relay-keepalive\n\n"), 2)
+        # Duplicate positions are coalesced, but each distinct position is
+        # preserved as the raw stream's assistant status text.
+        self.assertEqual(
+            content,
+            "排队中，当前位置：2\n排队中，当前位置：1\n",
+        )
+        self.assertNotIn(": relay-keepalive\n\n", chunks)
 
     def test_ide_empty_probe_emits_nothing_before_retry_signal(self):
         response = _LineResponse(
@@ -897,21 +899,24 @@ class TranslateCliStreamTests(unittest.TestCase):
             ]
         )
 
-        async def first_two():
+        async def first_three():
             stream = sse.translate_ide_stream(
                 response, "m", True, fail_on_empty=True
             )
-            chunks = [await anext(stream), await anext(stream)]
+            chunks = [await anext(stream), await anext(stream), await anext(stream)]
             await stream.aclose()
             return chunks
 
-        chunks = asyncio.run(first_two())
+        chunks = asyncio.run(first_three())
         parsed, _ = _parse_chunks(chunks)
-        # A probe stream stays silent while queued (a keepalive would make a
-        # doomed probe look started), then opens with the role frame and the
-        # first real delta as soon as text arrives.
+        # A probe stream stays silent while queued, then opens with the role
+        # frame, the pending queue notice, and the first real delta.
         self.assertEqual(parsed[0]["choices"][0]["delta"], {"role": "assistant"})
-        self.assertEqual(parsed[1]["choices"][0]["delta"]["content"], "ready")
+        self.assertEqual(
+            parsed[1]["choices"][0]["delta"]["content"],
+            "排队中，当前位置：1\n",
+        )
+        self.assertEqual(parsed[2]["choices"][0]["delta"]["content"], "ready")
 
     def test_ide_error_event_is_propagated(self):
         response = _LineResponse(
@@ -2607,3 +2612,101 @@ class SummaryPrefixMergeTests(unittest.TestCase):
     def test_nonstream_summary_extends_truncated_answer(self):
         result = asyncio.run(sse.collect_nonstream_web(self._events(), "m"))
         self.assertEqual(result["choices"][0]["message"]["content"], "The file r.txt contains: ok")
+
+
+class RawUpstreamErrorEventTests(unittest.TestCase):
+    def test_error_codes_and_messages_are_preserved_without_leaking_queue_notice(self):
+        cases = (
+            (
+                {"code": 4001, "message": "We're sorry, the param is invalid."},
+                4001,
+                "We're sorry, the param is invalid.",
+            ),
+            (
+                {
+                    "error": {
+                        "code": 2001,
+                        "message": "failed to get app config: record not found",
+                    }
+                },
+                2001,
+                "failed to get app config: record not found",
+            ),
+        )
+
+        for payload, expected_code, expected_message in cases:
+            with self.subTest(code=expected_code):
+                response = _LineResponse(
+                    [
+                        "event: request_wait_in_queue",
+                        'data: {"position":2}',
+                        "event: error",
+                        "data: " + json.dumps(payload),
+                    ]
+                )
+                emitted = []
+
+                async def run():
+                    async for chunk in sse.translate_ide_stream(
+                        response, "glm-5.3", fail_on_empty=True
+                    ):
+                        emitted.append(chunk)
+
+                with self.assertRaises(sse.UpstreamEventError) as raised:
+                    asyncio.run(run())
+
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertEqual(
+                    raised.exception.upstream_message, expected_message
+                )
+                self.assertTrue(raised.exception.retryable)
+                self.assertFalse(raised.exception.observed_model_event)
+                # Queue text is held until the first model output, so it must
+                # not hide the actual pre-output failure from the dispatcher.
+                self.assertEqual(emitted, [])
+
+    def test_output_before_error_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                'data: {"response":"partial answer"}',
+                "event: error",
+                'data: {"code":4001,"message":"request rejected"}',
+            ]
+        )
+        emitted = []
+
+        async def run():
+            async for chunk in sse.translate_ide_stream(
+                response, "glm-5.3", fail_on_empty=True
+            ):
+                emitted.append(chunk)
+
+        with self.assertRaises(sse.UpstreamEventError) as raised:
+            asyncio.run(run())
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        wire = "".join(emitted)
+        self.assertIn("partial answer", wire)
+
+    def test_usage_before_nonstream_error_is_not_retryable(self):
+        response = _LineResponse(
+            [
+                "event: token_usage",
+                'data: {"input_tokens":11,"output_tokens":0,"total_tokens":11}',
+                "event: error",
+                'data: {"code":2001,"message":"record not found"}',
+            ]
+        )
+
+        with self.assertRaises(sse.UpstreamEventError) as raised:
+            asyncio.run(
+                sse.collect_nonstream_ide(
+                    response, "glm-5.3", fail_on_empty=True
+                )
+            )
+
+        self.assertEqual(raised.exception.code, 2001)
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertEqual(raised.exception.usage["prompt_tokens"], 11)

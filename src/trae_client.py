@@ -1,11 +1,13 @@
 """
 trae_client.py - Trae API 客户端
 
-支持两条上游路径：
-1. IDE/桌面版：先走 /api/agent/v3/llm_utils_chat，失败后依次回退
-   /api/ide/v1/chat 与 /api/agent/v3/create_agent_task
-2. 网页版 remote 会话（OmniRoute 风格）：POST /chat_sessions +
-   GET /chat_sessions/{id}/events
+支持以下上游路径：
+1. TraeCode IDE/SOLO 主聊天：由 ``raw_client`` 走
+   ``/api/ide/v2/llm_raw_chat``（失败回退 ``/api/ide/v1/llm_raw_chat``）。
+2. TraeWork 兼容/旧版 IDE 辅助适配：保留 ``llm_utils_chat``、``/api/ide/v1/chat``
+   和 ``create_agent_task``，但不作为 TraeCode 主聊天链路。
+3. 网页版 Remote/Work 会话（OmniRoute 风格）：POST ``/chat_sessions`` +
+   GET ``/chat_sessions/{id}/events``。
 """
 
 import asyncio
@@ -53,13 +55,18 @@ TRAE_USAGE_API_HOST = os.environ.get(
     "TRAE_USAGE_API_HOST", "https://api5-normal.mchost.guru"
 )
 
-# 按优先级依次尝试的 IDE 版上游端点（参考 laojichao/trae-local-api）
+# Legacy IDE adapter endpoints.  Public ``ide``/``solo`` dispatch uses the
+# TraeCode raw transport in ``raw_client``; these remain only for older native
+# callers and compatibility tests.
 IDE_ENDPOINTS = [
     "/api/agent/v3/llm_utils_chat",
     "/api/ide/v1/chat",
     "/api/agent/v3/create_agent_task",
 ]
-DEFAULT_MODEL_GATEWAY = "https://trae-api-cn.mchost.guru"
+DEFAULT_MODEL_GATEWAY = (
+    os.environ.get("TRAE_CODE_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
 # Legacy Work ``create_agent_task`` is served from the Work gateway.  The
 # native Work Lite ``workflow/start`` path remains on trae-api-cn.mchost.guru;
 # keeping this host separate prevents an IDE request from being sent to the
@@ -71,9 +78,9 @@ WORK_AGENT_APP_ID = os.environ.get("TRAE_WORK_APP_ID", "931506")
 WORK_AGENT_APP_ID_CHAT = os.environ.get("TRAE_WORK_APP_ID_CHAT", IDE_APP_ID)
 WORK_AGENT_VERSION = os.environ.get("TRAE_WORK_IDE_VERSION", "0.1.63")
 WORK_AGENT_VERSION_CODE = os.environ.get("TRAE_WORK_IDE_VERSION_CODE", "20260901")
-# SOLO/llm_utils_chat uses a different client version family from the legacy
-# IDE payload builder.  Keep it independently configurable so old desktop
-# request values do not make the gateway reject otherwise valid parameters.
+# The legacy SOLO/IDE compatibility adapter uses a different client-version
+# family from the TraeCode raw transport. Keep it independently configurable
+# so old desktop request values do not make the gateway reject valid payloads.
 SOLO_GATEWAY_VERSION = os.environ.get("TRAE_SOLO_GATEWAY_VERSION", "0.1.52")
 SOLO_GATEWAY_VERSION_CODE = os.environ.get(
     "TRAE_SOLO_GATEWAY_VERSION_CODE", "20260811"
@@ -113,6 +120,10 @@ MODEL_ALIASES = {
     "DeepSeek-V4-Flash-Official": "DeepSeek-V4-Flash-Official",
     "deepseek-v4-pro": "DeepSeek-V4-Pro",
     "deepseek-v4-flash": "DeepSeek-V4-Flash",
+    # TraeCode Agent exposes this lowercase config directly.  Keep the
+    # spelling unchanged so it can be selected by automatic simple-task
+    # routing without being rewritten to the older V4 aliases.
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
     "deepseek-v4-pro 正式版": "DeepSeek-V4-Pro-Official",
     "deepseek-v4-flash 正式版": "DeepSeek-V4-Flash-Official",
     "seed-2.1-pro": "Doubao-Seed-2.1-Pro",
@@ -283,6 +294,56 @@ def convert_model_name(model: str) -> str:
         return model
     m = model.strip().lower()
     return _ALIAS_LOOKUP.get(m) or _UPSTREAM_MODEL_CASE.get(m) or model
+
+
+async def _resolve_request_model_name(
+    model: str,
+    *,
+    token: str = "",
+    user_id: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Resolve a public model id to the exact upstream config spelling.
+
+    ``/v1/models`` exposes a lower-case alias for every mixed-case config, but
+    Trae's native gateways match ``config_name`` case-sensitively.  A caller
+    can therefore send a lower-case id before it has fetched the model list and
+    receive a misleading ``4001 param invalid`` response.  Known aliases are
+    resolved locally; only an unknown all-lowercase id pays for one bound
+    account catalog lookup.
+    """
+
+    requested = str(model or "").strip()
+    if not requested:
+        return requested
+    mapped = convert_model_name(requested)
+    normalized = requested.lower()
+    # Built-in aliases and a previously learned live mapping are safe without
+    # another network round trip.  Mixed-case input is already exact.
+    if normalized in _ALIAS_LOOKUP or normalized in _UPSTREAM_MODEL_CASE:
+        return mapped
+    if requested != normalized:
+        return mapped
+
+    try:
+        config = await resolve_model_config(
+            requested,
+            token_override=token,
+            user_id_override=user_id,
+            provider_specific=provider_specific,
+        )
+    except Exception as exc:
+        logger.debug("trae-client: lower-case model lookup failed for %s: %s", requested, exc)
+        return mapped
+    exact = str(
+        (config or {}).get("config_name")
+        or (config or {}).get("name")
+        or ""
+    ).strip()
+    if exact:
+        _UPSTREAM_MODEL_CASE[normalized] = exact
+        return exact
+    return mapped
 
 
 def is_model_supported(model: str) -> bool:
@@ -1412,12 +1473,30 @@ def _build_web_model_config(raw: dict) -> dict:
             cfg["features"] = json.loads(features)
         except Exception:
             cfg["features"] = {}
-    name = cfg.get("name") or ""
-    cfg["config_name"] = cfg.get("config_name") or name
+    # Some catalog revisions use ``name`` for the display label while
+    # carrying the exact wire identifier in ``config_name`` or
+    # ``model_name``.  Preserve the raw fields, but always materialize the
+    # canonical identifiers so callers can resolve a lower-case public id
+    # without first loading /v1/models.
+    name = str(cfg.get("name") or "").strip()
+    config_name = (
+        cfg.get("config_name")
+        or cfg.get("configName")
+        or name
+        or cfg.get("model_name")
+        or cfg.get("modelName")
+        or ""
+    )
+    cfg["config_name"] = str(config_name).strip()
     # The CN model-list response uses ``name`` as the config identifier.  The
     # remote executor also accepts/records ``model_name``; keeping both makes
     # the selected model explicit instead of allowing a default fallback.
-    cfg["model_name"] = cfg.get("model_name") or name
+    cfg["model_name"] = (
+        cfg.get("model_name")
+        or cfg.get("modelName")
+        or cfg["config_name"]
+        or name
+    )
     cfg["config_source"] = cfg.get("config_source") or 1
     cfg["provider"] = cfg.get("provider") or ""
     cfg["multimodal"] = bool(cfg.get("multimodal"))
@@ -1459,15 +1538,56 @@ async def _fetch_web_model_configs(
         return {}
     out: dict[str, dict] = {}
 
+    def _catalog_endpoint(function: str) -> str:
+        """Map a Trae catalog function to the public endpoint identity."""
+
+        function = str(function or "").strip().lower()
+        if "work" in function:
+            return "work"
+        if "agent" in function:
+            return "remote"
+        if "design" in function:
+            return "solo"
+        return "remote"
+
     def _ingest_models(group: Mapping[str, Any]) -> None:
         if not isinstance(group, Mapping):
             return
+        endpoint = _catalog_endpoint(_group_function(group))
         for raw in group.get("models", []):
             if not isinstance(raw, Mapping):
                 continue
-            name = (raw.get("name") or "").strip()
-            if name and name not in out:
-                out[name] = _build_web_model_config(raw)
+            # ``name`` is the config id in current responses, but older
+            # payloads used it for a display label and supplied the exact
+            # request id in ``config_name``.  Index by the canonical config
+            # id so a caller using the documented lower-case id can resolve
+            # it even before get_models() has populated the case map.
+            raw_name = str(raw.get("name") or "").strip()
+            name = str(
+                raw.get("config_name")
+                or raw.get("configName")
+                or raw_name
+                or raw.get("model_name")
+                or raw.get("modelName")
+                or ""
+            ).strip()
+            if not name:
+                continue
+            if name not in out:
+                config = _build_web_model_config(raw)
+                config["_trae_endpoints"] = [endpoint]
+                out[name] = config
+                continue
+            # The same config can be enabled in Agent and Work catalogs. Keep
+            # the preferred config payload selected above, but retain every
+            # endpoint where the account advertises it for /v1/models.
+            current = out[name]
+            endpoints = current.get("_trae_endpoints")
+            if not isinstance(endpoints, list):
+                endpoints = []
+                current["_trae_endpoints"] = endpoints
+            if endpoint not in endpoints:
+                endpoints.append(endpoint)
 
     def _group_function(group: Mapping[str, Any]) -> str:
         if not isinstance(group, Mapping):
@@ -1514,6 +1634,7 @@ async def _fetch_web_model_configs(
 async def _fetch_solo_model_configs(
     token_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
+    user_id_override: str = "",
 ) -> dict[str, dict]:
     """Fetch the native Solo catalog from ``get_detail_param``.
 
@@ -1537,7 +1658,13 @@ async def _fetch_solo_model_configs(
         "mode_type": None,
         "agent_type": None,
     }
-    headers = build_headers(token_override=token)
+    # The native catalog is bound to the same user identity as the model
+    # request.  Calling build_headers without the account user id can produce
+    # a valid HTTP request that returns an empty catalog for a rotated account.
+    headers = build_headers(
+        token_override=token,
+        user_id_override=str(user_id_override or ""),
+    )
     headers.update(
         {
             "Accept": "application/json",
@@ -1611,7 +1738,31 @@ async def _fetch_solo_model_configs(
         normalized = dict(raw)
         normalized["name"] = config_name
         normalized["config_name"] = config_name
-        normalized["model_name"] = normalized.get("model_name") or config_name
+        # ``model_name`` is the upstream provider id, not always the config
+        # name.  The native gateway returns the exact id in
+        # ``model_detail_list`` (for example ``glm-5__dev`` or
+        # ``custom_model_claude__max``).  Keep the complete list for the
+        # request resolver and choose the development profile as the default.
+        details = raw.get("model_detail_list")
+        details = (
+            [dict(item) for item in details if isinstance(item, Mapping)]
+            if isinstance(details, list)
+            else []
+        )
+        normalized["_traecode_model_detail_list"] = details
+        default_detail = next(
+            (
+                item
+                for item in details
+                if str(item.get("model_name") or "").strip().lower().endswith("__dev")
+            ),
+            next((item for item in details if item.get("model_name")), None),
+        )
+        normalized["model_name"] = (
+            normalized.get("model_name")
+            or (default_detail or {}).get("model_name")
+            or config_name
+        )
         normalized["display_name"] = (
             normalized.get("display_name")
             or display_config.get("display_name")
@@ -1620,8 +1771,172 @@ async def _fetch_solo_model_configs(
         normalized["max_mode"] = bool(
             normalized.get("max_mode") or display_config.get("max_mode")
         )
-        out[config_name] = _build_web_model_config(normalized)
+        config = _build_web_model_config(normalized)
+        # Native TraeCode's catalog is shared by the public IDE and Solo
+        # endpoint presets.  Keep both identities on the entry so discovery
+        # can group the model without duplicating the upstream config.
+        config["_trae_endpoints"] = ["solo", "ide"]
+        out[config_name] = config
     return out
+
+
+def _select_traecode_detail(
+    config: Mapping[str, Any],
+    *,
+    max_mode: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Select the exact provider model id from a TraeCode config entry."""
+
+    details = config.get("_traecode_model_detail_list")
+    if not isinstance(details, list):
+        details = config.get("model_detail_list")
+    candidates = [
+        dict(item)
+        for item in (details or [])
+        if isinstance(item, Mapping) and str(item.get("model_name") or "").strip()
+    ]
+    if not candidates:
+        return None
+    suffix = "__max" if max_mode else "__dev"
+    selected = next(
+        (
+            item
+            for item in candidates
+            if str(item.get("model_name") or "").strip().lower().endswith(suffix)
+        ),
+        None,
+    )
+    return selected or candidates[0]
+
+
+def _traecode_model_match(
+    configs: Mapping[str, Mapping[str, Any]],
+    model_name: str,
+) -> Optional[dict[str, Any]]:
+    """Find a config by exact name, display name, or known public alias."""
+
+    requested = str(model_name or "").strip()
+    lowered = requested.casefold()
+    for name, config in configs.items():
+        if any(
+            value.casefold() == lowered
+            for value in _model_descriptor_values(name, config)
+        ):
+            return dict(config)
+
+    # Remote exposes a few display aliases that the native catalog represents
+    # with a shorter config name.  Only use this compatibility mapping when
+    # the live catalog contains the target; never invent a provider id.
+    aliases = {
+        "glm-5.2": ("glm-5",),
+        "glm-5.1": ("glm-5",),
+        "deepseek-v4-pro": ("DeepSeek-V4-Pro",),
+        "deepseek-v4-flash": ("DeepSeek-V4-Flash",),
+    }
+    for candidate in aliases.get(lowered, ()):
+        for name, config in configs.items():
+            if any(
+                value.casefold() == candidate.casefold()
+                for value in _model_descriptor_values(name, config)
+            ):
+                return dict(config)
+    return None
+
+
+async def resolve_traecode_model_config(
+    model_name: str,
+    *,
+    token_override: str = "",
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    max_mode: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Resolve a TraeCode config and its exact function-ready model id.
+
+    The native IDE/Solo endpoint rejects TraeWork ids such as ``glm-5__v2``.
+    Its own catalog is authoritative and returns the provider id in
+    ``model_detail_list``.  This helper deliberately leaves the selected
+    function out of the catalog request because the endpoint's
+    ``solo_work_lite`` metadata response contains the shared model entries for
+    both ``chat_v3`` and ``solo_agent``.
+    """
+
+    token = str(token_override or auth.get_token() or "").strip()
+    if not token:
+        return None
+    configs = await _fetch_solo_model_configs(
+        token_override=token,
+        provider_specific=provider_specific,
+        user_id_override=str(user_id_override or ""),
+    )
+    config = _traecode_model_match(configs, model_name)
+    if not config:
+        return None
+    detail = _select_traecode_detail(config, max_mode=max_mode)
+    selected_model = str(
+        (detail or {}).get("model_name")
+        or config.get("model_name")
+        or config.get("config_name")
+        or config.get("name")
+        or ""
+    ).strip()
+    config_name = str(
+        config.get("config_name")
+        or config.get("name")
+        or model_name
+    ).strip()
+    if not selected_model or not config_name:
+        return None
+    result = dict(config)
+    result["config_name"] = config_name
+    result["name"] = config_name
+    result["model_name"] = selected_model
+    result["raw_model_name"] = selected_model
+    result["display_name"] = str(
+        config.get("display_name")
+        or config.get("display_model_name")
+        or config_name
+    )
+    return result
+
+
+def _model_descriptor_values(
+    key: Any, candidate: Any
+) -> tuple[str, ...]:
+    """Return all public and wire spellings carried by one model entry.
+
+    Trae has shipped catalog payloads where ``name`` is a UI label and
+    ``config_name``/``model_name`` is the value required by the request body.
+    Matching only the mapping key or display label makes a lower-case API
+    request fail until another endpoint happens to warm the case map.  Keep
+    the matching logic centralized and case-insensitive while preserving the
+    exact value in the returned config.
+    """
+
+    values: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text.casefold() not in {item.casefold() for item in values}:
+            values.append(text)
+
+    add(key)
+    if isinstance(candidate, Mapping):
+        for field in (
+            "config_name",
+            "configName",
+            "model_name",
+            "modelName",
+            "raw_model_name",
+            "rawModelName",
+            "name",
+            "display_name",
+            "displayName",
+            "display_model_name",
+            "displayModelName",
+        ):
+            add(candidate.get(field))
+    return tuple(values)
 
 
 async def _get_web_custom_model(
@@ -1655,15 +1970,9 @@ async def _get_web_custom_model(
         # Only pay the extra native-Solo lookup when the requested config is
         # absent from Remote. This keeps normal model resolution on the fast
         # path while allowing Solo-only models to be used through Remote.
-        lowered_model = str(model_name).strip().lower()
+        lowered_model = str(model_name).strip().casefold()
         found = any(
-            str(name).strip().lower() == lowered_model
-            or str(
-                (candidate or {}).get("display_name")
-                or (candidate or {}).get("display_model_name")
-                or ""
-            ).strip().lower()
-            == lowered_model
+            any(value.casefold() == lowered_model for value in _model_descriptor_values(name, candidate))
             for name, candidate in configs.items()
         )
         if not found and not agent_type:
@@ -1671,26 +1980,35 @@ async def _get_web_custom_model(
             if isinstance(solo_configs, Mapping):
                 for name, config in solo_configs.items():
                     configs.setdefault(name, config)
-        cached = (now, configs)
-        _WEB_MODEL_CACHE[account_key] = cached
+        # Do not pin a transient upstream failure for the full model-cache
+        # TTL.  A failed catalog probe otherwise makes every subsequent
+        # lower-case request return ``None`` until the cache expires, even
+        # though the account/model is healthy on the next attempt.
+        if configs:
+            cached = (now, configs)
+            _WEB_MODEL_CACHE[account_key] = cached
+        else:
+            _WEB_MODEL_CACHE.pop(account_key, None)
+            cached = (now, {})
 
     configs = cached[1]
     cfg = configs.get(model_name)
     if cfg is not None:
         return cfg
 
-    lowered = model_name.lower()
+    lowered = model_name.casefold()
     for name, candidate in configs.items():
-        if name.lower() == lowered:
+        values = _model_descriptor_values(name, candidate)
+        if any(value.casefold() == lowered for value in values):
             return candidate
+    # A few desktop labels replace spaces with hyphens.  Keep this fallback
+    # deliberately narrow so unrelated models cannot be selected by a
+    # substring match.
+    normalized_requested = lowered.replace(" ", "-")
     for name, candidate in configs.items():
-        display = (candidate.get("display_name") or candidate.get("display_model_name") or "").strip()
-        if display and (display.lower() == lowered or display == model_name):
-            return candidate
-    for name, candidate in configs.items():
-        display = (candidate.get("display_name") or "").strip()
-        if display and lowered in (display.lower(), display.replace(" ", "-").lower()):
-            return candidate
+        for value in _model_descriptor_values(name, candidate):
+            if value.casefold().replace(" ", "-") == normalized_requested:
+                return candidate
 
     if lowered in ("mimo-v2.5", "mimo-v2.5-pro", "minimax-m25", "qwen36-35b"):
         return {
@@ -1942,7 +2260,7 @@ def _ide_native_tool_calls(message: Mapping[str, Any]) -> list[dict]:
 def _convert_ide_native_messages(
     messages: list[dict], options: Optional[dict] = None
 ) -> list[dict]:
-    """Preserve caller-owned tool correlation on llm_utils_chat only."""
+    """Preserve caller-owned tool correlation for the legacy IDE adapter."""
 
     result: list[dict] = []
     prepared = sanitize_assistant_history_messages(
@@ -2040,7 +2358,7 @@ def build_llm_chat_body(
     max_tokens: Optional[int] = None,
     options: Optional[dict] = None,
 ) -> dict:
-    """构造 Trae SOLO ``llm_utils_chat`` 的原生请求体.
+    """构造 TraeWork 兼容适配器的原生请求体.
 
     The upstream endpoint is not an OpenAI-compatible ``inline_chat`` route.
     TraeWork rewrites the request to ``solo_work_lite`` and pins the selected
@@ -2084,7 +2402,7 @@ def build_work_agent_body(
 ) -> dict:
     """Build the legacy Work ``create_agent_task`` envelope.
 
-    Work does not use the plaintext ``llm_utils_chat`` body.  The public
+    Work does not use the TraeCode raw body.  The public
     client still owns tools, so the schemas are represented both in the
     runtime system message (for compatibility with older Work builds) and in
     the native ``tools`` field when supplied.
@@ -2356,7 +2674,17 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
         getattr(auth.get_auth(), "host", ""),
     )
 
-    model_name = convert_model_name(model)
+    provider_specific = bound_record.get("provider_specific") or bound_record.get(
+        "providerSpecificData"
+    )
+    model_name = await _resolve_request_model_name(
+        model,
+        token=bound_token,
+        user_id=bound_user_id,
+        provider_specific=(
+            dict(provider_specific) if isinstance(provider_specific, Mapping) else None
+        ),
+    )
     max_tokens = options.get("maxTokens") or options.get("max_tokens")
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     errors: list[str] = []
@@ -2370,7 +2698,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             token_override=bound_token,
             user_id_override=bound_user_id,
         )
-        # Match TraeWork's SOLO headers for llm_utils_chat/ide-v1.  The
+        # Match TraeWork's legacy adapter headers for ide-v1.  The
         # account OAuth host and the old IDE version headers are accepted by
         # some endpoints but produce a generic "param is invalid" response on
         # the current gateway.
@@ -2434,7 +2762,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             if endpoint == "/api/ide/v1/chat":
                 _, trae_req = await build_trae_ide_request(
                     messages,
-                    model,
+                    model_name,
                     max_tokens,
                     options,
                 )
@@ -2477,19 +2805,176 @@ _MODEL_LIST_CACHE_TTL = float(os.environ.get("TRAE_MODEL_LIST_CACHE_TTL", "300")
 # Lowercase public id -> exact upstream config name, learned from the live
 # model list (for example ``doubao-seed-code`` -> ``Doubao-Seed-Code``).
 _UPSTREAM_MODEL_CASE: dict[str, str] = {}
-# Routing ids that are not upstream configs but are always accepted.
+# Routing ids that are accepted internally.  ``work`` is deliberately kept
+# here for backwards-compatible request routing, but hidden from /v1/models
+# because it is a Trae control model rather than a selectable chat model.
 _ROUTING_MODEL_IDS = ("auto", "work")
+_HIDDEN_INTERNAL_MODEL_IDS = frozenset(
+    {
+        "computer_use_subagent",
+        "browser_use_subagent",
+        "aquila",
+        "explore_sub_agent_v2",
+        "file_search_agent",
+        "work",
+    }
+)
+_MODEL_ENDPOINT_ORDER = {
+    "remote": 0,
+    "work": 1,
+    "solo": 2,
+    "ide": 3,
+    "fallback": 9,
+}
+_MODEL_ENDPOINT_GROUP = {
+    # ``solo`` and ``ide`` are the two public TraeCode transports.  Keep the
+    # wire endpoint names in ``endpoints`` while exposing this product-level
+    # grouping for clients that render one column per product.
+    "remote": "remote",
+    "work": "traework",
+    "solo": "traecode",
+    "ide": "traecode",
+    "fallback": "fallback",
+}
+_MODEL_ENDPOINT_GROUP_ORDER = {
+    "remote": 0,
+    "traecode": 1,
+    "traework": 2,
+    "fallback": 9,
+}
 
 
-def _model_item(model_id: str, created: int) -> dict:
-    return {"id": model_id, "object": "model", "created": created, "owned_by": "trae"}
+def _endpoint_groups(endpoints: list[str]) -> list[str]:
+    """Collapse wire endpoint identities into public product groups."""
+
+    groups: list[str] = []
+    for endpoint in endpoints:
+        group = _MODEL_ENDPOINT_GROUP.get(str(endpoint).strip().lower())
+        if group and group not in groups:
+            groups.append(group)
+    groups.sort(
+        key=lambda value: (
+            _MODEL_ENDPOINT_GROUP_ORDER.get(value, 8),
+            value,
+        )
+    )
+    return groups or ["fallback"]
+
+
+def _model_item(
+    model_id: str,
+    created: int,
+    *,
+    endpoint: str = "fallback",
+    endpoints: Optional[list[str]] = None,
+    alias_for: str = "",
+) -> dict:
+    """Build an OpenAI model object with relay discovery metadata.
+
+    The standard fields remain unchanged.  Endpoint/group metadata and
+    ``alias_for`` are additive fields consumed by the relay UI and ignored by
+    OpenAI-compatible clients that only read ``id``.
+    """
+
+    endpoint = str(endpoint or "fallback").strip().lower() or "fallback"
+    ordered = []
+    for value in endpoints or [endpoint]:
+        value = str(value or "").strip().lower()
+        if value and value not in ordered:
+            ordered.append(value)
+    ordered.sort(key=lambda value: (_MODEL_ENDPOINT_ORDER.get(value, 8), value))
+    groups = _endpoint_groups(ordered)
+    item = {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+        "owned_by": "trae",
+        "endpoint": ordered[0] if ordered else endpoint,
+        "endpoints": ordered or [endpoint],
+        # Additive product-level metadata for UIs that show Remote,
+        # TraeCode, and TraeWork as separate columns.  ``endpoint`` and
+        # ``endpoints`` remain the compatibility contract for older clients.
+        "endpoint_group": groups[0],
+        "endpoint_groups": groups,
+    }
+    if alias_for:
+        item["alias_for"] = alias_for
+    return item
 
 
 def _static_model_list(created: int) -> list[dict]:
-    """Offline fallback: lowercase built-in ids only, one entry per spelling."""
-    ids = {mid for mid in SUPPORTED_MODELS if mid and mid == mid.lower()}
-    ids.update(_ROUTING_MODEL_IDS)
-    return [_model_item(mid, created) for mid in sorted(ids)]
+    """Offline fallback with exact names plus lower-case aliases."""
+
+    ids = {
+        str(mid).strip()
+        for mid in SUPPORTED_MODELS
+        if str(mid or "").strip()
+        and str(mid).strip().lower() not in _HIDDEN_INTERNAL_MODEL_IDS
+    }
+    ids.update(
+        mid for mid in _ROUTING_MODEL_IDS if mid.lower() not in _HIDDEN_INTERNAL_MODEL_IDS
+    )
+    items: list[dict] = []
+    for model_id in sorted(ids, key=lambda value: (value.casefold(), value)):
+        items.append(_model_item(model_id, created))
+    return sorted(
+        items,
+        key=lambda item: (
+            _MODEL_ENDPOINT_ORDER.get(str(item.get("endpoint") or ""), 9),
+            str(item.get("id") or "").casefold(),
+            str(item.get("id") or ""),
+        ),
+    )
+
+
+def _catalog_endpoints(config: Mapping[str, Any]) -> list[str]:
+    raw = config.get("_trae_endpoints") if isinstance(config, Mapping) else None
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    result: list[str] = []
+    for value in values:
+        value = str(value or "").strip().lower()
+        if value and value not in result:
+            result.append(value)
+    if not result:
+        result.append("remote")
+    result.sort(key=lambda value: (_MODEL_ENDPOINT_ORDER.get(value, 8), value))
+    return result
+
+
+def _merge_model_item(
+    target: dict[str, dict],
+    model_id: str,
+    created: int,
+    *,
+    endpoints: list[str],
+    alias_for: str = "",
+) -> None:
+    """Insert/merge one exact or alias id while retaining endpoint metadata."""
+
+    if not model_id or model_id.lower() in _HIDDEN_INTERNAL_MODEL_IDS:
+        return
+    current = target.get(model_id)
+    if current is None:
+        target[model_id] = _model_item(
+            model_id,
+            created,
+            endpoint=endpoints[0] if endpoints else "remote",
+            endpoints=endpoints,
+            alias_for=alias_for,
+        )
+        return
+    merged = list(current.get("endpoints") or [])
+    for endpoint in endpoints:
+        if endpoint not in merged:
+            merged.append(endpoint)
+    merged.sort(key=lambda value: (_MODEL_ENDPOINT_ORDER.get(value, 8), value))
+    current["endpoints"] = merged
+    current["endpoint"] = merged[0] if merged else "remote"
+    groups = _endpoint_groups(merged)
+    current["endpoint_group"] = groups[0]
+    current["endpoint_groups"] = groups
+    if alias_for and not current.get("alias_for"):
+        current["alias_for"] = alias_for
 
 
 async def get_models(force: bool = False) -> list[dict]:
@@ -2498,10 +2983,11 @@ async def get_models(force: bool = False) -> list[dict]:
     Source is the active account's live Trae model lists: the Remote web
     catalog (merged across Agent / Work / Design tiers) plus native Solo's
     ``/api/ide/v1/get_detail_param`` catalog for Solo-only models.
-    Only config names are listed; display labels such as ``GLM-5.3`` are not.
-    Ids are exposed lowercase: config names that carry capitals appear once in
-    lowercase and ``convert_model_name`` maps them back to the exact config
-    name. The built-in table is used only when the upstream list is empty.
+    Exact upstream config names are listed alongside lower-case aliases when
+    the spelling contains capitals.  Each item carries the endpoint catalog
+    and product groups where it was advertised, and the result is ordered by
+    endpoint before the model id.  Internal computer-control model ids are
+    never exposed.
     """
     created = int(time.time())
     account_id, record = auth.get_active_account_snapshot()
@@ -2512,50 +2998,86 @@ async def get_models(force: bool = False) -> list[dict]:
     if not force and cached and time.time() - cached[0] < _MODEL_LIST_CACHE_TTL:
         return [dict(item) for item in cached[1]]
 
-    configs: dict[str, dict] = {}
+    catalogs: list[tuple[Mapping[str, dict], Optional[list[str]]]] = []
     if token:
-        kwargs: dict[str, Any] = {"token_override": token}
+        web_kwargs: dict[str, Any] = {"token_override": token}
+        solo_kwargs: dict[str, Any] = {"token_override": token}
+        bound_user_id = str(
+            (record or {}).get("user_id")
+            or account_id
+            or auth.get_user_id()
+            or ""
+        ).strip()
+        if bound_user_id:
+            solo_kwargs["user_id_override"] = bound_user_id
         provider = (record or {}).get("provider_specific") or (record or {}).get(
             "providerSpecificData"
         )
         if isinstance(provider, Mapping):
-            kwargs["provider_specific"] = dict(provider)
-        # Remote is the primary catalog because it carries the richer
-        # Agent/Work metadata.  Solo fills only models absent from Remote;
-        # this keeps discovery resilient when a newly enabled Solo model has
-        # not propagated to the web catalog yet.
-        remote_task = _fetch_web_model_configs(**kwargs)
-        solo_task = _fetch_solo_model_configs(**kwargs)
+            provider_copy = dict(provider)
+            web_kwargs["provider_specific"] = provider_copy
+            solo_kwargs["provider_specific"] = provider_copy
+        # Keep catalog entries separate until public items are merged.  A
+        # model can be advertised by Remote/Work and native TraeCode at once;
+        # replacing or setdefault-ing the full config would discard one
+        # catalog's endpoint evidence for that shared model.
+        remote_task = _fetch_web_model_configs(**web_kwargs)
+        solo_task = _fetch_solo_model_configs(**solo_kwargs)
         remote_configs, solo_configs = await asyncio.gather(
             remote_task,
             solo_task,
             return_exceptions=True,
         )
         if isinstance(remote_configs, Mapping):
-            configs.update(remote_configs)
+            catalogs.append((remote_configs, None))
         elif isinstance(remote_configs, Exception):
             logger.warning("trae-client: web model list fetch failed: %s", remote_configs)
         if isinstance(solo_configs, Mapping):
-            for name, config in solo_configs.items():
-                configs.setdefault(name, config)
+            catalogs.append((solo_configs, ["solo", "ide"]))
         elif isinstance(solo_configs, Exception):
             logger.warning("trae-client: solo model list fetch failed: %s", solo_configs)
 
-    ids: set[str] = set()
-    for name in configs:
-        exact = str(name or "").strip()
-        if not exact:
-            continue
-        lowered = exact.lower()
-        ids.add(lowered)
-        if lowered != exact:
-            _UPSTREAM_MODEL_CASE[lowered] = exact
-    if not ids:
+    items_by_id: dict[str, dict] = {}
+    for configs, catalog_endpoints in catalogs:
+        for name, config in configs.items():
+            exact = str(name or "").strip()
+            if not exact:
+                continue
+            if exact.lower() in _HIDDEN_INTERNAL_MODEL_IDS:
+                continue
+            endpoints = catalog_endpoints or _catalog_endpoints(config)
+            _merge_model_item(items_by_id, exact, created, endpoints=endpoints)
+            lowered = exact.lower()
+            if lowered != exact:
+                _UPSTREAM_MODEL_CASE[lowered] = exact
+                _merge_model_item(
+                    items_by_id,
+                    lowered,
+                    created,
+                    endpoints=endpoints,
+                    alias_for=exact,
+                )
+    if not items_by_id:
         # Not cached, so the next request retries the upstream list.
         logger.warning("trae-client: upstream model list empty, using built-in list")
         return _static_model_list(created)
 
-    ids.update(_ROUTING_MODEL_IDS)
-    items = [_model_item(mid, created) for mid in sorted(ids)]
+    for routing_id in _ROUTING_MODEL_IDS:
+        if routing_id.lower() not in _HIDDEN_INTERNAL_MODEL_IDS:
+            _merge_model_item(
+                items_by_id,
+                routing_id,
+                created,
+                endpoints=["fallback"],
+            )
+    items = sorted(
+        items_by_id.values(),
+        key=lambda item: (
+            _MODEL_ENDPOINT_ORDER.get(str(item.get("endpoint") or ""), 9),
+            str(item.get("id") or "").casefold(),
+            0 if not item.get("alias_for") else 1,
+            str(item.get("id") or ""),
+        ),
+    )
     _MODEL_LIST_CACHE[cache_key] = (time.time(), items)
     return [dict(item) for item in items]

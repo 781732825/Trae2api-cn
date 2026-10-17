@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Mapping, Optional
 
 from .cli_client import extract_result_text as _cli_extract_text
 from .cli_client import complete_tool_call_signature as _complete_tool_call_signature
@@ -112,6 +112,43 @@ class EmptyUpstreamResponse(RuntimeError):
         self.account_quota_exhausted = bool(account_quota_exhausted)
 
 
+class UpstreamEventError(EmptyUpstreamResponse):
+    """A structured SSE ``event:error`` from a native Trae stream.
+
+    Native raw streams use HTTP 200 for both successful turns and business
+    failures.  Keep the upstream code/message available to the dispatcher
+    without retaining or logging the complete event payload.  The exception
+    remains an ``EmptyUpstreamResponse`` so a pre-output error can use the
+    existing guarded fallback path.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Any = None,
+        retryable: bool = True,
+        usage: Optional[dict] = None,
+        observed_model_event: bool = False,
+        account_quota_exhausted: bool = False,
+    ):
+        self.code = code
+        self.upstream_message = str(message or "Trae upstream returned an error event")
+        code_text = str(code).strip() if code not in (None, "") else ""
+        rendered = (
+            f"Trae upstream error {code_text}: {self.upstream_message}"
+            if code_text
+            else f"Trae upstream error: {self.upstream_message}"
+        )
+        super().__init__(
+            rendered,
+            retryable=retryable,
+            usage=usage,
+            observed_model_event=observed_model_event,
+            account_quota_exhausted=account_quota_exhausted,
+        )
+
+
 class IncompleteUpstreamResponse(EmptyUpstreamResponse):
     """Raised when an upstream stream ends without a terminal event.
 
@@ -197,8 +234,9 @@ def _capture_upstream_metadata(target: Any, payload: Any) -> None:
     turn_id = _usage_turn_id(payload)
     if turn_id:
         target["usage_turn_id"] = turn_id
-    # Queue position is transport telemetry.  Record it for the console and
-    # request trace instead of leaking it into assistant text.
+    # Queue position is retained as transport telemetry for the console and
+    # request trace; the raw stream translator may also expose the original
+    # queue notice as assistant content for legacy client compatibility.
     if isinstance(payload, dict):
         position = payload.get("position")
         if isinstance(position, (int, float)) and not isinstance(position, bool):
@@ -266,7 +304,14 @@ def _provider_model_name(payload: Any) -> str:
 
 
 def _is_account_quota_error(payload: Any) -> bool:
-    """Return whether an upstream error represents account quota exhaustion."""
+    """Return whether an upstream error is account-scoped capacity exhaustion.
+
+    Trae uses ``4008`` for a hard quota response and ``4011``/HTTP ``429``
+    for the same account-scoped capacity window on native/remote streams.
+    These errors are emitted after ``model_config`` on some transports.  The
+    config frame proves routing metadata only; it must not make a request
+    look billable or disable the account rotation/fallback path.
+    """
 
     if not isinstance(payload, dict):
         return False
@@ -281,10 +326,83 @@ def _is_account_quota_error(payload: Any) -> bool:
         for key in ("message", "error", "detail", "reason")
     ).lower()
     return (
-        code == "4008"
+        code in {"4008", "4011", "429"}
         or "requests have exceeded the quota" in text
         or "quota exceeded" in text
         or "exceeded the quota" in text
+        or "rate limit" in text
+        or "rate-limit" in text
+        or "too many requests" in text
+    )
+
+
+def _upstream_error_details(payload: Mapping[str, Any]) -> tuple[Any, str]:
+    """Extract only the code and human-readable message from an SSE error."""
+
+    nested = payload.get("error")
+    nested_error = nested if isinstance(nested, Mapping) else {}
+    code = next(
+        (
+            value
+            for source in (payload, nested_error)
+            for key in ("code", "error_code", "errorCode")
+            if (value := source.get(key)) not in (None, "")
+        ),
+        None,
+    )
+    message = next(
+        (
+            str(value)
+            for source in (payload, nested_error)
+            for key in ("message", "detail", "reason")
+            if (value := source.get(key)) not in (None, "")
+        ),
+        "",
+    )
+    if not message and isinstance(nested, str):
+        message = nested
+    return code, message or "Trae raw upstream returned an error event"
+
+
+def _raise_upstream_event_error(
+    payload: Mapping[str, Any],
+    *,
+    content_count: int,
+    reasoning_text: Any,
+    tool_calls: Any,
+    usage: Optional[dict],
+    upstream_metadata: Optional[dict],
+) -> None:
+    code, message = _upstream_error_details(payload)
+    error_usage = usage
+    if error_usage is None and isinstance(payload.get("usage"), dict):
+        error_usage = _map_usage(payload["usage"])
+    observed_model_event = bool(
+        content_count
+        or reasoning_text.raw
+        or tool_calls.has_calls
+        or error_usage is not None
+        or (
+            isinstance(upstream_metadata, dict)
+            and upstream_metadata.get("usage_turn_id")
+        )
+    )
+    quota_exhausted = _is_account_quota_error(payload)
+    # ``model_config`` and usage-turn ids can precede a 4008/4011 error.
+    # They are setup metadata, not model output.  Keep the exception
+    # retryable so a streaming request may rotate credentials or use its
+    # configured Remote fallback before returning a 502.
+    if quota_exhausted and not (
+        content_count or reasoning_text.raw or tool_calls.has_calls or error_usage
+    ):
+        observed_model_event = False
+    raise UpstreamEventError(
+        message,
+        code=code,
+        retryable=not observed_model_event,
+        usage=error_usage,
+        observed_model_event=observed_model_event,
+        account_quota_exhausted=quota_exhausted,
     )
 
 
@@ -1552,6 +1670,7 @@ async def translate_ide_stream(
     saw_terminal = False
     terminal_event_pending = False
     started = not fail_on_empty
+    pending_queue_chunks: list[str] = []
 
     if started:
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1599,26 +1718,34 @@ async def translate_ide_stream(
         terminal_event_pending = False
         _capture_upstream_metadata(upstream_metadata, obj)
         if event_type == "error":
-            raise RuntimeError(
-                str(obj.get("message") or obj.get("error") or "Trae raw upstream returned an error event")
+            _raise_upstream_event_error(
+                obj,
+                content_count=content_count,
+                reasoning_text=reasoning_text,
+                tool_calls=tool_calls,
+                usage=final_usage,
+                upstream_metadata=upstream_metadata,
             )
         if event_type == "request_wait_in_queue" or obj.get("position") is not None:
             position = obj.get("position", 0)
             if position != last_queue_position:
-                # Queue position is transport telemetry, never assistant text.
-                # Emitting it as ``content`` polluted every caller's context
-                # (and made the relay look like it answered with a status
-                # line).  Keep the wire alive with an SSE comment instead;
-                # the position remains visible in the relay log.
+                # Preserve the original Trae raw contract: queue notices are
+                # assistant content.  Probe streams hold the notice until the
+                # first real model event so an empty probe still stays empty.
+                queue_chunk = openai_chunk(
+                    prefix_id,
+                    model,
+                    {"content": f"排队中，当前位置：{position}\n"},
+                )
+                if started:
+                    yield queue_chunk
+                    content_count += 1
+                else:
+                    pending_queue_chunks.append(queue_chunk)
                 last_queue_position = position
                 logger.info(
                     "upstream queue position model=%s position=%s", model, position
                 )
-                # A probe stream (``fail_on_empty``) must stay silent until the
-                # upstream proves it will answer; a keepalive here would make a
-                # doomed probe look like a started turn and defeat the retry.
-                if started:
-                    yield _STREAM_HEARTBEAT_LINE
             continue
         if event_type == "token_usage":
             final_usage = _map_usage(obj.get("usage") or obj)
@@ -1630,7 +1757,20 @@ async def translate_ide_stream(
             _check_provider_model(model, reported_provider)
 
         reasoning = _payload_reasoning_text(obj)
+        if not reasoning and event_type == "reasoning_delta":
+            reasoning = _payload_text_delta(obj)
         raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
+        # TraeCode's native llm_raw_chat emits incremental ``text_delta`` /
+        # ``translated_text`` events instead of the legacy cumulative
+        # ``response`` snapshots.  Feed those events through the same
+        # accumulator; old output frames remain unchanged.
+        if not raw_response and event_type in {
+            "text_delta",
+            "translated_text",
+            "accumulated",
+            "assistant_message",
+        }:
+            raw_response = _payload_text_delta(obj)
         embedded_reasoning, visible_response = _split_embedded_reasoning(raw_response)
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
         if embedded_reasoning:
@@ -1659,6 +1799,9 @@ async def translate_ide_stream(
         if tool_chunks and not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
         for chunk in tool_chunks:
             yield chunk
 
@@ -1667,6 +1810,9 @@ async def translate_ide_stream(
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
+                for pending in pending_queue_chunks:
+                    yield pending
+                pending_queue_chunks.clear()
             completion_bytes += len(text_delta.encode("utf-8"))
             content_count += 1
             yield openai_chunk(prefix_id, model, {"content": text_delta})
@@ -1705,6 +1851,9 @@ async def translate_ide_stream(
     if final_tool_chunks and not started:
         started = True
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
+        for pending in pending_queue_chunks:
+            yield pending
+        pending_queue_chunks.clear()
     for chunk in final_tool_chunks:
         yield chunk
 
@@ -1713,6 +1862,9 @@ async def translate_ide_stream(
         if not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
         completion_bytes += len(final_text_delta.encode("utf-8"))
         content_count += 1
         yield openai_chunk(prefix_id, model, {"content": final_text_delta})
@@ -1724,6 +1876,9 @@ async def translate_ide_stream(
         if not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
         yield openai_chunk(
             prefix_id,
             model,
@@ -2016,6 +2171,43 @@ def _payload_reasoning_text(data: Any) -> str:
                     parts.append(value)
             if parts:
                 return "\n".join(parts)
+    return ""
+
+
+def _payload_text_delta(data: Any) -> str:
+    """Extract TraeCode ``text_delta``/``accumulated`` payload text.
+
+    Older Trae/TraeWork streams expose cumulative text under ``response``.
+    TraeCode's native llm_raw_chat stream can instead send ``text_delta`` or
+    ``translated_text`` events with a ``delta``/``text``/``content`` field.
+    Keep this parser deliberately narrow so arbitrary metadata is never
+    surfaced as assistant content.
+    """
+
+    if not isinstance(data, dict):
+        return ""
+    for key in ("delta", "text_delta", "textDelta", "text", "content", "response"):
+        value = data.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            nested = _payload_text_delta(value)
+            if nested:
+                return nested
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    nested = _payload_text_delta(item)
+                    if nested:
+                        parts.append(nested)
+            if parts:
+                return "".join(parts)
+    message = data.get("message")
+    if isinstance(message, dict):
+        return _payload_text_delta(message)
     return ""
 
 
@@ -2840,8 +3032,13 @@ async def collect_nonstream_ide(
         terminal_event_pending = False
         _capture_upstream_metadata(upstream_metadata, obj)
         if event_type == "error":
-            raise RuntimeError(
-                str(obj.get("message") or obj.get("error") or "Trae raw upstream returned an error event")
+            _raise_upstream_event_error(
+                obj,
+                content_count=len(full),
+                reasoning_text=reasoning_text,
+                tool_calls=tool_calls,
+                usage=usage,
+                upstream_metadata=upstream_metadata,
             )
         if event_type == "token_usage":
             usage = _map_usage(obj.get("usage") or obj)

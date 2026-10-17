@@ -11,8 +11,8 @@ main.py - Trae CN Relay 中转站
   UPSTREAM_MODE=raw  - 直连 Trae 原生 chat 协议（direct 为别名）
   UPSTREAM_MODE=remote/9router - 只用 9router 风格 remote 会话
   UPSTREAM_MODE=web  - 只用旧版 CN remote 会话（兼容保留）
-  UPSTREAM_MODE=ide  - 只用 IDE Agent /api/agent/v3/llm_utils_chat
-  UPSTREAM_MODE=solo - 只用 Trae SOLO /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=ide  - TraeCode IDE /api/agent/v3/llm_utils_chat
+  UPSTREAM_MODE=solo - TraeCode SOLO /api/agent/v3/llm_utils_chat
   UPSTREAM_MODE=traework-native - Windows helper 承载 TraeWork ai-agent.dll
 """
 
@@ -105,7 +105,8 @@ PORT = int(os.environ.get("PORT", "8000"))
 API_KEYS = [k.strip() for k in os.environ.get("RELAY_API_KEYS", "").split(",") if k.strip()]
 UPSTREAM_MODE = (os.environ.get("UPSTREAM_MODE", "remote") or "remote").lower()
 _VALID_UPSTREAM_MODES = (
-    "remote", "raw", "direct", "auto", "web", "ide", "solo", "work-agent",
+    "remote", "raw", "direct", "auto", "web", "ide", "solo", "work",
+    "work-agent",
     "9router", "trae-remote", "cli", "traework-native",
     "native", "traework",
 )
@@ -170,10 +171,36 @@ def _restore_persisted_relay_settings() -> dict:
         )
         or ""
     ).strip().rstrip("/")
+    # Earlier releases made api5-normal the TraeCode preset default. The
+    # desktop client gets trae-api-cn from boot config and lets its network
+    # layer route that hostname to api5-normal. Migrate only that old preset
+    # value; an explicit TRAE_CODE_BASE_URL remains authoritative.
+    legacy_traecode_gateway = "https://api5-normal.mchost.guru"
+    env_code_gateway = str(os.environ.get("TRAE_CODE_BASE_URL") or "").strip().rstrip("/")
+    if (
+        (endpoint_id in {"ide", "solo"} or mode in {"ide", "solo"})
+        and model_base == legacy_traecode_gateway
+        and DEFAULT_MODEL_GATEWAY_URL != legacy_traecode_gateway
+        and (
+            not env_code_gateway
+            or env_code_gateway == DEFAULT_MODEL_GATEWAY_URL
+        )
+    ):
+        model_base = DEFAULT_MODEL_GATEWAY_URL
     if model_base:
         os.environ["TRAE_MODEL_API_HOST"] = model_base
+        if mode in {"work", "work-agent"}:
+            os.environ["TRAE_RAW_BASE_URL"] = model_base
+            os.environ["TRAE_WORK_BASE_URL"] = model_base
+        elif mode in {"ide", "solo"}:
+            os.environ["TRAE_CODE_BASE_URL"] = model_base
     else:
         os.environ.pop("TRAE_MODEL_API_HOST", None)
+        if mode in {"work", "work-agent"}:
+            os.environ.pop("TRAE_RAW_BASE_URL", None)
+            os.environ.pop("TRAE_WORK_BASE_URL", None)
+        elif mode in {"ide", "solo"}:
+            os.environ.pop("TRAE_CODE_BASE_URL", None)
     # Repair partially migrated stores once at startup.  This also makes the
     # settings API/UI observe the same canonical mode and URL as dispatch.
     if endpoint is not None and (
@@ -225,45 +252,68 @@ CHECKIN_AUTO_RETRY_INTERVAL = float(
     os.environ.get("TRAE_CHECKIN_AUTO_RETRY_INTERVAL_SECONDS", "60") or "60"
 )
 DEFAULT_REMOTE_BASE_URL = "https://trae-api-cn.mchost.guru/api/remote/v1"
-DEFAULT_MODEL_GATEWAY_URL = "https://trae-api-cn.mchost.guru"
+DEFAULT_WORK_MODEL_GATEWAY_URL = (
+    os.environ.get("TRAE_WORK_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
+DEFAULT_MODEL_GATEWAY_URL = (
+    os.environ.get("TRAE_CODE_BASE_URL")
+    or "https://trae-api-cn.mchost.guru"
+).rstrip("/")
 WEB_BASE = (os.environ.get("TRAE_WEB_BASE_URL", DEFAULT_REMOTE_BASE_URL)).rstrip("/")
 UPSTREAM_ENDPOINT_PRESETS = (
     {
         "id": "remote",
-        "label": "Remote / chat_sessions",
+        "label": "Remote / chat_sessions（trae remote）",
         "base_url": DEFAULT_REMOTE_BASE_URL,
         "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
         "endpoint_path": "/api/remote/v1/chat_sessions",
         "mode": "remote",
+        "product": "trae",
+    },
+    {
+        "id": "work",
+        "label": "TraeWork / chat_sessions（Work tier）",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
+        "endpoint_path": "/api/remote/v1/chat_sessions",
+        "mode": "work",
+        "product": "traework",
+    },
+    {
+        "id": "solo",
+        "label": "TraeCode Solo / llm_utils_chat（solo_work_lite）",
+        "base_url": DEFAULT_REMOTE_BASE_URL,
+        "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
+        "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
+        "endpoint_path": "/api/agent/v3/llm_utils_chat",
+        "mode": "solo",
+        "legacy_function": "solo_work_lite",
+        "product": "trae",
     },
     {
         "id": "ide",
-        "label": "IDE Agent / llm_utils_chat",
+        "label": "TraeCode IDE / llm_utils_chat（solo_work_lite）",
         "base_url": DEFAULT_REMOTE_BASE_URL,
         "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
         "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
         "endpoint_path": "/api/agent/v3/llm_utils_chat",
         "mode": "ide",
+        "legacy_function": "solo_work_lite",
+        "product": "trae",
     },
-    {
-        "id": "solo",
-        "label": "Solo / api/agent/v3/llm_utils_chat",
-        "base_url": DEFAULT_REMOTE_BASE_URL,
-        "model_base_url": DEFAULT_MODEL_GATEWAY_URL,
-        "endpoint_url": DEFAULT_MODEL_GATEWAY_URL + "/api/agent/v3/llm_utils_chat",
-        "endpoint_path": "/api/agent/v3/llm_utils_chat",
-        # The Solo transport is implemented by the existing IDE client.  The
-        # distinct mode keeps the selected protocol visible and persistent
-        # while reusing its headers, SSE parser and fallback behavior.
-        "mode": "solo",
-    },
+    # Settings written by releases before the four-way endpoint split remain
+    # readable.  The entry is intentionally hidden from the public selector;
+    # new settings use ``work`` above.
     {
         "id": "agent",
-        "label": "Work Agent / solo_work_remote",
+        "label": "Work Agent（兼容）/ chat_sessions",
         "base_url": DEFAULT_REMOTE_BASE_URL,
         "endpoint_url": DEFAULT_REMOTE_BASE_URL + "/chat_sessions",
         "endpoint_path": "/api/remote/v1/chat_sessions",
         "mode": "work-agent",
+        "product": "traework",
+        "visible": False,
     },
 )
 CHAT_OPTION_FIELDS = (
@@ -427,6 +477,20 @@ _USAGE_SNAPSHOT_TASKS: set[asyncio.Task] = set()
 _USAGE_PENDING_TASK_IDS: set[str] = set()
 _USAGE_ACTIVE_ACCOUNTS: dict[str, int] = {}
 _USAGE_UNSAFE_ACCOUNTS: set[str] = set()
+# Concurrent requests for one account share the same "before" snapshot.  A
+# per-request snapshot makes the second request look unsafe and drops its
+# credit delta, even though the account total still advances normally.
+_USAGE_ACCOUNT_BEFORE_TASKS: dict[tuple[int, str], asyncio.Task] = {}
+# The after-snapshot read is serialized per account and compared with the last
+# observed total.  This turns two concurrent deltas (10 -> 11 -> 12) into two
+# one-credit rows instead of 1 and 2 credits or an unknown row.
+_USAGE_CREDIT_SETTLE_GATES: dict[tuple[int, str], asyncio.Lock] = {}
+_USAGE_LAST_CREDIT_TOTALS: dict[str, float] = {}
+# Credit display reconciliation is intentionally separate from request
+# settlement.  The latter attributes a single turn; this overlay reconciles
+# all confirmed charges that arrived after the last official balance poll.
+_CREDIT_RECONCILE_TASKS: set[asyncio.Task] = set()
+_CREDIT_RECONCILE_STATE: dict[str, dict[str, Any]] = {}
 _CHECKIN_ACCOUNT_LOCKS: dict[str, asyncio.Lock] = {}
 _CHECKIN_CLAIM_GATE: asyncio.Lock | None = None
 _CHECKIN_CLAIM_GATE_LOOP: asyncio.AbstractEventLoop | None = None
@@ -1148,6 +1212,44 @@ a { color: var(--accent); }
   padding: 18px 18px 16px; min-width: 0;
 }
 .span-2 { grid-column: 1 / -1; }
+.model-list-grid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+  align-items: start;
+}
+.model-column {
+  min-width: 0; overflow: hidden;
+  border: 1px solid var(--line-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.model-column-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 10px 12px; border-bottom: 1px solid var(--line-strong);
+  background: var(--surface); color: var(--text);
+}
+.model-column-title { font-size: 13px; font-weight: 650; }
+.model-column-count {
+  color: var(--faint); font-family: var(--mono); font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.model-column-body {
+  display: flex; flex-direction: column; gap: 6px;
+  max-height: 520px; overflow: auto; padding: 10px;
+}
+.model-item {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--text); font-family: var(--mono); font-size: 12px;
+  line-height: 1.4; overflow-wrap: anywhere;
+}
+.model-item:hover { border-color: var(--edge); background: var(--accent-soft); }
+.model-item-name { overflow-wrap: anywhere; }
+.model-item-alias { color: var(--muted); font-family: inherit; font-size: 10px; }
+.model-column-empty { padding: 18px 10px; color: var(--faint); text-align: center; font-size: 12px; }
+.model-fallback { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.model-fallback-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.model-fallback-title { color: var(--muted); font-size: 12px; font-weight: 650; }
+.model-fallback-note { color: var(--faint); font-size: 11px; }
+.model-fallback-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .section-head > div { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
 .section-title { font-size: 14px; font-weight: 650; color: var(--text); }
@@ -1307,6 +1409,15 @@ a { color: var(--accent); }
 .status-cell .badge + .badge { margin-left: 4px; }
 .numeric { text-align: right !important; font-variant-numeric: tabular-nums; }
 .credit-value { font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.credit-calibration {
+  display: inline-flex; align-items: center; min-height: 24px; padding: 0 7px;
+  border: 1px solid var(--line-strong); border-radius: 5px; color: var(--muted);
+  background: var(--surface-2); font-size: 11px; white-space: nowrap;
+}
+.credit-calibration.ok { color: var(--ok); border-color: var(--ok-line); background: var(--ok-soft); }
+.credit-calibration.projected { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.credit-calibration.stale, .credit-calibration.error { color: var(--danger); border-color: var(--danger-line); background: var(--danger-soft); }
+.credit-calibration.unknown { color: var(--faint); border-style: dashed; }
 .muted-cell { color: var(--faint); font-size: 12px; white-space: nowrap; font-family: var(--mono); }
 .row-subtitle { display: block; color: var(--faint); font-size: 11px; margin-top: 2px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .actions-col { width: 120px; }
@@ -1319,17 +1430,19 @@ a { color: var(--accent); }
 .switch input:disabled + .track { opacity: .6; }
 .empty-state { padding: 28px 12px; text-align: center; color: var(--faint); font-size: 13px; border: 1px dashed var(--frame); border-radius: var(--radius); }
 .usage-records-container { max-height: calc(100vh - 220px); min-height: 160px; overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--radius); }
-.usage-table { min-width: 1280px; table-layout: fixed; }
+.usage-table { min-width: 1400px; table-layout: fixed; }
 .usage-table th:nth-child(1) { width: 170px; }
 .usage-table th:nth-child(2) { width: 130px; }
-.usage-table th:nth-child(3) { width: 150px; }
-.usage-table th:nth-child(4) { width: 105px; }
+.usage-table th:nth-child(3) { width: 145px; }
+.usage-table th:nth-child(4) { width: 150px; }
 .usage-table th:nth-child(5) { width: 105px; }
-.usage-table th:nth-child(6) { width: 145px; }
-.usage-table th:nth-child(7) { width: 190px; }
-.usage-table th:nth-child(8) { width: 100px; }
-.usage-table th:nth-child(9) { width: 90px; }
+.usage-table th:nth-child(6) { width: 105px; }
+.usage-table th:nth-child(7) { width: 145px; }
+.usage-table th:nth-child(8) { width: 190px; }
+.usage-table th:nth-child(9) { width: 100px; }
 .usage-table th:nth-child(10) { width: 90px; }
+.usage-table th:nth-child(11) { width: 90px; }
+.usage-table th:nth-child(12) { width: 110px; }
 .usage-table td { overflow-wrap: anywhere; }
 .usage-table .usage-status { white-space: nowrap; }
 .usage-table .usage-meta { white-space: nowrap; }
@@ -1337,6 +1450,7 @@ a { color: var(--accent); }
 .usage-table .usage-meta.unknown { color: var(--faint); }
 .usage-table .usage-meta .usage-arrow { color: var(--faint); padding: 0 3px; }
 .usage-table .usage-meta .usage-sub { color: var(--muted); font-size: 11px; }
+.usage-route-endpoint { color: var(--muted); font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-model-cell { min-width: 0; }
 .usage-model-cell > div:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .usage-model-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
@@ -1534,6 +1648,7 @@ html.theme-anim *, html.theme-anim *::before, html.theme-anim *::after {
   .topbar { position: static; padding: 12px 14px; }
   .content { padding: 14px 14px 36px; }
   .panel-card { padding: 16px 14px 14px; }
+  .model-list-grid { grid-template-columns: minmax(0, 1fr); }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .stat dd { font-size: 18px; }
   .manual-grid { grid-template-columns: minmax(0, 1fr); }
@@ -1582,6 +1697,7 @@ def _web_login_html() -> str:
           <tr>
             <th>时间</th>
             <th>账号</th>
+            <th>产品 / 端点</th>
             <th>模型</th>
             <th>思考强度</th>
             <th>上下文模式</th>
@@ -1698,6 +1814,9 @@ def _web_login_html() -> str:
     # ``2001 failed to get app config: record not found``; the raw transport
     # remains available only for internal protocol diagnostics.
     selected_endpoint_id = str(settings.get("endpoint_id") or "").strip().lower()
+    selected_endpoint_id = {
+        "agent": "work",
+    }.get(selected_endpoint_id, selected_endpoint_id)
     selected_mode = str(
         settings.get("upstream_mode") or _current_upstream_mode() or ""
     ).strip().lower()
@@ -1711,6 +1830,7 @@ def _web_login_html() -> str:
         "9router": "remote",
         "trae-remote": "remote",
         "web": "remote",
+        "work-agent": "work",
     }.get(selected_mode, selected_mode)
     def _preset_url_match(item: Mapping[str, Any]) -> bool:
         """Match the shared base, or a legacy host-only IDE/SOLO gateway.
@@ -1723,7 +1843,22 @@ def _web_login_html() -> str:
 
         shared = str(item.get("base_url") or "").rstrip("/")
         gateway = str(item.get("model_base_url") or "").rstrip("/")
-        return settings_web == shared or (bool(gateway) and settings_web == gateway)
+        if settings_web == shared or (bool(gateway) and settings_web == gateway):
+            return True
+        # Stores from the first endpoint split wrote the shared host without
+        # ``/api/remote/v1``.  Treat that legacy value as the same preset so
+        # the page can show the selected protocol before the next save
+        # canonicalizes the URL.
+        try:
+            parsed_web = urlsplit(settings_web)
+            parsed_shared = urlsplit(shared)
+            return bool(
+                parsed_web.scheme.lower() == parsed_shared.scheme.lower()
+                and parsed_web.netloc.lower() == parsed_shared.netloc.lower()
+                and parsed_web.path.rstrip("/") in {"", "/"}
+            )
+        except Exception:
+            return False
 
     url_matches = [
         item for item in UPSTREAM_ENDPOINT_PRESETS if _preset_url_match(item)
@@ -1731,12 +1866,16 @@ def _web_login_html() -> str:
     # Prefer the persisted preset identity.  The IDE/SOLO presets keep their
     # own host-only model gateway, so URL-only matching can silently render
     # the wrong option after a reload.
+    # ``endpoint_id`` is the durable protocol identity. Older releases
+    # persisted a bare host instead of the canonical Remote path, so requiring
+    # an exact URL match would render a valid IDE/SOLO selection as "custom"
+    # after a reload. Prefer the saved id and let the settings API normalize
+    # the URL on the next explicit save.
     matched_endpoint = next(
         (
             item
             for item in UPSTREAM_ENDPOINT_PRESETS
             if str(item.get("id") or "").strip().lower() == selected_endpoint_id
-            and _preset_url_match(item)
         ),
         None,
     )
@@ -1756,6 +1895,8 @@ def _web_login_html() -> str:
             f'<option value="__saved" selected>{html_mod.escape(settings_web)}</option>'
         )
     for item in UPSTREAM_ENDPOINT_PRESETS:
+        if not item.get("visible", True):
+            continue
         selected = " selected" if matched_endpoint and matched_endpoint["id"] == item["id"] else ""
         endpoint_options.append(
             f'<option value="{html_mod.escape(item["id"])}"{selected}>{html_mod.escape(item["label"])}</option>'
@@ -1844,6 +1985,7 @@ def _web_login_html() -> str:
     <button class="nav-item" role="tab" data-tab="usage" data-title="消费记录" onclick="switchTab('usage')">{ic['receipt']}<span>消费记录</span></button>
     <button class="nav-item" role="tab" data-tab="settings" data-title="轮询与设置" onclick="switchTab('settings')">{ic['sliders-horizontal']}<span>轮询与设置</span></button>
     <button class="nav-item" role="tab" data-tab="models" data-title="模型测试" onclick="switchTab('models')">{ic['activity']}<span>模型测试</span></button>
+    <button class="nav-item" role="tab" data-tab="model-list" data-title="模型列表" onclick="switchTab('model-list')">{ic['list']}<span>模型列表</span></button>
   </nav>
   <div class="sidebar-foot"><span>Trae2api-cn</span><span>v{APP_VERSION}</span></div>
 </aside>
@@ -1901,7 +2043,7 @@ def _web_login_html() -> str:
     <div><dt>{ic['zap']}1M 上下文</dt><dd id="ov-max">--</dd></div>
     <div><dt>{ic['calendar-check']}自动签到</dt><dd id="ov-autocheckin">--</dd></div>
     <div><dt>{ic['list']}进行中请求</dt><dd id="ov-inflight">--</dd></div>
-    <div><dt>{ic['coins']}剩余通用积分</dt><dd id="ov-credits">--</dd></div>
+  <div><dt>{ic['coins']}剩余通用积分</dt><dd id="ov-credits">--</dd><dd class="stat-sub" id="ov-credits-meta">等待校准</dd></div>
   </dl>
 </section>
 </div>
@@ -1927,7 +2069,7 @@ def _web_login_html() -> str:
   <div class="stat"><dt>{ic['users']}账号</dt><dd id="stat-total">{stat_total}</dd></div>
   <div class="stat"><dt>{ic['shield-check']}有效</dt><dd id="stat-valid">{stat_valid}</dd></div>
   <div class="stat"><dt>{ic['check-check']}今日已签到</dt><dd id="stat-checked">{stat_checked}</dd></div>
-  <div class="stat"><dt>{ic['coins']}剩余通用积分</dt><dd id="stat-credits">{stat_credits}</dd></div>
+  <div class="stat"><dt>{ic['coins']}剩余通用积分</dt><dd id="stat-credits">{stat_credits}</dd><dd class="stat-sub" id="stat-credits-meta">等待校准</dd></div>
 </dl>
 <section class="panel-card" aria-label="账号列表">
   <div class="section-head">
@@ -1936,6 +2078,7 @@ def _web_login_html() -> str:
       <span id="checkin-busy" class="busy-indicator" role="status" aria-live="polite">正在处理...</span>
       <button class="btn btn-secondary btn-sm" id="checkin-status-refresh-btn" onclick="checkinRefreshAll()">{ic['refresh-cw']}查询签到状态</button>
       <button class="btn btn-secondary btn-sm" id="credits-refresh-btn" onclick="creditsRefreshAll()">{ic['coins']}查询全部积分</button>
+      <span id="credits-calibration-state" class="credit-calibration" role="status" aria-live="polite">等待校准</span>
       <button class="btn btn-primary btn-sm" id="checkin-claim-btn" onclick="checkinClaimAll()">{ic['calendar-check']}一键轮询签到</button>
       <button class="btn btn-secondary btn-sm" id="account-model-save-btn" onclick="saveAccountModelSettings()" disabled>{ic['save']}保存模型开关</button>
     </div>
@@ -2162,9 +2305,9 @@ def _web_login_html() -> str:
     <select id="conn-endpoint">
         <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
         <option value="remote">Remote / chat_sessions</option>
-        <option value="ide">IDE Agent / llm_utils_chat</option>
-        <option value="solo">Solo / api/agent/v3/llm_utils_chat</option>
-        <option value="work-agent">Work Agent / solo_work_remote</option>
+        <option value="work">TraeWork / chat_sessions（Work tier）</option>
+        <option value="solo">TraeCode Solo / llm_raw_chat</option>
+        <option value="ide">TraeCode IDE / llm_raw_chat</option>
       </select>
     </div>
   </div>
@@ -2182,6 +2325,7 @@ def _web_login_html() -> str:
           <option value="medium">medium / 高</option>
           <option value="high">high / 高</option>
           <option value="xhigh">xhigh / 极高</option>
+          <option value="ultra">ultra / 极高</option>
         </select>
       </label>
       <label class="inline-check inline-field">超时(秒) <input type="number" id="conn-timeout" value="120" min="10" max="600"></label>
@@ -2199,15 +2343,41 @@ def _web_login_html() -> str:
   </div>
   <div id="conn-msg" class="msg"></div>
 </div>
-<div class="panel-card">
-  <div class="section-head">
-    <div class="section-title">模型列表</div>
-    <button class="btn btn-secondary btn-sm" onclick="refreshModels()">{ic['list']}获取模型列表</button>
-  </div>
-  <p class="section-desc">从当前账号的上游模型列表实时获取，只列小写模型名，大小写重复项已合并。</p>
-  <pre id="models-out" class="code-out"></pre>
-  <div id="models-msg" class="msg"></div>
 </div>
+</div>
+
+<div class="tab-page" data-page="model-list">
+<div class="panel-stack">
+<section id="model-list-panel" aria-labelledby="model-list-title">
+  <div class="section-head">
+    <div><div class="section-title" id="model-list-title">模型列表</div><span id="model-list-meta" class="section-meta">尚未加载</span></div>
+    <button class="btn btn-secondary btn-sm" id="models-refresh-btn" onclick="refreshModels()">{ic['refresh-cw']}刷新模型列表</button>
+  </div>
+  <p class="section-desc">TraeCode：Solo / IDE · TraeWork：Work · 同一模型可出现在多个端点目录中</p>
+  <div class="model-list-grid">
+    <section class="model-column" aria-labelledby="models-col-remote-title">
+      <div class="model-column-head"><span class="model-column-title" id="models-col-remote-title">Remote</span><span class="model-column-count" id="models-count-remote">0</span></div>
+      <div class="model-column-body" id="models-col-remote"><div class="model-column-empty">尚未加载</div></div>
+    </section>
+    <section class="model-column" aria-labelledby="models-col-traecode-title">
+      <div class="model-column-head"><span class="model-column-title" id="models-col-traecode-title">TraeCode</span><span class="model-column-count" id="models-count-traecode">0</span></div>
+      <div class="model-column-body" id="models-col-traecode"><div class="model-column-empty">尚未加载</div></div>
+    </section>
+    <section class="model-column" aria-labelledby="models-col-traework-title">
+      <div class="model-column-head"><span class="model-column-title" id="models-col-traework-title">TraeWork</span><span class="model-column-count" id="models-count-traework">0</span></div>
+      <div class="model-column-body" id="models-col-traework"><div class="model-column-empty">尚未加载</div></div>
+    </section>
+  </div>
+  <div id="models-fallback" class="model-fallback" hidden>
+    <div class="model-fallback-head">
+      <span class="model-fallback-title">内置回退 · 端点未确认</span>
+      <span class="model-column-count" id="models-count-fallback">0</span>
+      <span class="model-fallback-note">内置或未归类的候选模型，尚未验证端点可用性</span>
+    </div>
+    <div class="model-fallback-list" id="models-col-fallback"></div>
+  </div>
+  <div id="models-msg" class="msg" role="status" aria-live="polite"></div>
+</section>
 </div>
 </div>
 
@@ -2238,6 +2408,7 @@ function switchTab(name){{
   try{{ history.replaceState(null,'','#'+name); }}catch(e){{}}
   syncSelection();
   if(name==='overview') refreshOverview();
+  if(name==='model-list') refreshModels();
 }}
 // Sliding highlights for the nav and segmented controls. The first placement
 // skips the transition so elements don't fly in from the corner.
@@ -2276,6 +2447,128 @@ function setStatePill(id,text,on){{
   el.textContent=text;
   el.classList.toggle('on',!!on);
 }}
+// Credit reconciliation state is intentionally kept separate from usage
+// rendering.  The server's ``remaining`` field is the effective balance
+// (official snapshot minus weighted, confirmed local debits); older servers
+// may only expose the historical ``remaining``/``total_limit`` pair.
+var creditUiState={{
+  accounts:Object.create(null),
+  meta:{{status:'unknown',reconciled_at:0,confidence:null,official_remaining:null,local_debit:null}},
+  usageFingerprint:'',
+  usageFingerprintReady:false,
+  reconcileTimer:null,
+  reconcileInFlight:false
+}};
+function creditNumber(value){{
+  if(value===undefined||value===null||value==='') return null;
+  var n=Number(value);
+  return Number.isFinite(n)?n:null;
+}}
+function creditSnapshot(data){{
+  if(!data||typeof data!=='object') return null;
+  var raw=data.account_credits||data.credits||data;
+  if(!raw||typeof raw!=='object') return null;
+  var out=Object.assign({{}},raw);
+  ['credits_reconciled_at','reconcile_status','reconcile_confidence','official_remaining','local_debit','credits_updated_at'].forEach(function(key){{
+    if(out[key]===undefined&&data[key]!==undefined) out[key]=data[key];
+  }});
+  return out;
+}}
+function creditStatusLabel(status){{
+  var value=String(status||'unknown').trim().toLowerCase();
+  if(value==='ok'||value==='verified'||value==='upstream') return '已校准';
+  if(value==='projected'||value==='weighted'||value==='usage_weighted') return '加权估算';
+  if(value==='stale'||value==='pending'||value==='settling') return '待校准';
+  if(value==='error'||value==='failed') return '校准失败';
+  return '等待校准';
+}}
+function creditStatusClass(status){{
+  var value=String(status||'unknown').trim().toLowerCase();
+  if(value==='ok'||value==='verified'||value==='upstream') return 'ok';
+  if(value==='projected'||value==='weighted'||value==='usage_weighted') return 'projected';
+  if(value==='stale'||value==='pending'||value==='settling') return 'stale';
+  if(value==='error'||value==='failed') return 'error';
+  return 'unknown';
+}}
+function creditTime(value){{
+  var n=creditNumber(value);
+  if(!n) return '';
+  // Upstream stores seconds; tolerate millisecond timestamps in custom
+  // adapters without showing an implausible 1970 date.
+  if(n>100000000000) n=n/1000;
+  try{{ return new Date(n*1000).toLocaleTimeString(); }}catch(e){{ return ''; }}
+}}
+function renderCreditCalibrationMeta(){{
+  var meta=creditUiState.meta||{{}};
+  var label=creditStatusLabel(meta.status);
+  var stamp=creditTime(meta.reconciled_at||meta.updated_at);
+  var confidence=creditNumber(meta.confidence);
+  var text=label+(stamp?' · '+stamp:'');
+  if(confidence!==null) text+=' · 置信 '+Math.round(Math.max(0,Math.min(1,confidence))*100)+'%';
+  var detail=[];
+  var official=creditNumber(meta.official_remaining);
+  var local=creditNumber(meta.local_debit);
+  if(official!==null) detail.push('官方 '+official.toFixed(2));
+  if(local!==null&&local>0) detail.push('待上游扣除 '+local.toFixed(2));
+  ['credits-calibration-state','stat-credits-meta','ov-credits-meta'].forEach(function(id){{
+    var el=document.getElementById(id);
+    if(!el) return;
+    el.textContent=text;
+    el.title=detail.join(' · ')||'总积分由上游快照与已确认消费加权校准';
+    if(el.classList){{ el.classList.remove('ok','projected','stale','error','unknown'); el.classList.add(creditStatusClass(meta.status)); }}
+  }});
+}}
+function updateCreditCalibrationMeta(data){{
+  if(!data||typeof data!=='object') return;
+  var meta=creditUiState.meta||{{}};
+  var source=data.accounts&&typeof data.accounts==='object'?data.accounts:data;
+  var status=source.credits_reconcile_status;
+  var stamp=source.credits_reconciled_at||source.credits_updated_at;
+  var confidence=source.credits_reconcile_confidence;
+  var official=source.credits_official_remaining;
+  var local=source.credits_local_debit;
+  if(status===undefined&&data.account_credits) status=data.account_credits.reconcile_status;
+  if(stamp===undefined&&data.account_credits) stamp=data.account_credits.credits_reconciled_at||data.account_credits.credits_updated_at;
+  if(confidence===undefined&&data.account_credits) confidence=data.account_credits.reconcile_confidence;
+  if(official===undefined&&data.account_credits) official=data.account_credits.official_remaining;
+  if(local===undefined&&data.account_credits) local=data.account_credits.local_debit;
+  if(status!==undefined&&status!==null&&status!=='') meta.status=status;
+  if(stamp!==undefined&&stamp!==null&&stamp!=='') meta.reconciled_at=stamp;
+  if(confidence!==undefined&&confidence!==null&&confidence!=='') meta.confidence=confidence;
+  if(official!==undefined&&official!==null&&official!=='') meta.official_remaining=official;
+  if(local!==undefined&&local!==null&&local!=='') meta.local_debit=local;
+  creditUiState.meta=meta;
+  renderCreditCalibrationMeta();
+}}
+function updateCreditCalibrationFromAccounts(accounts){{
+  if(!Array.isArray(accounts)||!accounts.length) return;
+  var latest=0, status='', confidenceTotal=0, confidenceWeight=0, officialTotal=0, localTotal=0;
+  var hasOfficial=false, hasLocal=false, successful=0;
+  accounts.forEach(function(account){{
+    var snap=creditSnapshot(account);
+    if(!snap) return;
+    var stamp=creditNumber(snap.credits_reconciled_at||account.credits_reconciled_at||snap.credits_updated_at||account.credits_updated_at);
+    if(stamp!==null) latest=Math.max(latest,stamp);
+    var accountStatus=snap.reconcile_status||account.credits_reconcile_status;
+    if(accountStatus) status=status||accountStatus;
+    var confidence=creditNumber(snap.reconcile_confidence||account.credits_reconcile_confidence);
+    var remaining=creditNumber(snap.remaining);
+    if(confidence!==null){{ var weight=Math.max(1,remaining===null?1:Math.abs(remaining)); confidenceTotal+=confidence*weight; confidenceWeight+=weight; }}
+    var official=creditNumber(snap.official_remaining);
+    if(official!==null){{ officialTotal+=official; hasOfficial=true; }}
+    var local=creditNumber(snap.local_debit);
+    if(local!==null){{ localTotal+=local; hasLocal=true; }}
+    if(!account.error) successful++;
+  }});
+  if(successful===0) return;
+  updateCreditCalibrationMeta({{
+    credits_reconciled_at:latest||null,
+    credits_reconcile_status:status||'ok',
+    credits_reconcile_confidence:confidenceWeight?confidenceTotal/confidenceWeight:null,
+    credits_official_remaining:hasOfficial?officialTotal:null,
+    credits_local_debit:hasLocal?localTotal:null
+  }});
+}}
 // Overview numbers are derived from the rendered rows so every partial
 // refresh (single check-in, credits query, claim-all) keeps them in sync.
 function refreshStats(){{
@@ -2294,6 +2587,7 @@ function refreshStats(){{
   set('stat-total',rows.length);
   set('stat-checked',checked);
   set('stat-credits',unlimited?'无限':(known?sum.toFixed(2):'-'));
+  renderCreditCalibrationMeta();
 }}
 const state = {{ traceId: null, win: null }};
 let currentCodeVerifier = '';
@@ -2424,7 +2718,7 @@ function usageEffortLabel(value){{
   if(text==='low' || text==='light') return '低';
   if(text==='medium' || text==='mid' || text==='normal' || text==='default') return '中';
   if(text==='high') return '高';
-  if(text==='xhigh' || text==='extra_high' || text==='very_high' || text==='max' || text==='maximum') return '极高';
+  if(text==='xhigh' || text==='extra_high' || text==='very_high' || text==='max' || text==='maximum' || text==='ultra') return '极高';
   return escapeHtml(String(value));
 }}
 function usageReasoningMeta(record){{
@@ -2542,6 +2836,56 @@ function usageTransportMeta(record){{
   if(!parts.length) return null;
   return {{text:parts.join(' · '),title:title.join('；')}};
 }}
+function usageRouteMeta(record){{
+  var rawProduct=usageRecordField(record,['product','provider_product','upstream_product']);
+  var product=rawProduct===null?'':String(rawProduct).trim().toLowerCase();
+  var productLabel=product==='traework'?'TraeWork':(product==='trae'?'Trae':(rawProduct===null?'--':String(rawProduct)));
+  var actual=usageRecordField(record,['actual_endpoint','actual_mode','upstream_endpoint']);
+  var requested=usageRecordField(record,['requested_endpoint','requested_mode']);
+  var publicEndpoint=usageRecordField(record,['endpoint']);
+  var endpoint=actual||requested||publicEndpoint;
+  var detail=endpoint===null?'--':String(endpoint);
+  var title=[];
+  if(productLabel!=='--') title.push('产品: '+productLabel);
+  if(actual!==null) title.push('实际端点: '+String(actual));
+  if(requested!==null && String(requested)!==String(actual||'')) title.push('请求端点: '+String(requested));
+  if(publicEndpoint!==null && String(publicEndpoint)!==String(actual||requested||'')) title.push('入口: '+String(publicEndpoint));
+  return {{
+    text:escapeHtml(productLabel)+'<div class="usage-route-endpoint">'+escapeHtml(detail)+'</div>',
+    title:title.join('；')||'未记录产品/端点',
+    unknown:productLabel==='--' && endpoint===null
+  }};
+}}
+function usageCreditFingerprint(records){{
+  if(!Array.isArray(records)) return '';
+  return records.map(function(record){{
+    if(!record||typeof record!=='object') return '';
+    var amount=creditNumber(record.credits_consumed);
+    var source=String(record.credits_source||'').toLowerCase();
+    var status=String(record.status||'completed').toLowerCase();
+    if(amount===null||amount<=0||status==='error'||status==='cancelled'||source==='pending'||source==='unavailable'||source==='unknown') return '';
+    return String(record.request_id||record.id||record.timestamp||'')+'='+amount.toFixed(4)+'@'+String(record.account_id||'');
+  }}).filter(Boolean).join('|');
+}}
+function scheduleUsageCreditCalibration(records){{
+  var fingerprint=usageCreditFingerprint(records);
+  if(!fingerprint) return;
+  if(!creditUiState.usageFingerprintReady){{
+    creditUiState.usageFingerprint=fingerprint;
+    creditUiState.usageFingerprintReady=true;
+    return;
+  }}
+  if(fingerprint===creditUiState.usageFingerprint) return;
+  creditUiState.usageFingerprint=fingerprint;
+  // A settled usage row means the effective balance may have changed.  One
+  // debounced bulk query refreshes all rows and the aggregate without
+  // turning the five-second history poll into an upstream polling loop.
+  clearTimeout(creditUiState.reconcileTimer);
+  creditUiState.reconcileTimer=setTimeout(function(){{
+    creditUiState.reconcileTimer=null;
+    creditsRefreshAll({{silent:true,reason:'usage'}});
+  }},1200);
+}}
 async function refreshUsage() {{
   if(usageRefreshing) return;
   usageRefreshing=true;
@@ -2553,6 +2897,7 @@ async function refreshUsage() {{
     if(!result.ok) throw new Error(apiError(result.data,result.status));
     var records=usageRecordsFromPayload(result.data);
     if(records===null) throw new Error(apiError(result.data,result.status));
+    scheduleUsageCreditCalibration(records);
     if(!tbody) return;
     if(records.length===0) {{
       tbody.innerHTML='';
@@ -2564,6 +2909,7 @@ async function refreshUsage() {{
         var when=stamp?new Date(stamp*1000).toLocaleString():'--';
         var account=record.account_id?String(record.account_id).slice(-12):'--';
         var model=record.model||'--';
+         var route=usageRouteMeta(record);
          var reasoning=usageReasoningMeta(record);
          var context=usageContextMeta(record);
          var maxMode=usageMaxMeta(record);
@@ -2584,6 +2930,7 @@ async function refreshUsage() {{
         return '<tr>'
           + '<td>'+escapeHtml(when)+'</td>'
           + '<td><code>'+escapeHtml(account)+'</code></td>'
+          + '<td class="usage-meta usage-route'+(route.unknown?' unknown':'')+'" title="'+escapeHtml(route.title)+'">'+route.text+'</td>'
           + '<td class="usage-model-cell"><div title="'+escapeHtml(model)+'">'+escapeHtml(model)+'</div><div class="usage-model-flags">'+usageModelFlags(maxMode,tool)+'</div></td>'
           + '<td class="usage-meta'+(reasoning.unknown?' unknown':'')+'" title="'+escapeHtml(reasoning.title)+'">'+reasoning.text+'</td>'
           + '<td class="usage-meta'+(context.unknown?' unknown':'')+'" title="'+escapeHtml(context.title)+'">'+escapeHtml(context.text)+'</td>'
@@ -2684,6 +3031,7 @@ function renderOverview(){{
   setOv('ov-inflight',String(s.in_flight||0));
   var cr=a.credits_remaining;
   setOv('ov-credits',cr==='unlimited'?'无限':(cr===null||cr===undefined?'--':Number(cr).toFixed(2)));
+  updateCreditCalibrationMeta(a);
   renderOverviewChart();
   renderOverviewDays();
   showOverviewDay(ovDay);
@@ -2811,7 +3159,10 @@ function setOverviewRange(value){{
 }})();
 setInterval(function(){{
   if(document.hidden) return;
-  if(document.querySelector('.tab-page.active[data-page="overview"]')) refreshOverview();
+  // /api/overview reads the persisted credit projection and never calls the
+  // provider.  Keep the calibration badge and aggregate total fresh on every
+  // page without turning this timer into an upstream credit probe.
+  refreshOverview();
 }},10000);
 refreshOverview();
 window.addEventListener('message',function(ev){{
@@ -2944,15 +3295,26 @@ function setAccountCheckinBusy(id,busy){{
   syncCheckinBusyUI();
 }}
 function setCredits(id,data){{
-  var values=[['general-credits-',data&&data.account_credits]];
-  values.forEach(function(pair){{
-    var el=document.getElementById(pair[0]+id), value=pair[1];
-    if(!el) return;
-    if(value===undefined||value===null) return;
-    if(value.unlimited) el.textContent='☆ 无限';
-    else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+Number(value.remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
-    else el.textContent='-';
-  }});
+  var value=creditSnapshot(data);
+  var el=document.getElementById('general-credits-'+id);
+  if(!el||!value) return;
+  creditUiState.accounts[String(id)]=Object.assign({{}},creditUiState.accounts[String(id)]||{{}},value);
+  var row=document.getElementById('row-'+id);
+  if(row){{
+    var remaining=creditNumber(value.remaining);
+    var official=creditNumber(value.official_remaining);
+    var local=creditNumber(value.local_debit);
+    if(remaining!==null) row.dataset.creditRemaining=String(remaining);
+    if(official!==null) row.dataset.creditOfficial=String(official);
+    if(local!==null) row.dataset.creditLocalDebit=String(local);
+    if(value.reconcile_status) row.dataset.creditStatus=String(value.reconcile_status);
+    if(value.credits_reconciled_at) row.dataset.creditReconciledAt=String(value.credits_reconciled_at);
+  }}
+  if(value.unlimited) el.textContent='☆ 无限';
+  else if(value.remaining!==undefined&&value.remaining!==null) el.textContent='剩'+Number(value.remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
+  else if(value.official_remaining!==undefined&&value.official_remaining!==null) el.textContent='剩'+Number(value.official_remaining).toFixed(2)+'/总'+(value.total_limit===undefined?'?':Number(value.total_limit).toFixed(2));
+  else el.textContent='-';
+  updateCreditCalibrationMeta(value);
 }}
 function setCheckinState(id,checked,detail,error){{
   var el=document.getElementById('checkin-'+id), detailEl=document.getElementById('checkin-detail-'+id);
@@ -3169,21 +3531,122 @@ async function runConnTest(){{
     endpointWarnings.slice(0,3).join('\\n'),false,12000);
 }}
 async function refreshModels(){{
-  var el=document.getElementById('models-out');
-  var msg=document.getElementById('models-msg');
-  el.style.display='block';
-  el.textContent='加载中...';
+  if(refreshModels.running) return;
+  refreshModels.running=true;
+  var refreshButton=document.getElementById('models-refresh-btn');
+  if(refreshButton) refreshButton.disabled=true;
+  var meta=document.getElementById('model-list-meta');
+  var groupNames=['remote','traecode','traework'];
+  var columns={{}};
+  groupNames.forEach(function(group){{
+    columns[group]=document.getElementById('models-col-'+group);
+    var count=document.getElementById('models-count-'+group);
+    if(count) count.textContent='0';
+    if(columns[group]) columns[group].innerHTML='<div class="model-column-empty">加载中...</div>';
+  }});
+  var fallbackPanel=document.getElementById('models-fallback');
+  var fallbackColumn=document.getElementById('models-col-fallback');
+  var fallbackCount=document.getElementById('models-count-fallback');
+  if(fallbackPanel) fallbackPanel.hidden=true;
+  if(fallbackColumn) fallbackColumn.innerHTML='';
+  if(fallbackCount) fallbackCount.textContent='0';
+  if(meta) meta.textContent='加载中...';
   try{{
     var result=await requestJSON('/v1/models?refresh=true',{{method:'GET'}},45000);
     var d=result.data;
     if(!result.ok || !d || !Array.isArray(d.data)){{
       throw new Error((d && d.error && d.error.message) || ('HTTP '+result.status));
     }}
-    el.textContent=d.data.map(function(model,index){{ return String(index+1).padStart(2,'0')+'  '+String(model.id||''); }}).join('\\n');
+    var groupForEndpoint=function(endpoint){{
+      endpoint=String(endpoint||'').trim().toLowerCase();
+      if(endpoint==='remote') return 'remote';
+      if(endpoint==='work' || endpoint==='traework') return 'traework';
+      if(endpoint==='solo' || endpoint==='ide' || endpoint==='traecode') return 'traecode';
+      return '';
+    }};
+    var fallbackModels=[];
+    var modelGroups=function(model){{
+      var modelId=String(model.id||'').toLowerCase();
+      if(modelId==='auto') return ['remote'];
+      var groups=(Array.isArray(model.endpoint_groups)?model.endpoint_groups:[model.endpoint_group])
+        .map(groupForEndpoint).filter(Boolean);
+      if(!groups.length){{
+        groups=(Array.isArray(model.endpoints)?model.endpoints:[model.endpoint])
+          .map(groupForEndpoint).filter(Boolean);
+      }}
+      if(!groups.length && model.endpoint){{
+        groups=[groupForEndpoint(model.endpoint)].filter(Boolean);
+      }}
+      groups=groups.filter(function(item,index){{ return item && groups.indexOf(item)===index; }});
+      if(!groups.length && !fallbackModels.some(function(item){{ return item.id===model.id; }})) fallbackModels.push(model);
+      return groups;
+    }};
+    var appendModel=function(column,model){{
+      var item=document.createElement('div');
+      item.className='model-item';
+      var name=document.createElement('div');
+      name.className='model-item-name';
+      name.textContent=String(model.id||'');
+      item.appendChild(name);
+      if(String(model.id||'').toLowerCase()==='auto'){{
+        var route=document.createElement('div');
+        route.className='model-item-alias';
+        route.textContent='Relay 自动路由';
+        item.appendChild(route);
+      }}
+      if(model.alias_for){{
+        var alias=document.createElement('div');
+        alias.className='model-item-alias';
+        alias.textContent='别名 → '+String(model.alias_for);
+        item.appendChild(alias);
+      }}
+      column.appendChild(item);
+    }};
+    var grouped={{remote:[],traecode:[],traework:[]}};
+    d.data.forEach(function(model){{
+      modelGroups(model).forEach(function(group){{
+        if(!grouped[group].some(function(existing){{ return String(existing.id||'')===String(model.id||''); }})){{
+          grouped[group].push(model);
+        }}
+      }});
+    }});
+    groupNames.forEach(function(group){{
+      var column=columns[group];
+      var count=document.getElementById('models-count-'+group);
+      if(!column) return;
+      column.innerHTML='';
+      var items=grouped[group]||[];
+      if(count) count.textContent=String(items.length);
+      if(!items.length){{
+        column.innerHTML='<div class="model-column-empty">暂无模型</div>';
+        return;
+      }}
+      items.forEach(function(model){{
+        appendModel(column,model);
+      }});
+    }});
+    if(fallbackPanel && fallbackColumn && fallbackModels.length){{
+      fallbackPanel.hidden=false;
+      if(fallbackCount) fallbackCount.textContent=String(fallbackModels.length);
+      fallbackModels.forEach(function(model){{
+        appendModel(fallbackColumn,model);
+      }});
+    }}
+    if(meta) meta.textContent='共 '+d.data.length+' 个模型，按端点归类';
     showMsg('models-msg','成功获取 '+d.data.length+' 个模型',true);
   }}catch(e){{
-    el.textContent=String(e);
+    groupNames.forEach(function(group){{
+      var column=columns[group];
+      if(column) column.innerHTML='<div class="model-column-empty">加载失败</div>';
+    }});
+    if(fallbackPanel) fallbackPanel.hidden=true;
+    if(fallbackColumn) fallbackColumn.innerHTML='';
+    if(fallbackCount) fallbackCount.textContent='0';
+    if(meta) meta.textContent='加载失败';
     showMsg('models-msg',String(e),false);
+  }}finally{{
+    refreshModels.running=false;
+    if(refreshButton) refreshButton.disabled=false;
   }}
 }}
 async function logout(){{
@@ -3341,8 +3804,13 @@ function endpointPreviewText(state){{
   var web=String(state.web_base_url||'').replace(/\\/+$/,'');
   var model=String(state.model_base_url||'').replace(/\\/+$/,'');
   var parts=[];
-  if(entry&&(entry.mode==='ide'||entry.mode==='solo')){{
+  if(entry&&(entry.mode==='work'||entry.mode==='work-agent')){{
+    parts.push('模型请求 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
+    parts.push('TraeWork / solo_work_remote（Work tier）');
+  }}else if(entry&&(entry.mode==='ide'||entry.mode==='solo')){{
     parts.push('模型请求 '+(model||'https://trae-api-cn.mchost.guru')+'/api/agent/v3/llm_utils_chat');
+    parts.push('function=solo_work_lite');
+    parts.push('raw 诊断 '+(model||'https://trae-api-cn.mchost.guru')+'/api/ide/v2/llm_raw_chat');
     parts.push('Remote 回落 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
   }}else{{
     parts.push('会话请求 '+(web||'https://trae-api-cn.mchost.guru/api/remote/v1')+'/chat_sessions');
@@ -3583,25 +4051,36 @@ async function checkinRefreshAll(){{
   finally{{ setBusy(false); }}
 }}
 async function creditsRefreshAll(){{
-  setBusy(true);
+  var options=arguments[0]||{{}};
+  var silent=!!options.silent;
+  if(creditUiState.reconcileInFlight) return;
+  creditUiState.reconcileInFlight=true;
+  if(!silent) setBusy(true);
   try{{
     var result=await requestJSON('/api/checkin/credits/accounts',{{method:'GET'}},90000);
     var d=result.data;
     if(!result.ok||!d||!d.success){{ throw new Error(apiError(d,result.status)); }}
     var accounts=d.accounts||[];
     accounts.forEach(updateAccountCreditsRow);
+    updateCreditCalibrationFromAccounts(accounts);
     var failures=accounts.filter(function(a){{ return a.error; }});
     var summary=document.getElementById('checkin-summary');
     if(summary) summary.textContent='积分查询完成：'+(accounts.length-failures.length)+' / '+accounts.length+' 个账号'+(failures.length?'，'+failures.length+' 个异常':'');
     var updated=document.getElementById('checkin-updated');
     if(updated) updated.textContent='更新于 '+new Date().toLocaleTimeString();
-    if(failures.length){{
+    if(!silent&&failures.length){{
       showMsg('checkin-msg','积分查询完成，但有 '+failures.length+' 个账号失败：\\n'+failures.slice(0,3).map(checkinFailureText).join('\\n'),false,12000);
-    }}else{{
+    }}else if(!silent){{
       showMsg('checkin-msg','积分查询成功，已刷新 '+accounts.length+' 个账号',true,3000);
     }}
-  }}catch(e){{ showMsg('checkin-msg',String(e),false,12000); }}
-  finally{{ setBusy(false); }}
+  }}catch(e){{
+    creditUiState.meta.status='error';
+    renderCreditCalibrationMeta();
+    if(!silent) showMsg('checkin-msg',String(e),false,12000);
+  }}finally{{
+    creditUiState.reconcileInFlight=false;
+    if(!silent) setBusy(false);
+  }}
 }}
 async function checkinAccount(id){{
   setAccountCheckinBusy(id,true);
@@ -3877,6 +4356,7 @@ async def _deferred_dispatch_stream(
             "auto",
             "ide",
             "solo",
+            "work",
             "work-agent",
             "traework-native",
             "native",
@@ -4064,7 +4544,18 @@ async def _deferred_dispatch_stream(
         except Exception as exc:
             if isinstance(exc, EmptyUpstreamResponse):
                 _track_usage_from_exception(exc, model)
-                if not exc.retryable or exc.observed_model_event:
+                # Native Trae endpoints may emit ``model_config`` and a
+                # usage-turn id before returning account-scoped 4011/429.
+                # The translator preserves those metadata fields on the
+                # exception, but no model output was sent.  Let the endpoint
+                # fallback proceed for this capacity error; otherwise the
+                # public streaming request becomes a 502 while the same
+                # non-stream probe can still rotate/fallback successfully.
+                native_capacity_error = _is_native_rate_limit_error(exc)
+                if (
+                    (not exc.retryable or exc.observed_model_event)
+                    and not native_capacity_error
+                ):
                     raise
             # A StreamingResponse can be returned with HTTP 200 and fail only
             # when its body iterator starts (empty native SSE, invalid headers,
@@ -4959,6 +5450,7 @@ def _bind_chat_session(
                 "auto",
                 "ide",
                 "solo",
+                "work",
                 "work-agent",
             ):
                 auth.next_polling_account()
@@ -5361,6 +5853,66 @@ def _optional_bool(value: Any) -> bool | None:
     return None
 
 
+def _normalize_usage_thinking(value: Any) -> dict[str, Any] | str | None:
+    """Keep a compact, non-sensitive copy of the caller's thinking hint.
+
+    Request options can contain the full Anthropic/OpenAI ``thinking`` object.
+    Usage history only needs the small routing/display fields; persisting the
+    whole object would make records noisy and could retain adapter-specific
+    payloads indefinitely.
+    """
+
+    if value in (None, "", False):
+        return None
+    if isinstance(value, Mapping):
+        allowed = (
+            "type",
+            "enabled",
+            "enable",
+            "effort",
+            "level",
+            "budget_tokens",
+            "budgetTokens",
+        )
+        compact = {
+            key: value[key]
+            for key in allowed
+            if key in value and value[key] not in (None, "")
+        }
+        return compact or None
+    if isinstance(value, bool):
+        return {"type": "enabled"} if value else None
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_usage_product(value: Any) -> str | None:
+    """Normalize route products to the public ``trae``/``traework`` labels."""
+
+    if value in (None, ""):
+        return None
+    product = str(value).strip().lower().replace("_", "-")
+    if product in {
+        "work",
+        "work-agent",
+        "remote-work",
+        "trae-work",
+        "traework",
+        "traework-native",
+        "native",
+        "solo-work",
+    }:
+        return "traework"
+    if product in {"trae", "trae-cn", "remote", "ide", "solo"}:
+        return "trae"
+    # Do not mistake an HTTP path (the legacy ``endpoint`` field) for a
+    # product when normalizing old rows. Unknown products remain unknown;
+    # callers can still inspect the raw route fields separately.
+    return None
+
+
 def _context_mode_bool(value: Any) -> bool | None:
     """Map known context labels to a Max-enabled boolean.
 
@@ -5579,11 +6131,209 @@ async def _fetch_used_credits(token: str) -> int | float | None:
         return None
 
 
+def _credit_reconcile_interval_seconds() -> float:
+    """Return the cadence for official total-credit reconciliation."""
+
+    try:
+        value = float(
+            os.environ.get("TRAE_CREDIT_RECONCILE_INTERVAL_SECONDS", "120")
+            or "120"
+        )
+    except (TypeError, ValueError):
+        value = 120.0
+    return max(15.0, min(value, 86_400.0))
+
+
+def _credit_settled_timestamp(record: Mapping[str, Any]) -> float:
+    value = record.get("credits_settled_at")
+    if value in (None, ""):
+        value = record.get("timestamp")
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _credit_source_weight(record: Mapping[str, Any]) -> float:
+    """Return confidence for a confirmed charge source.
+
+    Session usage and explicit upstream usage are authoritative.  Account
+    total deltas are reliable but can race another request, so they receive a
+    slightly lower weight.  Pending/unknown rows never reduce the displayed
+    balance.
+    """
+
+    source = str(record.get("credits_source") or "").strip().lower()
+    if source in {"session_usage", "upstream", "manual"}:
+        return 1.0
+    if source in {"snapshot_delta", "account_total"}:
+        return 0.85
+    return 0.0
+
+
+def _settled_credit_overlay(
+    account_id: str, anchor_at: float
+) -> tuple[float, float, float, int, float]:
+    """Return weighted post-anchor charges for one account.
+
+    The tuple is ``(weighted, raw, confidence, count, latest_timestamp)``.
+    Rows are read under the usage lock, but account persistence happens after
+    the lock is released so usage updates and account refreshes cannot deadlock.
+    """
+
+    if not account_id or anchor_at <= 0:
+        return 0.0, 0.0, 0.0, 0, 0.0
+    weighted = raw = confidence_total = 0.0
+    count = 0
+    latest = 0.0
+    with _USAGE_LOCK:
+        records = tuple(_USAGE_HISTORY)
+    for record in records:
+        if str(record.get("account_id") or "") != str(account_id):
+            continue
+        amount = _number_value(record.get("credits_consumed"))
+        settled_at = _credit_settled_timestamp(record)
+        # Include the boundary instant.  The provider and local settlement can
+        # legitimately share the same timestamp (especially in tests or when
+        # the billing response is handled in the same event-loop tick); using
+        # ``<=`` would then hide a confirmed charge from the projection.
+        if amount is None or amount < 0 or settled_at < anchor_at:
+            continue
+        weight = _credit_source_weight(record)
+        if weight <= 0:
+            continue
+        weighted += float(amount) * weight
+        raw += float(amount)
+        confidence_total += weight
+        count += 1
+        latest = max(latest, settled_at)
+    confidence = (confidence_total / count) if count else 0.0
+    return (
+        _credit_round(weighted) or 0.0,
+        _credit_round(raw) or 0.0,
+        round(min(1.0, confidence), 4),
+        count,
+        latest,
+    )
+
+
+def _credit_projection_for_account(
+    account_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build a local balance projection from the latest official anchor."""
+
+    credits = auth.get_account_credit_state(account_id)
+    if not credits:
+        return {}, {}
+    official = _number_value(
+        credits.get("official_remaining")
+        if "official_remaining" in credits
+        else credits.get("remaining")
+    )
+    if official is None or credits.get("unlimited"):
+        return credits, {
+            "remaining": credits.get("remaining"),
+            "local_debit": 0.0,
+            "confidence": 1.0,
+            "status": "unlimited" if credits.get("unlimited") else "unknown",
+            "source": "upstream",
+            "latest": 0.0,
+        }
+    anchor = credits.get("credits_anchor_at") or credits.get(
+        "credits_reconciled_at"
+    )
+    try:
+        anchor_at = float(anchor or 0)
+    except (TypeError, ValueError):
+        anchor_at = 0.0
+    weighted, raw, confidence, count, latest = _settled_credit_overlay(
+        account_id, anchor_at
+    )
+    effective = max(0.0, float(official) - float(weighted))
+    projection = {
+        "remaining": _credit_round(effective),
+        "local_debit": _credit_round(weighted) or 0.0,
+        "confidence": confidence if count else 1.0,
+        "status": "projected" if count else "ok",
+        "source": "usage_weighted" if count else "upstream",
+        "latest": latest,
+        "raw_debit": _credit_round(raw) or 0.0,
+    }
+    return credits, projection
+
+
+def _refresh_credit_projection(account_id: str) -> dict[str, Any]:
+    """Persist the current post-settlement balance projection."""
+
+    credits, projection = _credit_projection_for_account(account_id)
+    if not credits or not projection:
+        return credits
+    return auth.update_account_credit_projection(
+        account_id,
+        effective_remaining=projection.get("remaining"),
+        local_debit=projection.get("local_debit", 0),
+        status=projection.get("status", "projected"),
+        source=projection.get("source", "usage_weighted"),
+        confidence=projection.get("confidence", 0),
+        settled_at=projection.get("latest"),
+    ) or credits
+
+
+def _credit_snapshot_projection(
+    account_id: str, parsed: Mapping[str, Any], observed_at: float
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Combine an upstream snapshot with charges not yet reflected upstream."""
+
+    previous = auth.get_account_credit_state(account_id)
+    previous_used = _number_value(
+        previous.get("official_used")
+        if "official_used" in previous
+        else previous.get("used")
+    )
+    incoming_used = _number_value(parsed.get("used"))
+    upstream_delta = 0.0
+    if previous_used is not None and incoming_used is not None:
+        upstream_delta = max(0.0, float(incoming_used) - float(previous_used))
+    # Charges after the previous anchor may already be included in the new
+    # upstream ``used`` counter.  Subtract only the weighted remainder.
+    anchor = previous.get("credits_anchor_at") or previous.get(
+        "credits_reconciled_at"
+    )
+    try:
+        anchor_at = float(anchor or 0)
+    except (TypeError, ValueError):
+        anchor_at = 0.0
+    weighted, raw, confidence, count, latest = _settled_credit_overlay(
+        account_id, anchor_at
+    )
+    unmatched = max(0.0, float(weighted) - upstream_delta)
+    official_remaining = _number_value(parsed.get("remaining"))
+    if official_remaining is None:
+        effective = parsed.get("remaining")
+    else:
+        effective = _credit_round(max(0.0, float(official_remaining) - unmatched))
+    state = {
+        "local_debit": _credit_round(unmatched) or 0.0,
+        "confidence": confidence if count else 1.0,
+        "status": "projected" if unmatched > 0 else "ok",
+        "source": "upstream_weighted" if unmatched > 0 else "upstream",
+        "raw_debit": _credit_round(raw) or 0.0,
+        "upstream_delta": _credit_round(upstream_delta) or 0.0,
+        "latest": latest,
+    }
+    return state, {"effective_remaining": effective}
+
+
 def _begin_credit_snapshot(account_id: str, token: str) -> bool:
     if not account_id or account_id == "default" or not token:
         return False
     with _USAGE_LOCK:
         active = _USAGE_ACTIVE_ACCOUNTS.get(account_id, 0)
+        if active == 0:
+            # A new in-flight batch starts a fresh attribution window.  Do
+            # not let a previous test/request's terminal total become the
+            # baseline for this batch.
+            _USAGE_LAST_CREDIT_TOTALS.pop(account_id, None)
         if active:
             _USAGE_UNSAFE_ACCOUNTS.add(account_id)
         _USAGE_ACTIVE_ACCOUNTS[account_id] = active + 1
@@ -5592,21 +6342,130 @@ def _begin_credit_snapshot(account_id: str, token: str) -> bool:
         return active == 0
 
 
-def _end_credit_snapshot(account_id: str) -> None:
+def _end_credit_snapshot(account_id: str) -> bool:
+    """Release one live snapshot and return whether it was the last owner."""
+
     if not account_id:
-        return
+        return False
     with _USAGE_LOCK:
         active = _USAGE_ACTIVE_ACCOUNTS.get(account_id, 0)
         if active <= 1:
             _USAGE_ACTIVE_ACCOUNTS.pop(account_id, None)
             _USAGE_UNSAFE_ACCOUNTS.discard(account_id)
+            # The shared before task is no longer useful once every request
+            # in the batch has settled.  Remove only the map entry here; the
+            # caller decides whether it is safe to cancel the task.
+            for key in tuple(_USAGE_ACCOUNT_BEFORE_TASKS):
+                if key[1] == account_id:
+                    _USAGE_ACCOUNT_BEFORE_TASKS.pop(key, None)
+            for key in tuple(_USAGE_CREDIT_SETTLE_GATES):
+                if key[1] == account_id:
+                    _USAGE_CREDIT_SETTLE_GATES.pop(key, None)
+            return True
         else:
             _USAGE_ACTIVE_ACCOUNTS[account_id] = active - 1
+            return False
 
 
 def _credit_snapshot_is_safe(account_id: str) -> bool:
     with _USAGE_LOCK:
         return account_id not in _USAGE_UNSAFE_ACCOUNTS
+
+
+def _shared_credit_before_task(account_id: str, token: str) -> asyncio.Task | None:
+    """Return one before-snapshot task shared by concurrent requests."""
+
+    if not account_id or account_id == "default" or not token:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (id(loop), account_id)
+    with _USAGE_LOCK:
+        existing = _USAGE_ACCOUNT_BEFORE_TASKS.get(key)
+        if existing is not None:
+            return existing
+        task = _spawn_usage_task(
+            _fetch_used_credits(token),
+            _USAGE_SNAPSHOT_TASKS,
+        )
+        if task is not None:
+            _USAGE_ACCOUNT_BEFORE_TASKS[key] = task
+        return task
+
+
+def _credit_settle_gate(account_id: str) -> asyncio.Lock | None:
+    """Get a loop-local gate for account after-snapshot attribution."""
+
+    if not account_id or account_id == "default":
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (id(loop), account_id)
+    with _USAGE_LOCK:
+        gate = _USAGE_CREDIT_SETTLE_GATES.get(key)
+        if gate is None:
+            gate = asyncio.Lock()
+            _USAGE_CREDIT_SETTLE_GATES[key] = gate
+        return gate
+
+
+def _credit_delta_from_total(
+    account_id: str,
+    before: int | float | None,
+    after: int | float | None,
+) -> tuple[float, float] | None:
+    """Attribute one monotonic account-total increment.
+
+    The first request in a concurrent batch uses its before snapshot. Later
+    requests use the last observed after total as their baseline, preventing
+    the same upstream increment from being counted twice.
+    """
+
+    before_value = _number_value(before)
+    after_value = _number_value(after)
+    if after_value is None:
+        return None
+    with _USAGE_LOCK:
+        previous = _number_value(_USAGE_LAST_CREDIT_TOTALS.get(account_id))
+        candidates = [value for value in (before_value, previous) if value is not None]
+        if not candidates:
+            return None
+        baseline = max(candidates)
+        if after_value < baseline:
+            return None
+        _USAGE_LAST_CREDIT_TOTALS[account_id] = max(
+            after_value,
+            previous if previous is not None else after_value,
+        )
+    return _credit_round(after_value - baseline), _credit_round(baseline)
+
+
+def _usage_pending_max_age_seconds() -> float:
+    try:
+        # Commercial usage can lag the model stream by several polling
+        # intervals, especially when two requests finish on the same account.
+        # Keep a row recoverable long enough for a periodic reconciliation to
+        # observe the eventual bill instead of freezing it after one miss.
+        value = float(os.environ.get("TRAE_USAGE_PENDING_MAX_AGE_SECONDS", "300"))
+    except (TypeError, ValueError):
+        value = 300.0
+    return max(1.0, min(value, 86_400.0))
+
+
+def _usage_enrichment_interval_seconds() -> float:
+    """Return the cadence for retrying unresolved usage rows."""
+
+    try:
+        value = float(
+            os.environ.get("TRAE_USAGE_ENRICH_INTERVAL_SECONDS", "5") or "5"
+        )
+    except (TypeError, ValueError):
+        value = 5.0
+    return max(1.0, min(value, 60.0))
 
 
 def _usage_account_token(account_id: str) -> str:
@@ -5703,15 +6562,54 @@ def _schedule_pending_usage_enrichment() -> int:
             # enrichment coroutine's own cleanup.
             _USAGE_PENDING_TASK_IDS.discard(request_id)
 
-    scheduled = 0
+    now = time.time()
+    stale_request_ids: list[str] = []
+    unrecoverable_request_ids: list[str] = []
     with _USAGE_LOCK:
-        pending = [
-            dict(record)
-            for record in _USAGE_HISTORY
-            if _number_value(record.get("credits_consumed")) is None
-            and record.get("usage_turn_id")
-            and record.get("request_id")
-        ]
+        pending = []
+        for record in _USAGE_HISTORY:
+            request_id = str(record.get("request_id") or "")
+            # A live request may already have a settlement task. Do not mark
+            # that row unavailable from the periodic restart/reconciliation
+            # scan while the in-process lookup is still running.
+            if request_id and request_id in _USAGE_PENDING_TASK_IDS:
+                continue
+            source = str(record.get("credits_source") or "").lower()
+            if (
+                _number_value(record.get("credits_consumed")) is not None
+                # ``pending`` is the normal post-stream state.  Keep
+                # ``unknown`` rows eligible too because older adapters may
+                # have written a terminal row before the usage turn id was
+                # discovered by the SSE parser.
+                or source not in {"", "unknown", "pending"}
+                or not record.get("request_id")
+            ):
+                continue
+            age = max(0.0, now - float(record.get("timestamp") or now))
+            if age > _usage_pending_max_age_seconds():
+                stale_request_ids.append(str(record.get("request_id") or ""))
+                continue
+            # A restart cannot reconstruct a missing before-snapshot.  Turn
+            # usage ids are recoverable from the commercial endpoint; rows
+            # without one are only safe to enrich while the live request is
+            # still in this process.
+            if record.get("usage_turn_id"):
+                pending.append(dict(record))
+            else:
+                unrecoverable_request_ids.append(str(record.get("request_id") or ""))
+    for request_id in stale_request_ids:
+        _update_usage_record(
+            request_id,
+            credits_source="unavailable",
+            credits_resolution="expired",
+        )
+    for request_id in unrecoverable_request_ids:
+        _update_usage_record(
+            request_id,
+            credits_source="unavailable",
+            credits_resolution="no_usage_turn",
+        )
+    scheduled = 0
     concurrency_limit = _usage_enrich_concurrency()
     semaphore = asyncio.Semaphore(concurrency_limit)
     for record in pending:
@@ -5721,6 +6619,11 @@ def _schedule_pending_usage_enrichment() -> int:
         account_id = str(record.get("account_id") or "")
         token = _usage_account_token(account_id)
         if not token:
+            _update_usage_record(
+                request_id,
+                credits_source="unavailable",
+                credits_resolution="account_token_missing",
+            )
             continue
         _USAGE_PENDING_TASK_IDS.add(request_id)
         _spawn_usage_task(enrich_pending(record, token, semaphore))
@@ -5759,6 +6662,10 @@ async def _cancel_usage_tasks() -> None:
     tasks = set(_USAGE_ENRICH_TASKS) | set(_USAGE_SNAPSHOT_TASKS)
     if not tasks:
         _USAGE_PENDING_TASK_IDS.clear()
+        with _USAGE_LOCK:
+            _USAGE_ACCOUNT_BEFORE_TASKS.clear()
+            _USAGE_CREDIT_SETTLE_GATES.clear()
+            _USAGE_LAST_CREDIT_TOTALS.clear()
         return
     for task in tasks:
         if not task.done():
@@ -5767,6 +6674,10 @@ async def _cancel_usage_tasks() -> None:
     _USAGE_ENRICH_TASKS.difference_update(tasks)
     _USAGE_SNAPSHOT_TASKS.difference_update(tasks)
     _USAGE_PENDING_TASK_IDS.clear()
+    with _USAGE_LOCK:
+        _USAGE_ACCOUNT_BEFORE_TASKS.clear()
+        _USAGE_CREDIT_SETTLE_GATES.clear()
+        _USAGE_LAST_CREDIT_TOTALS.clear()
 
 
 def _usage_credit_retry_delays() -> tuple[float, ...]:
@@ -5799,6 +6710,7 @@ async def _enrich_usage_credits(
     usage_turn_id: str = "",
     credit_safe: bool = True,
     release_snapshot: bool = True,
+    allow_shared_snapshot: bool = False,
 ) -> None:
     if request_id:
         _USAGE_PENDING_TASK_IDS.add(request_id)
@@ -5823,11 +6735,6 @@ async def _enrich_usage_credits(
                     # Zero is a valid settled charge. Only None means that
                     # the commercial endpoint has not produced a bill yet.
                     if credits is not None and credits >= 0:
-                        await _cancel_usage_task(
-                            before_task,
-                            _USAGE_SNAPSHOT_TASKS,
-                        )
-                        before_task = None
                         _update_usage_record(
                             request_id,
                             credits_consumed=_credit_round(credits),
@@ -5846,7 +6753,53 @@ async def _enrich_usage_credits(
                         attempt + 1,
                         exc,
                     )
-        if not credit_safe or not _credit_snapshot_is_safe(account_id):
+            # A real upstream turn id is preferred.  For a live request that
+            # also owns a before snapshot, however, the account-total delta is
+            # a useful bounded fallback when the commercial turn endpoint is
+            # temporarily unavailable.  This prevents every other concurrent
+            # request from remaining in "settling" forever.  Restart-resumed
+            # rows have no before snapshot and must remain pending so they are
+            # never charged from an unrelated account delta.
+            if request_id and usage_turn_id and (
+                not credit_safe or before_task is None
+            ):
+                _update_usage_record(
+                    request_id,
+                    credits_source="pending",
+                    credits_resolution="session_usage_pending",
+                )
+                return
+        if (
+            (not credit_safe and not allow_shared_snapshot)
+            or not account_id
+            or account_id == "default"
+        ):
+            if request_id:
+                _update_usage_record(
+                    request_id,
+                    credits_source=(
+                        "pending"
+                        if usage_turn_id
+                        else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "concurrent_pending"
+                        if usage_turn_id
+                        else "concurrent_or_unbound"
+                    ),
+                )
+            return
+        # Snapshot deltas are only safe for a single in-flight account turn.
+        # ``allow_shared_snapshot`` is retained for compatibility with older
+        # callers, but it must not opt concurrent requests into false
+        # per-turn attribution.
+        if not credit_safe and not allow_shared_snapshot:
+            if request_id:
+                _update_usage_record(
+                    request_id,
+                    credits_source="unavailable",
+                    credits_resolution="concurrent_snapshot_unattributable",
+                )
             return
         before = None
         if before_task is not None:
@@ -5854,22 +6807,83 @@ async def _enrich_usage_credits(
                 before = await before_task
             except Exception:
                 before = None
-        after = await _fetch_used_credits(token)
-        if before is None or after is None or after < before:
+        if before is None:
+            if request_id:
+                _update_usage_record(
+                    request_id,
+                    # Keep a bound turn recoverable.  The account entitlement
+                    # endpoint can transiently return no data while the
+                    # commercial bill is being committed; the background
+                    # reconciler will retry this row.
+                    credits_source=(
+                        "pending" if usage_turn_id else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "before_snapshot_pending"
+                        if usage_turn_id
+                        else "before_snapshot_unavailable"
+                    ),
+                )
             return
-        _update_usage_record(
-            request_id,
-            credits_consumed=_credit_round(after - before),
-            credits_source="snapshot_delta",
-            credits_before=_credit_round(before),
-            credits_after=_credit_round(after),
-        )
+        gate = _credit_settle_gate(account_id)
+        if gate is None:
+            after = await _fetch_used_credits(token)
+            delta = _credit_delta_from_total(account_id, before, after)
+            if delta is None:
+                _update_usage_record(
+                    request_id,
+                    credits_source=(
+                        "pending" if usage_turn_id else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "after_snapshot_pending"
+                        if usage_turn_id
+                        else "after_snapshot_unavailable"
+                    ),
+                )
+                return
+            credits, baseline = delta
+            _update_usage_record(
+                request_id,
+                credits_consumed=credits,
+                credits_source="snapshot_delta",
+                credits_before=baseline,
+                credits_after=_credit_round(after),
+            )
+            return
+        async with gate:
+            after = await _fetch_used_credits(token)
+            delta = _credit_delta_from_total(account_id, before, after)
+            if delta is None:
+                _update_usage_record(
+                    request_id,
+                    credits_source=(
+                        "pending" if usage_turn_id else "unavailable"
+                    ),
+                    credits_resolution=(
+                        "after_snapshot_pending"
+                        if usage_turn_id
+                        else "after_snapshot_unavailable"
+                    ),
+                )
+                return
+            credits, baseline = delta
+            _update_usage_record(
+                request_id,
+                credits_consumed=credits,
+                credits_source="snapshot_delta",
+                credits_before=baseline,
+                credits_after=_credit_round(after),
+            )
     finally:
         if request_id:
             _USAGE_PENDING_TASK_IDS.discard(request_id)
-        await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
         if release_snapshot:
-            _end_credit_snapshot(account_id)
+            last_owner = _end_credit_snapshot(account_id)
+            # A shared before snapshot must survive until the last request in
+            # this account batch has finished its enrichment.
+            if last_owner:
+                await _cancel_usage_task(before_task, _USAGE_SNAPSHOT_TASKS)
 
 
 class _UsageTracker:
@@ -5934,6 +6948,8 @@ class _UsageTracker:
         # ``tools`` catalog means the caller offered tools; it does not mean
         # that this response actually returned a tool call.
         self.tools_requested = _tools_requested_from_options(options)
+        self.thinking = _normalize_usage_thinking(options.get("thinking"))
+        self.tool_choice = options.get("tool_choice")
         self.tool_used: bool | None = None
         self.tool_calls_returned: bool | None = None
         self.queue_position: int | None = None
@@ -5945,13 +6961,17 @@ class _UsageTracker:
         )
         self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
         self._before_task = (
-            _spawn_usage_task(
-                _fetch_used_credits(self.token),
-                _USAGE_SNAPSHOT_TASKS,
-            )
+            _shared_credit_before_task(self.account_id, self.token)
             if self._credit_safe
             else None
         )
+        # Concurrent requests join the first request's before snapshot.  The
+        # old unsafe request path had no before value at all and consequently
+        # produced a permanently missing credit row.
+        if self._before_task is None and self._credit_snapshot_started:
+            self._before_task = _shared_credit_before_task(
+                self.account_id, self.token
+            )
 
     def update(self, usage: Any) -> None:
         self.saw_usage = True
@@ -6035,10 +7055,12 @@ class _UsageTracker:
             return
 
         old_account = self.account_id
-        await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+        old_before_task = self._before_task
         self._before_task = None
         if self._credit_snapshot_started:
-            _end_credit_snapshot(old_account)
+            last_owner = _end_credit_snapshot(old_account)
+            if last_owner:
+                await _cancel_usage_task(old_before_task, _USAGE_SNAPSHOT_TASKS)
 
         self.account_id = account_id or self.account_id
         self.billing_id = billing_id or self.account_id
@@ -6048,10 +7070,9 @@ class _UsageTracker:
             self.account_id and self.account_id != "default" and self.token
         )
         self._credit_safe = _begin_credit_snapshot(self.account_id, self.token)
-        if self._credit_safe:
-            self._before_task = _spawn_usage_task(
-                _fetch_used_credits(self.token),
-                _USAGE_SNAPSHOT_TASKS,
+        if self._credit_snapshot_started:
+            self._before_task = _shared_credit_before_task(
+                self.account_id, self.token
             )
 
     async def finish(self, status: str | None = None) -> None:
@@ -6069,6 +7090,23 @@ class _UsageTracker:
             trace.get("reasoning_effort_applied")
             or self.options.get("_reasoning_effort_applied")
         )
+        product = _normalize_usage_product(
+            trace.get("product")
+            or self.options.get("product")
+            or self.options.get("provider_product")
+            or (
+                "traework"
+                if self.options.get("_traework_custom_model")
+                or str(self.options.get("_trae_mode") or "").lower() == "work"
+                else None
+            )
+        )
+        requested_endpoint = (
+            trace.get("requested_endpoint") or trace.get("requested_mode")
+        )
+        actual_endpoint = trace.get("actual_endpoint") or trace.get("actual_mode")
+        requested_mode = trace.get("requested_mode")
+        actual_mode = trace.get("actual_mode")
         (
             context_requested,
             context_actual,
@@ -6094,11 +7132,20 @@ class _UsageTracker:
             self.tool_used = self.tool_calls_returned
         context_mode = self.context_mode_actual
         explicit_credits = values.get("credits_consumed")
+        # A failed/cancelled request with no usage frame has no evidence of a
+        # billable upstream turn.  Do not render it as "settling" forever.
+        no_billable_activity = (
+            final_status in {"error", "cancelled"}
+            and not self.saw_usage
+            and not self.usage_turn_id
+        )
         credits_source = (
             "upstream"
             if explicit_credits is not None
+            else "unavailable"
+            if no_billable_activity
             else "pending"
-            if self.usage_turn_id or self._credit_safe
+            if self.usage_turn_id or self._credit_snapshot_started
             else "unknown"
         )
         _record_usage(
@@ -6111,6 +7158,11 @@ class _UsageTracker:
             usage_turn_id=self.usage_turn_id or None,
             request_id=self.request_id,
             endpoint=self.endpoint,
+            product=product,
+            requested_endpoint=requested_endpoint,
+            actual_endpoint=actual_endpoint,
+            requested_mode=requested_mode,
+            actual_mode=actual_mode,
             stream=self.stream,
             status=final_status,
             duration_ms=round((time.perf_counter() - self.started) * 1000, 1),
@@ -6123,6 +7175,8 @@ class _UsageTracker:
                 if applied_effort not in (None, "")
                 else None
             ),
+            thinking=self.thinking,
+            tool_choice=self.tool_choice,
             context_mode_requested=self.context_mode_requested,
             context_mode=context_mode,
             context_mode_actual=self.context_mode_actual,
@@ -6139,12 +7193,20 @@ class _UsageTracker:
         )
         if explicit_credits is not None:
             try:
-                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+                last_owner = (
+                    _end_credit_snapshot(self.account_id)
+                    if self._credit_snapshot_started
+                    else False
+                )
+                if last_owner:
+                    await _cancel_usage_task(
+                        self._before_task, _USAGE_SNAPSHOT_TASKS
+                    )
             finally:
                 self._before_task = None
-                if self._credit_snapshot_started:
-                    _end_credit_snapshot(self.account_id)
-        elif self.usage_turn_id or self._credit_safe:
+        elif not no_billable_activity and (
+            self.usage_turn_id or self._credit_snapshot_started
+        ):
             _spawn_usage_task(
                 _enrich_usage_credits(
                     self.request_id,
@@ -6154,17 +7216,28 @@ class _UsageTracker:
                     usage_turn_id=self.usage_turn_id,
                     credit_safe=self._credit_safe,
                     release_snapshot=self._credit_snapshot_started,
+                    allow_shared_snapshot=True,
                 )
             )
         else:
             try:
-                await _cancel_usage_task(self._before_task, _USAGE_SNAPSHOT_TASKS)
+                last_owner = (
+                    _end_credit_snapshot(self.account_id)
+                    if self._credit_snapshot_started
+                    else False
+                )
+                if last_owner:
+                    await _cancel_usage_task(
+                        self._before_task, _USAGE_SNAPSHOT_TASKS
+                    )
             finally:
                 self._before_task = None
-                if self._credit_snapshot_started:
-                    _end_credit_snapshot(self.account_id)
 
     async def begin(self) -> None:
+        if self._credit_snapshot_started and self._before_task is None:
+            self._before_task = _shared_credit_before_task(
+                self.account_id, self.token
+            )
         if self._before_task is not None:
             # Let the before-snapshot request start without delaying the first
             # model frame on the result of a separate billing endpoint.
@@ -6318,6 +7391,18 @@ def _raw_history_limit_int(
         return default
 
 
+class RemoteQueryTooLarge(ValueError):
+    """The compacted query still cannot fit Trae Remote's hard input cap."""
+
+    def __init__(self, query_chars: int, limit: int):
+        self.query_chars = max(0, int(query_chars))
+        self.limit = max(0, int(limit))
+        super().__init__(
+            "Trae remote query exceeds the configured input limit "
+            f"({self.query_chars} > {self.limit} characters after compaction)"
+        )
+
+
 def _bounded_remote_query(
     messages: list[Mapping[str, Any]],
     options: Mapping[str, Any],
@@ -6350,7 +7435,7 @@ def _bounded_remote_query(
             if str(message.get("role") or "user") not in {"system", "developer"}
         ]
         if len(non_system) <= 1:
-            return bounded, removed
+            break
         head = non_system[0]
         drop = {head}
         head_message = bounded[head]
@@ -6363,6 +7448,138 @@ def _bounded_remote_query(
                     drop.add(head + 1)
         bounded = [m for index, m in enumerate(bounded) if index not in drop]
         removed += len(drop)
+
+    # The loop above can only remove complete turns.  A request containing one
+    # enormous user/tool-result message has no removable non-system turn, so
+    # the old implementation returned the oversized query unchanged.  Trae
+    # accepts the create-session request but then closes the events stream
+    # before the first model event; callers consequently rotate through every
+    # account and end with a burst of 502 responses.  Clamp message content as
+    # a final step so a single large turn cannot bypass the upstream limit.
+    bounded = _fit_remote_query_contents(bounded, raw_limit)
+    final_query_chars = len(trae_client.flatten_query(bounded))
+    if final_query_chars > raw_limit:
+        # Never send a request that the provider is known to accept only
+        # partially. A non-text tool payload or an intentionally tiny custom
+        # limit can leave fixed JSON/tool metadata larger than the budget even
+        # after text truncation. Failing before ``create_session`` keeps this
+        # deterministic client error from being replayed on every account.
+        raise RemoteQueryTooLarge(final_query_chars, raw_limit)
+    return bounded, removed
+
+
+_REMOTE_QUERY_TRUNCATION_MARKER = (
+    "\n\n[relay: older context omitted to fit the Trae remote query limit]\n\n"
+)
+
+
+def _truncate_remote_text(text: str, limit: int) -> str:
+    """Keep the useful head and tail of one message within ``limit`` chars."""
+
+    value = str(text or "")
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    if limit <= len(_REMOTE_QUERY_TRUNCATION_MARKER):
+        return value[:limit]
+    available = limit - len(_REMOTE_QUERY_TRUNCATION_MARKER)
+    head = max(1, int(available * 0.65))
+    tail = max(0, available - head)
+    if not tail:
+        return value[:head] + _REMOTE_QUERY_TRUNCATION_MARKER
+    return (
+        value[:head]
+        + _REMOTE_QUERY_TRUNCATION_MARKER
+        + value[-tail:]
+    )
+
+
+def _remote_message_text(message: Mapping[str, Any]) -> str:
+    """Return the text that ``flatten_query`` contributes for one message."""
+
+    content = message.get("content")
+    if content in (None, "", []) and not message.get("tool_calls"):
+        for key in ("parts", "text", "prompt", "message", "input"):
+            candidate = message.get(key)
+            if candidate not in (None, "", [], {}):
+                content = candidate
+                break
+    return raw_client._content_to_text(content)
+
+
+def _truncate_remote_message(
+    message: Mapping[str, Any],
+    content_limit: int,
+) -> dict[str, Any]:
+    """Copy one message while bounding its text contribution.
+
+    Structured content is converted to text only when it must be truncated.
+    Tool call metadata remains on the message so the caller-owned tool history
+    is still represented in the compacted prompt.
+    """
+
+    updated = dict(message)
+    text = _remote_message_text(message)
+    updated["content"] = _truncate_remote_text(text, content_limit)
+    for key in ("parts", "text", "prompt", "message", "input"):
+        if key in updated and key != "content":
+            updated.pop(key, None)
+    return updated
+
+
+def _fit_remote_query_contents(
+    messages: list[dict[str, Any]],
+    raw_limit: int,
+) -> list[dict[str, Any]]:
+    """Trim oversized individual messages until the flattened query fits."""
+
+    if raw_limit <= 0:
+        return messages
+    bounded = [dict(message) for message in messages]
+    while len(trae_client.flatten_query(bounded)) > raw_limit:
+        before_query_chars = len(trae_client.flatten_query(bounded))
+        candidates = sorted(
+            (
+                (index, len(_remote_message_text(message)))
+                for index, message in enumerate(bounded)
+                if _remote_message_text(message)
+            ),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if not candidates:
+            break
+        index, text_length = candidates[0]
+        current = bounded[index]
+        low, high = 0, text_length
+        best: Optional[dict[str, Any]] = None
+        # Find the largest prefix/suffix slice that makes the whole query fit.
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = _truncate_remote_message(current, middle)
+            probe = list(bounded)
+            probe[index] = candidate
+            if len(trae_client.flatten_query(probe)) <= raw_limit:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best is None:
+            # Keep a small marker rather than returning an invalid oversized
+            # request when fixed JSON framing consumes the entire budget.
+            best = _truncate_remote_message(
+                current,
+                max(1, min(text_length, len(_REMOTE_QUERY_TRUNCATION_MARKER))),
+            )
+        bounded[index] = best
+        if len(trae_client.flatten_query(bounded)) >= before_query_chars:
+            # Avoid spinning forever when a non-text tool payload alone is
+            # larger than the configured budget.  The normal cap leaves ample
+            # room for tool metadata; this is only a defensive escape hatch
+            # for malformed or extremely small custom limits.
+            break
+    return bounded
 
 
 _CONTINUATION_ONLY_RE = re.compile(
@@ -6858,14 +8075,13 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     if not token:
         raise RuntimeError("No Cloud-IDE-JWT token available")
     remote_options = dict(options)
-    # Caller-owned tools must run in the API client's workspace.  Agent owns a
-    # separate remote workspace and can consume file/shell work internally,
-    # then return only a success sentence; Work keeps the advertised tools as
-    # calls for Codex/the API client to execute.  Plain text requests remain
-    # Agent-first (including the 1M/max profile), and operators can explicitly
-    # opt tool requests back into Agent with ``...USE_WORK=0`` for diagnostics.
+    # Agent is the default executor for every remote request, including turns
+    # that advertise caller-owned tools.  This matches the desktop Agent
+    # contract and is required for the Agent-tier model binding/1M profile.
+    # Operators that need local-workspace tool execution can explicitly opt
+    # those turns into Work with ``TRAE_REMOTE_CALLER_TOOLS_USE_WORK=1``.
     caller_tools_use_work = (
-        os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "1").strip().lower()
+        os.environ.get("TRAE_REMOTE_CALLER_TOOLS_USE_WORK", "0").strip().lower()
         in {"1", "true", "yes", "on"}
     )
     if (
@@ -6961,6 +8177,51 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         fallback["_session_variant"] = "work-fallback"
         return fallback
 
+    def mark_work_fallback_trace() -> None:
+        """Expose an Agent -> Work fallback as the actual billed product."""
+
+        trace = options.get("_upstream_trace")
+        if isinstance(trace, dict):
+            trace.update(
+                actual_mode="work",
+                actual_endpoint="work",
+                product="traework",
+                fallback_used=True,
+                fallback_target="work",
+            )
+
+    def agent_create_may_fallback(error: BaseException) -> bool:
+        """Only replay transient Agent setup failures through Work.
+
+        A deterministic account/config/auth error cannot be repaired by
+        sending the same model to another executor. Replaying those errors
+        creates a second request, obscures the real diagnosis, and can charge
+        the wrong product.
+        """
+
+        text = str(error or "").lower()
+        if any(
+            marker in text
+            for marker in (
+                "model binding mismatch",
+                "model is not available",
+                "failed to get app config",
+                "app config",
+                "record not found",
+                "unauthorized",
+                "authentication",
+                "invalid token",
+                "no cloud-ide-jwt",
+                "http 400",
+                "http 401",
+                "http 403",
+                "http 404",
+                "http 422",
+            )
+        ):
+            return False
+        return True
+
     # Inject caller-owned tool definitions as a system prompt so the
     # remote upstream sees the available tools even though its transport
     # only accepts text messages.
@@ -6994,9 +8255,11 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     prepared_messages, omitted_history = raw_client._compact_raw_history(
         prepared_messages, compact_options
     )
+    query_chars_before_bound = len(trae_client.flatten_query(prepared_messages))
     prepared_messages, query_trimmed = _bounded_remote_query(
         prepared_messages, compact_options
     )
+    query_chars_after_bound = len(trae_client.flatten_query(prepared_messages))
     if omitted_history:
         logger.info(
             "remote history compacted input_messages=%d output_messages=%d omitted=%d",
@@ -7010,7 +8273,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             original_message_count,
             len(prepared_messages),
             query_trimmed,
-            len(trae_client.flatten_query(prepared_messages)),
+            query_chars_after_bound,
+        )
+    elif query_chars_after_bound < query_chars_before_bound:
+        logger.warning(
+            "remote query content trimmed for upstream size "
+            "input_query_chars=%d output_query_chars=%d",
+            query_chars_before_bound,
+            query_chars_after_bound,
         )
     await trae_client.acquire_web_slot(
         account_id,
@@ -7019,12 +8289,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     try:
         client = httpx.AsyncClient(timeout=None)
         logger.info(
-            "remote create start id=%s account=%s model=%s messages=%d last_chars=%d",
+            "remote create start id=%s account=%s model=%s messages=%d "
+            "input_last_chars=%d query_chars=%d",
             str(options.get("_relay_request_id") or ""),
             account_id,
             model,
             len(messages),
             len(str(messages[-1].get("content") or "")) if messages else 0,
+            query_chars_after_bound,
         )
         try:
             session_id, message_id = await trae_remote_client.create_session(
@@ -7035,7 +8307,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                 options=remote_options,
             )
         except Exception as create_exc:
-            if not can_work_fallback:
+            if not can_work_fallback or not agent_create_may_fallback(create_exc):
                 raise
             logger.warning(
                 "remote Agent create failed; falling back to Work id=%s model=%s error=%s",
@@ -7051,6 +8323,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             client = httpx.AsyncClient(timeout=None)
             remote_options = work_fallback_options(remote_options)
             work_fallback_used = True
+            mark_work_fallback_trace()
             session_id, message_id = await trae_remote_client.create_session(
                 client,
                 token,
@@ -7186,6 +8459,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             ):
                                 retry_options = work_fallback_options(retry_options)
                                 work_fallback_used = True
+                                mark_work_fallback_trace()
                             retry_token = token
                             # A 4008 is account-scoped. Never retry it through
                             # the same account's Work executor; rotate to a
@@ -7363,6 +8637,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             except Exception:
                 pass
             remote_options = work_fallback_options(remote_options)
+            mark_work_fallback_trace()
             session_id, message_id = await trae_remote_client.create_session(
                 client,
                 token,
@@ -7402,59 +8677,209 @@ def _effort_note(effort: str, trace: Mapping[str, Any]) -> Optional[str]:
         return None
     mode = str(trace.get("actual_mode") or trace.get("actual_endpoint") or "")
     if mode in {"ide", "solo"}:
-        # This utility-route adapter has no verified strength mapping. Do not
-        # mistake that implementation limit for a provider capability claim.
-        return "当前 IDE/SOLO llm_utils_chat 封装未转发强度字段；可使用 Remote Agent"
+        # TraeCode's raw endpoint carries model selection in CustomModel.  The
+        # relay keeps the caller's requested level in usage metadata even
+        # when a particular native config does not expose a writable effort
+        # field, so the diagnostic must name the actual protocol.
+        return "当前 TraeCode IDE/SOLO raw 配置未声明可写思考档位"
     if mode == "raw":
         return "raw 端点需要企业 PAT"
     return "该模型未声明 reasoning_effort_config"
 
 
 async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = None):
-    """trae2api 风格 IDE chat，流式响应消费完成后关闭 response 和 client。"""
+    """Run the IDE/SOLO protocol with a bounded raw -> legacy fallback.
+
+    TraeCode raw v2 is the preferred protocol because it preserves the
+    desktop model binding. Personal CN accounts, however, can reject a valid
+    catalog model with ``4001 param invalid`` or close an empty stream before
+    the first model event. The same account is accepted by the legacy
+    ``/api/agent/v3/llm_utils_chat`` adapter. Try raw first, then reopen the
+    legacy request only when raw failed before any model output. This keeps
+    existing raw replay tests valid while making the public IDE/SOLO presets
+    usable on accounts that do not have the raw app-config record.
+    """
+
+    options = dict(options or {})
     translation_options = _tool_translation_options(options, messages)
+    raw_requested = bool(options.get("_traecode_raw_chat_function"))
+    legacy_fallback_allowed = not bool(
+        options.get("_disable_upstream_fallback")
+        or options.get("_disable_traecode_legacy_fallback")
+    )
     upstream_metadata: dict[str, Any] = {}
-    ide_resp = await trae_client.send_chat_request(messages, model, stream, options=options)
-    response = ide_resp.response
-    close_response = _chat_response_closer(ide_resp, upstream_metadata)
+
+    def _legacy_options() -> dict:
+        legacy = dict(options)
+        legacy.pop("_traecode_raw_chat_function", None)
+        legacy.pop("_traecode_solo", None)
+        legacy["_ide_endpoint"] = str(
+            legacy.get("_legacy_ide_endpoint")
+            or legacy.get("_ide_endpoint")
+            or "/api/agent/v3/llm_utils_chat"
+        )
+        return legacy
+
+    def _mark_raw_fallback(error: BaseException) -> None:
+        trace = options.get("_upstream_trace")
+        if not isinstance(trace, dict):
+            return
+        requested = str(
+            trace.get("requested_endpoint")
+            or trace.get("requested_mode")
+            or options.get("_upstream_mode")
+            or "ide"
+        )
+        reason = f"{requested}: raw -> legacy llm_utils_chat: {str(error)[:800]}"
+        previous = str(trace.get("fallback_reason") or "").strip()
+        trace.update(
+            fallback_used=True,
+            fallback_target="legacy-ide",
+            fallback_reason="; ".join(
+                part for part in (previous, reason) if part
+            )[:1200],
+            actual_endpoint="/api/agent/v3/llm_utils_chat",
+        )
+
+    async def _open(kind: str):
+        if kind == "raw":
+            code_options = dict(options)
+            function = str(
+                code_options.get("_traecode_raw_chat_function") or "chat_v3"
+            )
+            code_options["_traecode_solo"] = function.startswith("solo_")
+            return await raw_client.send_traecode_chat_request(
+                messages,
+                model,
+                stream=stream,
+                options=code_options,
+            )
+        return await trae_client.send_chat_request(
+            messages,
+            model,
+            stream,
+            options=_legacy_options(),
+        )
+
+    if not raw_requested:
+        raw_kind = "legacy"
+    else:
+        raw_kind = "raw"
+
     if stream:
-        async def gen():
+        current_kind = raw_kind
+        current_wrapper = None
+        current_close = None
+        try:
             try:
-                async for chunk in translate_ide_stream(
-                    response,
-                    model,
-                    FORWARD_USAGE,
-                    fail_on_empty=True,
-                    upstream_metadata=upstream_metadata,
-                    **translation_options,
-                ):
-                    _bind_usage_turn_from_metadata(upstream_metadata)
-                    _track_usage_from_chunk(chunk, model)
-                    yield chunk
-            finally:
-                await close_response()
+                current_wrapper = await _open(current_kind)
+            except Exception as exc:
+                if current_kind == "raw" and legacy_fallback_allowed:
+                    _mark_raw_fallback(exc)
+                    current_kind = "legacy"
+                    current_wrapper = await _open(current_kind)
+                else:
+                    raise
+            current_close = _chat_response_closer(
+                current_wrapper, upstream_metadata
+            )
+
+            async def close_current():
+                if current_close is not None:
+                    await current_close()
+
+        except BaseException:
+            if current_close is not None:
+                await current_close()
+            raise
+
+        async def gen():
+            nonlocal current_kind, current_wrapper, current_close
+            emitted_model_output = False
+            while True:
+                try:
+                    response = current_wrapper.response
+                    async for chunk in translate_ide_stream(
+                        response,
+                        model,
+                        FORWARD_USAGE,
+                        fail_on_empty=True,
+                        upstream_metadata=upstream_metadata,
+                        **translation_options,
+                    ):
+                        if (
+                            _chunk_text_delta(chunk)
+                            or _chunk_reasoning_delta(chunk)
+                            or _chunk_has_tool_calls(chunk)
+                        ):
+                            emitted_model_output = True
+                        _bind_usage_turn_from_metadata(upstream_metadata)
+                        _track_usage_from_chunk(chunk, model)
+                        yield chunk
+                    await close_current()
+                    return
+                except (asyncio.CancelledError, GeneratorExit):
+                    await close_current()
+                    raise
+                except Exception as exc:
+                    if (
+                        current_kind == "raw"
+                        and legacy_fallback_allowed
+                        and not emitted_model_output
+                    ):
+                        await close_current()
+                        _mark_raw_fallback(exc)
+                        current_kind = "legacy"
+                        current_wrapper = await _open(current_kind)
+                        current_close = _chat_response_closer(
+                            current_wrapper, upstream_metadata
+                        )
+                        continue
+                    await close_current()
+                    raise
+
         try:
             return StreamingResponse(
-                _SessionStreamIterator(gen(), close_response),
+                _SessionStreamIterator(gen(), close_current),
                 media_type="text/event-stream",
                 headers=_sse_headers(),
             )
         except BaseException:
-            await close_response()
+            await close_current()
             raise
-    try:
-        result = await collect_nonstream_ide(
-            response,
-            model,
-            fail_on_empty=True,
-            upstream_metadata=upstream_metadata,
-            **translation_options,
-        )
-        _bind_usage_turn_from_metadata(upstream_metadata)
-        _track_usage_from_result(result, model)
-        return JSONResponse(content=result)
-    finally:
-        await close_response()
+
+    current_kind = raw_kind
+    while True:
+        response_wrapper = None
+        close_response = None
+        try:
+            response_wrapper = await _open(current_kind)
+            response = response_wrapper.response
+            close_response = _chat_response_closer(
+                response_wrapper, upstream_metadata
+            )
+            result = await collect_nonstream_ide(
+                response,
+                model,
+                fail_on_empty=True,
+                upstream_metadata=upstream_metadata,
+                **translation_options,
+            )
+            _bind_usage_turn_from_metadata(upstream_metadata)
+            _track_usage_from_result(result, model)
+            return JSONResponse(content=result)
+        except Exception as exc:
+            if (
+                current_kind == "raw"
+                and legacy_fallback_allowed
+            ):
+                _mark_raw_fallback(exc)
+                current_kind = "legacy"
+                continue
+            raise
+        finally:
+            if close_response is not None:
+                await close_response()
 
 
 async def run_traework_native_chat(
@@ -7898,6 +9323,11 @@ async def _run_remote_with_retry(
             attempted_accounts.add(account_key)
             try:
                 return await run_remote_session(messages, model, stream, options)
+            except RemoteQueryTooLarge:
+                # This is a deterministic request-size failure. Preserve it
+                # for the dispatcher so it can return 413 without replaying
+                # the same payload on another account.
+                raise
             except EmptyUpstreamResponse as exc:
                 if not exc.retryable or attempt_index + 1 >= attempts:
                     raise
@@ -7933,6 +9363,275 @@ async def _run_remote_with_retry(
                 continue
         raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
     return await run_remote_session(messages, model, stream, options)
+
+
+def _is_native_rate_limit_error(error: Any) -> bool:
+    """Return whether a native IDE/SOLO failure is a pre-output rate limit.
+
+    TraeCode reports account-level throttling as business code ``4011`` while
+    some gateway variants expose the same condition as HTTP ``429`` or a
+    human-readable rate-limit message.  Parameter errors such as ``4001`` are
+    deliberately excluded: retrying those with another account cannot repair
+    an invalid request envelope.
+    """
+
+    detail = str(error or "").strip().lower()
+    if not detail:
+        return False
+    if "4001" in detail or "param is invalid" in detail:
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "4011",
+            "429",
+            "rate limit",
+            "rate-limit",
+            "too many requests",
+            "exceeded the rate",
+        )
+    )
+
+
+async def _run_ide_stream_with_retry(
+    messages,
+    model,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Open a native IDE/SOLO stream with pre-output account rotation.
+
+    ``run_ide_chat`` returns a ``StreamingResponse`` before the upstream SSE
+    body is iterated, so its 4011/429 business error is raised after the
+    dispatcher has already returned.  The old retry helper intentionally
+    skipped all streaming requests and consequently left the public stream
+    with a 502/empty response.  Own the body iterator here, retrying only
+    before the first model data frame and preserving cancellation after output.
+    """
+
+    options = dict(options or {})
+    tracker = tracker or _USAGE_TRACKER.get()
+    polling = auth.get_polling_status()
+    if not polling.get("enabled"):
+        return await run_ide_chat(messages, model, True, options)
+
+    attempts = min(2, _polling_retry_limit(options))
+    attempted_accounts: set[str] = set()
+
+    async def rotate_account() -> bool:
+        next_snapshot = _next_retry_account_snapshot(
+            attempted_accounts, attempts
+        )
+        if next_snapshot is None:
+            return False
+        account_id, record = next_snapshot
+        token = str(record.get("token") or "")
+        billing_id = _account_id_from_token(token) or account_id
+        provider_specific = (
+            record.get("provider_specific")
+            or record.get("providerSpecificData")
+            or {}
+        )
+        options["_account_id"] = account_id
+        options["_billing_id"] = billing_id
+        options["_auth_token"] = token
+        options["_auth_user_id"] = billing_id
+        if isinstance(provider_specific, Mapping):
+            options["provider_specific"] = dict(provider_specific)
+        if tracker is not None:
+            await tracker.rebind(options)
+        _rebind_chat_session_account(
+            str(options.get("session_id") or options.get("sessionId") or ""),
+            account_id,
+            billing_id,
+            token,
+            provider_specific,
+        )
+        logger.warning(
+            "native IDE/SOLO stream rate limit, retrying on account=%s",
+            account_id,
+        )
+        return True
+
+    async def close_response(response: Any) -> None:
+        if response is None:
+            return
+        iterator = getattr(response, "body_iterator", None)
+        close_iterator = getattr(iterator, "aclose", None)
+        if close_iterator is not None:
+            try:
+                await close_iterator()
+            except Exception:
+                pass
+        close = getattr(response, "close", None)
+        if close is not None:
+            try:
+                result = close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
+    def has_public_data(chunk: Any) -> bool:
+        if isinstance(chunk, (bytes, bytearray)):
+            text = chunk.decode("utf-8", errors="replace")
+        else:
+            text = str(chunk or "")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.lower().startswith("data:"):
+                continue
+            payload = stripped.split(":", 1)[1].strip()
+            if payload and payload != "[DONE]":
+                return True
+        return False
+
+    def retryable_before_output(exc: Exception, saw_output: bool) -> bool:
+        if saw_output:
+            return False
+        if _is_native_rate_limit_error(exc):
+            return True
+        return (
+            isinstance(exc, EmptyUpstreamResponse)
+            and bool(exc.retryable)
+            and not bool(exc.observed_model_event)
+        )
+
+    async def open_for_attempt(attempt_index: int):
+        account_key = _retry_account_key(options, attempt_index)
+        if account_key in attempted_accounts:
+            raise RuntimeError("native IDE/SOLO account already attempted")
+        attempted_accounts.add(account_key)
+        return await run_ide_chat(messages, model, True, options)
+
+    current = None
+    attempt_index = 0
+    while True:
+        try:
+            current = await open_for_attempt(attempt_index)
+            break
+        except Exception as exc:
+            if (
+                attempt_index + 1 >= attempts
+                or not retryable_before_output(exc, False)
+                or not await rotate_account()
+            ):
+                raise
+            attempt_index += 1
+
+    async def body():
+        nonlocal current, attempt_index
+        try:
+            while True:
+                saw_output = False
+                try:
+                    async for chunk in _response_body_iterator(current):
+                        saw_output = saw_output or has_public_data(chunk)
+                        yield chunk
+                    return
+                except Exception as exc:
+                    if (
+                        attempt_index + 1 >= attempts
+                        or not retryable_before_output(exc, saw_output)
+                    ):
+                        raise
+                    await close_response(current)
+                    if not await rotate_account():
+                        raise
+                    attempt_index += 1
+                    current = await open_for_attempt(attempt_index)
+        finally:
+            await close_response(current)
+
+    async def close_current() -> None:
+        await close_response(current)
+
+    return StreamingResponse(
+        _SessionStreamIterator(body(), close_current),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
+
+
+async def _run_ide_with_retry(
+    messages,
+    model,
+    stream: bool,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Retry a native IDE/SOLO request once on an account rate limit.
+
+    The native endpoint can return a business error before emitting any model
+    event.  In that case the request is safe to replay on another enabled
+    account.  This helper intentionally handles only the request/collection
+    phase; once a streaming response has been handed to the caller, the
+    existing stream cancellation and usage guards remain authoritative.
+    """
+
+    options = dict(options or {})
+    tracker = tracker or _USAGE_TRACKER.get()
+    polling = auth.get_polling_status()
+    if stream:
+        return await _run_ide_stream_with_retry(
+            messages,
+            model,
+            options,
+            tracker=tracker,
+        )
+    if not polling.get("enabled"):
+        return await run_ide_chat(messages, model, stream, options)
+
+    attempts = min(2, _polling_retry_limit(options))
+    attempted_accounts: set[str] = set()
+    for attempt_index in range(max(1, attempts)):
+        account_key = _retry_account_key(options, attempt_index)
+        if account_key in attempted_accounts:
+            break
+        attempted_accounts.add(account_key)
+        try:
+            return await run_ide_chat(messages, model, stream, options)
+        except Exception as exc:
+            if (
+                not _is_native_rate_limit_error(exc)
+                or attempt_index + 1 >= attempts
+            ):
+                raise
+            next_snapshot = _next_retry_account_snapshot(
+                attempted_accounts, attempts
+            )
+            if next_snapshot is None:
+                raise
+            account_id, record = next_snapshot
+            token = str(record.get("token") or "")
+            billing_id = _account_id_from_token(token) or account_id
+            provider_specific = (
+                record.get("provider_specific")
+                or record.get("providerSpecificData")
+                or {}
+            )
+            options["_account_id"] = account_id
+            options["_billing_id"] = billing_id
+            options["_auth_token"] = token
+            options["_auth_user_id"] = billing_id
+            if isinstance(provider_specific, Mapping):
+                options["provider_specific"] = dict(provider_specific)
+            if tracker is not None:
+                await tracker.rebind(options)
+            _rebind_chat_session_account(
+                str(options.get("session_id") or options.get("sessionId") or ""),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+            logger.warning(
+                "native IDE/SOLO rate limit, retrying on account=%s",
+                account_id,
+            )
+    raise RuntimeError("native IDE/SOLO rate-limit retry ended unexpectedly")
 
 
 def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -7980,6 +9679,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         max_applied = _optional_bool(record.get("max_mode_enabled"))
     if max_applied is None:
         max_applied = _optional_bool(record.get("max_mode"))
+    if max_applied is None:
+        max_applied = _optional_bool(record.get("max"))
     if context_mode in (None, "") and max_applied is not None:
         context_mode = "max_1m" if max_applied else "standard"
     if context_mode in (None, "") and actual_context_mode not in (None, ""):
@@ -8000,6 +9701,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         max_mode_requested = _context_mode_bool(requested_context)
     if max_mode_requested is None and "max_mode" in record:
         max_mode_requested = _optional_bool(record.get("max_mode"))
+    if max_mode_requested is None and "max" in record:
+        max_mode_requested = _optional_bool(record.get("max"))
     max_mode_enabled = _optional_bool(
         record.get("max_mode_enabled")
         if "max_mode_enabled" in record
@@ -8023,6 +9726,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
     tool_called = _optional_bool(
         record.get("tool_called") if "tool_called" in record else None
     )
+    if tool_called is None and "tool" in record:
+        tool_called = _optional_bool(record.get("tool"))
     if tool_called is None:
         # ``tool_used`` is the canonical actual-result marker in v1.0.2;
         # ``tool_calls_returned`` is retained for compatibility with rows
@@ -8040,12 +9745,55 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
         or record.get("_usage_turn_id")
         or ""
     ).strip() or None
+    credits_settled_at = _number_value(record.get("credits_settled_at"))
     queue_position = _number_value(record.get("queue_position"))
     auto_continue_rounds = _number_value(record.get("auto_continue_rounds"))
+    trace = record.get("_upstream_trace") or record.get("upstream_trace")
+    trace = trace if isinstance(trace, Mapping) else {}
+    product = _normalize_usage_product(
+        record.get("product")
+        or record.get("provider_product")
+        or record.get("upstream_product")
+        or trace.get("product")
+    )
+    requested_endpoint = (
+        record.get("requested_endpoint")
+        or record.get("requested_mode")
+        or trace.get("requested_endpoint")
+        or trace.get("requested_mode")
+    )
+    actual_endpoint = (
+        record.get("actual_endpoint")
+        or record.get("actual_mode")
+        or trace.get("actual_endpoint")
+        or trace.get("actual_mode")
+    )
+    if product is None:
+        product = _normalize_usage_product(actual_endpoint or requested_endpoint)
+    requested_mode = record.get("requested_mode") or trace.get("requested_mode")
+    actual_mode = record.get("actual_mode") or trace.get("actual_mode")
+    thinking = _normalize_usage_thinking(
+        record.get("thinking")
+        if "thinking" in record
+        else record.get("thinking_config")
+    )
+    tool_choice = record.get("tool_choice")
+    if isinstance(tool_choice, Mapping):
+        # Keep only the public selection name; function schemas belong to the
+        # request payload and are not useful in a billing history row.
+        function = tool_choice.get("function")
+        tool_choice = (
+            function.get("name")
+            if isinstance(function, Mapping) and function.get("name")
+            else tool_choice.get("type") or "specified"
+        )
+    elif tool_choice not in (None, ""):
+        tool_choice = str(tool_choice).strip() or None
     normalized.update(
         {
             "account_id": str(record.get("account_id") or "default"),
             "model": str(record.get("model") or "auto"),
+            "product": product,
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "input_tokens": prompt,
@@ -8074,11 +9822,36 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 record.get("credits_source")
                 or ("upstream" if credits is not None else "unknown")
             ),
+            "credits_settled_at": (
+                credits_settled_at
+                if credits_settled_at is not None
+                else None
+            ),
             # Keep only the opaque upstream turn id needed for delayed billing
             # enrichment. Credentials and token payloads are never persisted.
             "usage_turn_id": usage_turn_id,
             "request_id": str(record.get("request_id") or ""),
             "endpoint": record.get("endpoint") or None,
+            "requested_endpoint": (
+                str(requested_endpoint).strip()
+                if requested_endpoint not in (None, "")
+                else None
+            ),
+            "actual_endpoint": (
+                str(actual_endpoint).strip()
+                if actual_endpoint not in (None, "")
+                else None
+            ),
+            "requested_mode": (
+                str(requested_mode).strip()
+                if requested_mode not in (None, "")
+                else None
+            ),
+            "actual_mode": (
+                str(actual_mode).strip()
+                if actual_mode not in (None, "")
+                else None
+            ),
             "stream": record.get("stream") if "stream" in record else None,
             "status": str(record.get("status") or "completed"),
             "duration_ms": _number_value(record.get("duration_ms")),
@@ -8100,6 +9873,8 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
                 if applied_effort not in (None, "")
                 else None
             ),
+            "thinking": thinking,
+            "tool_choice": tool_choice,
             "context_mode_requested": (
                 str(requested_context).strip()
                 if requested_context not in (None, "")
@@ -8124,6 +9899,7 @@ def _normalize_usage_record(record: Mapping[str, Any]) -> dict[str, Any]:
             # distinction; these aliases represent the actual observed
             # capability when it is known.
             "max_mode": max_mode_enabled,
+            "max": max_mode_enabled,
             "tools_requested": tools_requested,
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
@@ -8361,6 +10137,11 @@ def _record_usage(
     usage_turn_id: str | None = None,
     request_id: str = "",
     endpoint: str | None = None,
+    product: str | None = None,
+    requested_endpoint: str | None = None,
+    actual_endpoint: str | None = None,
+    requested_mode: str | None = None,
+    actual_mode: str | None = None,
     stream: bool | None = None,
     status: str = "completed",
     duration_ms: int | float | None = None,
@@ -8369,6 +10150,7 @@ def _record_usage(
     reasoning_effort: str | None = None,
     requested_reasoning_effort: str | None = None,
     reasoning_effort_applied: str | None = None,
+    thinking: Any = None,
     context_mode_requested: str | None = None,
     context_mode: str | None = None,
     context_mode_actual: str | None = None,
@@ -8377,6 +10159,7 @@ def _record_usage(
     max_mode_requested: bool | None = None,
     max_mode_enabled: bool | None = None,
     tools_requested: bool | None = None,
+    tool_choice: Any = None,
     tool_used: bool | None = None,
     tool_calls_returned: bool | None = None,
     tool_called: bool | None = None,
@@ -8396,9 +10179,15 @@ def _record_usage(
             "tokens_source": tokens_source,
             "credits_consumed": credits_consumed,
             "credits_source": credits_source,
+            "credits_settled_at": time.time() if credits_consumed is not None else None,
             "usage_turn_id": usage_turn_id,
             "request_id": request_id,
             "endpoint": endpoint,
+            "product": product,
+            "requested_endpoint": requested_endpoint,
+            "actual_endpoint": actual_endpoint,
+            "requested_mode": requested_mode,
+            "actual_mode": actual_mode,
             "stream": stream,
             "status": status,
             "duration_ms": duration_ms,
@@ -8406,6 +10195,7 @@ def _record_usage(
             "reasoning_effort": reasoning_effort,
             "requested_reasoning_effort": requested_reasoning_effort,
             "reasoning_effort_applied": reasoning_effort_applied,
+            "thinking": thinking,
             "context_mode_requested": context_mode_requested,
             "context_mode": context_mode,
             "context_mode_actual": context_mode_actual,
@@ -8414,6 +10204,7 @@ def _record_usage(
             "max_mode_requested": max_mode_requested,
             "max_mode_enabled": max_mode_enabled,
             "tools_requested": tools_requested,
+            "tool_choice": tool_choice,
             "tool_used": tool_used,
             "tool_calls_returned": tool_calls_returned,
             "tool_called": tool_called,
@@ -8439,6 +10230,18 @@ def _record_usage(
         if len(_USAGE_HISTORY) > _USAGE_MAX_HISTORY:
             _USAGE_HISTORY = _USAGE_HISTORY[:_USAGE_MAX_HISTORY]
         _save_usage_history_locked()
+    if request_id and credits_consumed is not None:
+        credits = _refresh_credit_projection(str(account_id or ""))
+        projected = _number_value(credits.get("remaining"))
+        if projected is not None:
+            _update_usage_record(
+                request_id,
+                credits_remaining_after=_credit_round(projected),
+                credits_reconcile_status=credits.get("reconcile_status"),
+                credits_reconcile_confidence=credits.get(
+                    "reconcile_confidence"
+                ),
+            )
     return record
 
 
@@ -8470,14 +10273,11 @@ def _remote_fallback_options(
     fallback = dict(options or {})
     fallback["_upstream_mode"] = "remote"
     fallback["_upstream_fallback_from"] = requested_mode
-    # ``work-agent`` is a selectable Work tier, but its fallback must be the
-    # ordinary Remote/Agent tier.  Carrying ``solo_work_remote`` (or
-    # ``_trae_mode=work``) here only changes the log label while issuing a
-    # second Work request, which is why the UI appeared to "fall back to
-    # Remote" without ever leaving Work.  Native TraeWork compatibility modes
-    # retain their historical Work-tier fallback because they are separate
-    # helper transports.
-    if requested_mode == "work-agent":
+    # Work's primary route uses Remote chat_sessions with an explicit Work
+    # executor. Its fallback must clear those bindings and use the ordinary
+    # Agent tier; otherwise a request labelled Remote can still be billed and
+    # executed as Work.
+    if requested_mode in {"work", "work-agent"}:
         fallback.pop("_trae_mode", None)
         fallback.pop("_remote_agent_type", None)
         fallback.pop("remote_agent_type", None)
@@ -8503,20 +10303,60 @@ def _remote_fallback_options(
 def _update_usage_record(request_id: str, **updates: Any) -> None:
     if not request_id:
         return
+    account_id = ""
+    should_refresh_projection = False
+    normalized_record: dict[str, Any] | None = None
     with _USAGE_LOCK:
         for index, existing in enumerate(_USAGE_HISTORY):
             if existing.get("request_id") != request_id:
                 continue
             merged = dict(existing)
             merged.update(updates)
+            if (
+                "credits_consumed" in updates
+                and _number_value(updates.get("credits_consumed")) is not None
+            ):
+                # The request timestamp can precede a delayed commercial bill.
+                # Keep a settlement timestamp so the overlay is anchored to
+                # when the charge became observable, not when the model began.
+                merged["credits_settled_at"] = time.time()
+                should_refresh_projection = True
             # Round credit fields before normalizing
             for key in ("credits_consumed", "credits_before", "credits_after"):
                 if key in merged:
                     merged[key] = _credit_round(merged[key])
-            _USAGE_HISTORY[index] = _normalize_usage_record(merged)
-            _usage_stats_replace_locked(existing, _USAGE_HISTORY[index])
+            normalized_record = _normalize_usage_record(merged)
+            _USAGE_HISTORY[index] = normalized_record
+            account_id = str(normalized_record.get("account_id") or "")
+            _usage_stats_replace_locked(existing, normalized_record)
             _save_usage_history_locked()
-            return
+            break
+    if normalized_record is None:
+        return
+    if should_refresh_projection and account_id:
+        credits = _refresh_credit_projection(account_id)
+        projected = _number_value(credits.get("remaining"))
+        if projected is not None:
+            # Store the balance visible immediately after this charge.  This
+            # is metadata on the row only; the account cache remains the
+            # single source used by the dashboard.
+            with _USAGE_LOCK:
+                for index, current in enumerate(_USAGE_HISTORY):
+                    if current.get("request_id") != request_id:
+                        continue
+                    updated = dict(current)
+                    updated["credits_remaining_after"] = _credit_round(projected)
+                    updated["credits_reconcile_status"] = credits.get(
+                        "reconcile_status"
+                    )
+                    updated["credits_reconcile_confidence"] = credits.get(
+                        "reconcile_confidence"
+                    )
+                    normalized = _normalize_usage_record(updated)
+                    _USAGE_HISTORY[index] = normalized
+                    _usage_stats_replace_locked(current, normalized)
+                    _save_usage_history_locked()
+                    break
 
 
 # Raw v2 answers ``2001 failed to get app config: record not found`` when the
@@ -8562,6 +10402,355 @@ def _auto_route_enabled() -> bool:
         return bool(auth.get_auto_route_settings().get("enabled"))
     except Exception:
         return False
+
+
+def _task_model_routing_enabled() -> bool:
+    """Whether ``model=auto`` should be assigned from task complexity.
+
+    Automatic task routing is the safe default for this relay: explicit model
+    names are never rewritten, while ``auto`` is assigned to the configured
+    simple/complex candidates before endpoint dispatch. Operators that need
+    the legacy provider-owned ``auto`` selection can disable it explicitly.
+    """
+
+    value = str(os.environ.get("TRAE_TASK_MODEL_ROUTING", "1") or "").strip().lower()
+    return value not in {"", "0", "false", "no", "off", "disabled"}
+
+
+def _task_model_is_automatic(model: Any) -> bool:
+    """Return whether the caller delegated model selection to the relay."""
+
+    return str(model or "").strip().lower() in {"", "auto"}
+
+
+def _task_message_text(message: Any) -> str:
+    """Extract bounded plain text for deterministic complexity classification."""
+
+    if not isinstance(message, Mapping):
+        return str(message or "")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, Mapping):
+        return " ".join(
+            _task_message_text({"content": value}) for value in content.values()
+        )
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, Mapping):
+                value = (
+                    item.get("text")
+                    or item.get("content")
+                    or item.get("value")
+                    or item.get("input")
+                    or ""
+                )
+                if isinstance(value, (Mapping, list)):
+                    parts.append(_task_message_text({"content": value}))
+                else:
+                    parts.append(str(value or ""))
+            elif item not in (None, ""):
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(content)
+
+
+_TASK_COMPLEXITY_MARKERS = re.compile(
+    r"""
+    \b(?:implement|implementation|modify|change|create|write|edit|patch|refactor|
+       debug|diagnose|fix|test|review|analy[sz]e|research|deploy|download|install|
+       command|shell|script|file|files|project|repository|repo|code|coding|
+       multi[- ]?step|step[- ]?by[- ]?step|batch|automate|automation)\b
+    |(?:实现|修改|创建|编写|编辑|补丁|重构|调试|排查|修复|测试|审查|分析|研究|
+       部署|下载|安装|命令|脚本|文件|项目|仓库|代码|多步|批量|自动化|完整链路)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _task_is_complex(
+    messages: Optional[list[dict[str, Any]]], options: Optional[Mapping[str, Any]]
+) -> tuple[bool, str]:
+    """Classify a request without contacting the upstream model catalog."""
+
+    messages = messages or []
+    options = options or {}
+    if _tool_protocol_requested(dict(options), messages):
+        return True, "tools"
+    if images.messages_have_images(messages):
+        return True, "image"
+    if any(
+        isinstance(message, Mapping)
+        and str(message.get("role") or "").strip().lower()
+        in {"tool", "function"}
+        for message in messages
+    ):
+        return True, "tool_history"
+
+    text = "\n".join(_task_message_text(message) for message in messages)
+    # Long history and large prompts are much more likely to need the
+    # high-capability model even when the latest user turn is short.
+    if len(messages) >= 12 or len(text) >= 16_000:
+        return True, "long_context"
+    if _TASK_COMPLEXITY_MARKERS.search(text):
+        return True, "action_or_code"
+    return False, "simple"
+
+
+def _task_model_endpoint(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Return the canonical endpoint identity used to scope model evidence."""
+
+    options = options or {}
+    mode = str(
+        options.get("_upstream_mode") or _current_upstream_mode() or ""
+    ).strip().lower()
+    aliases = {
+        "direct": "raw",
+        "auto": "raw",
+        "work-agent": "work",
+        "9router": "remote",
+        "trae-remote": "remote",
+    }
+    return aliases.get(mode, mode)
+
+
+def _task_model_account_key(options: Optional[Mapping[str, Any]] = None) -> str:
+    """Return the identity used by the account-bound model catalogue cache."""
+
+    options = options or {}
+    token = str(options.get("_auth_token") or "").strip()
+    user_id = str(
+        options.get("_auth_user_id")
+        or options.get("_billing_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if not token and not user_id:
+        return ""
+    try:
+        return str(trae_client._web_model_cache_key(token, user_id) or "")
+    except Exception:
+        return user_id
+
+
+def _task_catalog_model_names(
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    endpoint: str = "",
+) -> set[str]:
+    """Read only model evidence scoped to this endpoint and bound account."""
+
+    options = options or {}
+    endpoint = endpoint or _task_model_endpoint(options)
+    account_key = _task_model_account_key(options)
+    names: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, Mapping):
+            descriptor_keys = {
+                "id",
+                "name",
+                "config_name",
+                "model_name",
+                "display_name",
+                "display_model_name",
+            }
+            if not descriptor_keys.intersection(value):
+                for key in value:
+                    add(key)
+            for key in (
+                "id",
+                "name",
+                "config_name",
+                "model_name",
+                "display_name",
+                "display_model_name",
+            ):
+                add(value.get(key))
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+            return
+        text = str(value or "").strip().lower()
+        if text:
+            names.add(text)
+
+    # Internal callers may provide a request-local catalog, but only when its
+    # endpoint and account labels match the already-bound request identity.
+    catalog_endpoint = str(options.get("_available_models_endpoint") or "").strip().lower()
+    catalog_account = str(options.get("_available_models_account_key") or "").strip()
+    if (
+        catalog_endpoint == endpoint
+        and account_key
+        and catalog_account == account_key
+    ):
+        add(options.get("_available_models"))
+
+    # The remote model cache is partitioned by account and executor tier. Do
+    # not use the merged /v1/models cache or a different account/tier as proof
+    # that a candidate can be used on this request.
+    if endpoint in {"remote", "web", "work"} and account_key:
+        requested_agent_type = str(
+            options.get("_remote_agent_type")
+            or options.get("remote_agent_type")
+            or ""
+        ).strip().lower()
+        if endpoint == "work" or requested_agent_type in {
+            "solo_work_remote",
+            "solo_work_lite",
+            "work",
+        }:
+            agent_types = ("solo_work_remote",)
+        elif requested_agent_type in {"solo_agent_remote", "solo_agent_lite", "agent"}:
+            agent_types = ("solo_agent_remote",)
+        else:
+            agent_types = (
+                "solo_work_remote",
+                "solo_agent_remote",
+            ) if os.environ.get("TRAE_REMOTE_AGENT_FIRST", "1").strip().lower() in {
+                "0", "false", "no", "off"
+            } else ("solo_agent_remote",)
+        cache = getattr(trae_client, "_WEB_MODEL_CACHE", {})
+        ttl = float(getattr(trae_client, "_WEB_MODEL_CACHE_TTL", 300) or 300)
+        now = time.time()
+        for agent_type in agent_types:
+            cached = cache.get(f"{account_key}:{agent_type}") if isinstance(cache, Mapping) else None
+            if (
+                isinstance(cached, tuple)
+                and len(cached) > 1
+                and now - float(cached[0]) <= ttl
+                and isinstance(cached[1], Mapping)
+            ):
+                add(cached[1])
+                break
+    return names
+
+
+def _task_model_available(
+    model: str,
+    options: Optional[Mapping[str, Any]] = None,
+    *,
+    endpoint: str = "",
+) -> bool:
+    """Require a current-endpoint, current-account catalogue match."""
+
+    candidate = str(model or "").strip().lower()
+    if not candidate:
+        return False
+    endpoint = endpoint or _task_model_endpoint(options)
+    names = _task_catalog_model_names(options, endpoint=endpoint)
+    if candidate in names:
+        return True
+    try:
+        mapped = str(trae_client.convert_model_name(candidate) or "").strip().lower()
+    except Exception:
+        mapped = ""
+    return bool(mapped and mapped in names)
+
+
+def _apply_task_model_routing(
+    messages: Optional[list[dict[str, Any]]],
+    model: Any,
+    options: Optional[dict],
+) -> tuple[str, dict]:
+    """Assign configured simple/complex models only for automatic requests.
+
+    The complex candidate is deliberately selected only when it is present in
+    a catalog that was already loaded by this process.  A missing ``6.1sol``
+    must remain an explicit ``auto`` request rather than silently becoming
+    Kimi or another static fallback.
+    """
+
+    options = dict(options or {})
+    requested = str(model or "").strip()
+    if not _task_model_routing_enabled() or not _task_model_is_automatic(model):
+        return requested or str(model or ""), options
+
+    endpoint = _task_model_endpoint(options)
+    account_key = _task_model_account_key(options)
+    existing = str(options.get("_task_model_effective") or "").strip()
+    if (
+        options.get("_task_model_routed")
+        and existing
+        and str(options.get("_task_model_routed_endpoint") or "") == endpoint
+        and str(options.get("_task_model_routed_account_key") or "") == account_key
+    ):
+        return existing, options
+
+    complex_task, reason = _task_is_complex(messages, options)
+    simple_model = (
+        str(os.environ.get("TRAE_SIMPLE_MODEL", "deepseek-v4.1-flash") or "")
+        .strip()
+        or "deepseek-v4.1-flash"
+    )
+    complex_model = (
+        str(os.environ.get("TRAE_COMPLEX_MODEL", "6.1sol") or "").strip()
+        or "6.1sol"
+    )
+    candidate = complex_model if complex_task else simple_model
+    effective = candidate
+    fallback_reason = ""
+    if not _task_model_available(candidate, options, endpoint=endpoint):
+        effective = "auto"
+        fallback_reason = (
+            f"{candidate} is not confirmed for endpoint={endpoint or 'unknown'} "
+            f"account={account_key or 'unbound'}"
+        )
+
+    options.update(
+        {
+            "_task_model_routed": True,
+            "_task_model_routed_endpoint": endpoint,
+            "_task_model_routed_account_key": account_key,
+            "_task_model_requested": requested or "auto",
+            "_task_model_class": "complex" if complex_task else "simple",
+            "_task_model_reason": reason,
+            "_task_model_candidate": candidate,
+            "_task_model_effective": effective,
+        }
+    )
+    if _requested_reasoning_effort(options) is None:
+        options["reasoning_effort"] = "ultra"
+        options["_task_model_reasoning_effort"] = "ultra"
+
+    trace = options.get("_upstream_trace")
+    if not isinstance(trace, dict):
+        trace = {}
+        options["_upstream_trace"] = trace
+    trace.update(
+        task_model_routing=True,
+        task_model_requested=requested or "auto",
+        task_model_class=options["_task_model_class"],
+        task_model_reason=reason,
+        task_model_candidate=candidate,
+        task_model_effective=effective,
+    )
+    if fallback_reason:
+        trace.update(
+            task_model_fallback="auto",
+            task_model_fallback_reason=fallback_reason,
+        )
+        logger.warning(
+            "task model candidate unavailable requested=%s candidate=%s; keeping auto",
+            requested or "auto",
+            candidate,
+        )
+    else:
+        trace.pop("task_model_fallback", None)
+        trace.pop("task_model_fallback_reason", None)
+    logger.info(
+        "task model route requested=%s class=%s candidate=%s effective=%s reason=%s",
+        requested or "auto",
+        options["_task_model_class"],
+        candidate,
+        effective,
+        reason,
+    )
+    return effective, options
 
 
 def _multimodal_fallback_model(model: str) -> str:
@@ -8706,7 +10895,22 @@ def _trace_append_failure(trace: Any, endpoint: str, error: Any) -> None:
 
 
 async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] = None):
+    requested_model = model
     options = _apply_auto_route(messages, options)
+    # Resolve the concrete endpoint before selecting an automatic task model.
+    # Model availability is product/account scoped; choosing from a global
+    # alias table before this point can send an otherwise valid ``auto``
+    # request to a model unsupported by the selected executor.
+    model, options = _apply_task_model_routing(messages, model, options)
+    active_tracker = _USAGE_TRACKER.get()
+    if active_tracker is not None:
+        # Automatic endpoint/model selection happens at dispatch time. Keep
+        # both the usage row's model and its metadata aligned even when the
+        # selected model stays unchanged (for example, auto-route adds the
+        # resolved endpoint or task strength to a copied options mapping).
+        if getattr(active_tracker, "model", model) != model:
+            active_tracker.model = model
+        active_tracker.options = options
     # A text-only config cannot read an attached image, so an image request is
     # re-pointed at a multimodal model before any routing decision is made.
     model = _apply_multimodal_switch(messages, model, options)
@@ -8776,6 +10980,16 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             options.get("_traework_upstream_mode")
             or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
         ).strip().lower()
+        if isinstance(trace, dict):
+            trace.update(
+                product="traework",
+                requested_mode="traework",
+                requested_endpoint="traework",
+                actual_mode=custom_mode,
+                actual_endpoint=(
+                    "remote-work" if custom_mode in {"remote", "web"} else custom_mode
+                ),
+            )
         if custom_mode in {"raw", "direct", "auto"}:
             logger.info(
                 "dispatch TraeWork custom-model ingress id=%s mode=raw model=%s",
@@ -8853,8 +11067,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return _openai_error(502, str(exc), "upstream_model_mismatch", "model")
 
     # ``auto`` is the direct-proxy mode: every model request reaches Trae's
-    # native llm_utils_chat endpoint. Legacy modes remain explicit opt-ins for
-    # diagnostics, but they are never silent fallbacks for API traffic.
+    # native raw transport. Legacy compatibility modes remain explicit
+    # diagnostics and are never silent fallbacks for API traffic.
     errors = []
     fallback_reasons: list[str] = []
     modes = []
@@ -8868,8 +11082,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         modes = ["web"]
     elif active_mode in ("ide", "solo"):
         modes = [active_mode]
-    elif active_mode == "work-agent":
-        modes = ["work-agent"]
+    elif active_mode in ("work", "work-agent"):
+        modes = ["work"]
     elif active_mode in ("traework-native", "native", "traework"):
         modes = ["traework-native"]
     else:
@@ -8888,7 +11102,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         "auto",
         "ide",
         "solo",
-        "work-agent",
+        "work", "work-agent",
         "traework-native",
         "native",
         "traework",
@@ -8923,6 +11137,24 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
 
     for mode in modes:
         try:
+            mode_options = dict(options)
+            if mode == "remote" and modes[0] != "remote":
+                mode_options = _remote_fallback_options(
+                    mode_options, active_mode
+                )
+            mode_model = model
+            if mode != active_mode:
+                # A fallback is a different executor and may have a different
+                # model catalogue. Re-evaluate from the caller's original
+                # ``auto`` instead of carrying a candidate chosen for the
+                # failed endpoint into the fallback request.
+                mode_model, mode_options = _apply_task_model_routing(
+                    messages, requested_model, mode_options
+                )
+                if active_tracker is not None:
+                    if getattr(active_tracker, "model", mode_model) != mode_model:
+                        active_tracker.model = mode_model
+                    active_tracker.options = mode_options
             if isinstance(trace, dict):
                 route_fallback = (
                     bool(fallback_from)
@@ -8934,10 +11166,15 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     actual_mode=mode,
                     actual_endpoint=mode,
                     fallback_used=route_fallback,
+                    product=(
+                        "traework"
+                        if mode in {"work", "work-agent", "traework-native", "native", "traework"}
+                        else "trae"
+                    ),
                 )
                 if route_fallback:
                     trace["fallback_target"] = (
-                        "remote-work" if mode == "work-agent" else mode
+                        "remote-work" if mode == "work" else mode
                     )
                     if fallback_reasons:
                         trace["fallback_reason"] = "; ".join(fallback_reasons)[:1200]
@@ -8947,9 +11184,8 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                     trace["max_mode_applied"] = False
                 else:
                     trace.pop("max_mode_applied", None)
-            mode_options = dict(options)
             if mode == "raw":
-                result = await run_raw_chat(messages, model, stream, mode_options)
+                result = await run_raw_chat(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"raw returned {error}")
@@ -8964,6 +11200,7 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 "web",
                 "ide",
                 "solo",
+                "work",
                 "work-agent",
                 "traework-native",
             ):
@@ -8971,51 +11208,72 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
                 mode_options.pop("_account_id", None)
             if mode == "cli":
                 mode_options.pop("_upstream_trace", None)
-                result = await run_cli_chat(messages, model, stream, mode_options)
+                result = await run_cli_chat(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"cli returned {error}")
                 return result
             if mode == "web":
-                result = await _run_web_with_retry(messages, model, stream, mode_options)
+                result = await _run_web_with_retry(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"web returned {error}")
                 return result
             if mode == "remote":
-                if modes[0] != "remote":
-                    mode_options = _remote_fallback_options(
-                        mode_options, active_mode
-                    )
-                result = await _run_remote_with_retry(messages, model, stream, mode_options)
+                result = await _run_remote_with_retry(messages, mode_model, stream, mode_options)
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"remote returned {error}")
                 return result
-            if mode == "work-agent":
+            if mode in ("work", "work-agent"):
+                # TraeWork uses the Remote chat_sessions transport, pinned to
+                # the Work executor so model binding and billing stay aligned.
                 mode_options["_trae_mode"] = "work"
                 mode_options["_remote_agent_type"] = "solo_work_remote"
-                mode_options.setdefault("_session_variant", "work-agent")
+                mode_options["_session_variant"] = "work"
                 if isinstance(trace, dict):
-                    trace.update(actual_endpoint="remote-work")
+                    trace.update(
+                        actual_mode="work",
+                        actual_endpoint="remote-work",
+                        product="traework",
+                    )
                 result = await _run_remote_with_retry(
-                    messages, model, stream, mode_options
+                    messages, mode_model, stream, mode_options
                 )
                 error = _upstream_response_error(result)
                 if error:
-                    raise RuntimeError(f"work-agent returned {error}")
+                    raise RuntimeError(f"work returned {error}")
                 return result
             if mode == "traework-native":
                 result = await run_traework_native_chat(
-                    messages, model, stream, mode_options
+                    messages, mode_model, stream, mode_options
                 )
                 error = _upstream_response_error(result)
                 if error:
                     raise RuntimeError(f"traework-native returned {error}")
                 return result
             if mode in ("ide", "solo"):
+                # Prefer TraeCode's native raw contract.  Personal CN
+                # accounts can lack the raw app-config record, in which case
+                # run_ide_chat reopens the verified solo_work_lite adapter.
+                # Keep the legacy endpoint visible in options so diagnostics
+                # and older callers retain the exact fallback path.
                 mode_options["_ide_endpoint"] = "/api/agent/v3/llm_utils_chat"
-            result = await run_ide_chat(messages, model, stream, mode_options)
+                mode_options["_legacy_ide_endpoint"] = (
+                    "/api/agent/v3/llm_utils_chat"
+                )
+                mode_options["_traecode_raw_chat_function"] = (
+                    "solo_agent" if mode == "solo" else "chat_v3"
+                )
+                if isinstance(trace, dict):
+                    trace["product"] = "trae"
+            result = await _run_ide_with_retry(
+                messages,
+                mode_model,
+                stream,
+                mode_options,
+                tracker=active_tracker,
+            )
             if getattr(result, "status_code", 200) >= 400:
                 payload = _response_json_payload(result)
                 detail = payload.get("error") if isinstance(payload, Mapping) else None
@@ -9030,9 +11288,40 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
             return result
         except Exception as e:
             logger.warning("upstream %s failed: %s", mode, e)
-            reason = _trace_failure_reason(mode, e)
+            # ``work-agent`` is the public endpoint identity while ``work``
+            # is the internal dispatch branch. Keep the public label in
+            # diagnostics so a failed Work request is not misreported as a
+            # different endpoint.
+            diagnostic_mode = (
+                active_mode
+                if mode == "work" and active_mode in {"work-agent", "work"}
+                else mode
+            )
+            reason = _trace_failure_reason(diagnostic_mode, e)
             fallback_reasons.append(reason)
+            # Keep ``failed_endpoint`` tied to the actual dispatch branch
+            # (``work``) while the human-facing reason retains the requested
+            # public tier (``work-agent``).
             _trace_append_failure(trace, mode, e)
+            if diagnostic_mode != mode and isinstance(trace, dict):
+                previous = str(trace.get("fallback_reason") or "").strip()
+                internal = _trace_failure_reason(mode, e)
+                parts = [part.strip() for part in previous.split(";") if part.strip()]
+                if internal in parts:
+                    parts.remove(internal)
+                if reason not in parts:
+                    parts.append(reason)
+                trace["fallback_reason"] = "; ".join(parts)[:1200]
+            if isinstance(e, RemoteQueryTooLarge):
+                # The provider rejects oversized flattened queries
+                # deterministically. Do not fall through to another executor
+                # or replay the same payload on every polling account.
+                return _openai_error(
+                    413,
+                    str(e),
+                    "context_length_exceeded",
+                    "messages",
+                )
             if isinstance(e, _ModelAccountUnavailable):
                 return _openai_error(503, str(e), "model_account_unavailable")
             if isinstance(e, EmptyUpstreamResponse):
@@ -9275,22 +11564,13 @@ async def handle_chat(req: Request):
         return StreamingResponse(
             _tracked_stream(
                 _lease_stream(
-                    _stream_with_continuation(
-                        messages,
-                        model,
-                        options,
-                        _deferred_dispatch_stream(messages, model, options),
-                    ),
+                    _deferred_dispatch_stream(messages, model, options),
                     session_id,
                 ),
                 tracker,
             ),
             media_type="text/event-stream",
             headers=_sse_headers(),
-        )
-    if _continuation_allowed(options) and continuation.max_continues() > 0:
-        return await _nonstream_with_continuation(
-            messages, model, options, tracker
         )
     return await _tracked_dispatch(messages, model, options, tracker)
 
@@ -9475,12 +11755,7 @@ async def handle_anthropic_messages(req: Request):
             _tracked_stream(
                 _lease_stream(
                     anthropic_api.translate_chat_stream(
-                        _stream_with_continuation(
-                            messages,
-                            model,
-                            options,
-                            _deferred_dispatch_stream(messages, model, options),
-                        ),
+                        _deferred_dispatch_stream(messages, model, options),
                         model,
                         request_input_tokens=input_tokens,
                     ),
@@ -9491,12 +11766,7 @@ async def handle_anthropic_messages(req: Request):
             media_type="text/event-stream",
             headers=_sse_headers(),
         )
-    if _continuation_allowed(options) and continuation.max_continues() > 0:
-        chat_response = await _nonstream_with_continuation(
-            messages, model, options, tracker
-        )
-    else:
-        chat_response = await _tracked_dispatch(messages, model, options, tracker)
+    chat_response = await _tracked_dispatch(messages, model, options, tracker)
     if getattr(chat_response, "status_code", 200) >= 400:
         detail = _upstream_response_error(chat_response) or "Upstream request failed"
         return JSONResponse(
@@ -9576,6 +11846,85 @@ async def init_app():
         auth.get_auth().edition,
         cli_client.resolve_cli_command() or "not-found",
     )
+
+
+async def _usage_enrichment_loop():
+    """Retry bill lookups that were still settling after a model response.
+
+    The model response must stay independent from the commercial accounting
+    endpoint.  A short background pass keeps the API fast while preventing a
+    transient empty usage response from becoming a permanently missing credit
+    value in the console.
+    """
+
+    interval = _usage_enrichment_interval_seconds()
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            _schedule_pending_usage_enrichment()
+        except Exception as exc:
+            logger.debug("usage enrichment scheduler error: %s", exc)
+
+
+async def _credit_reconcile_cycle(trigger: str = "schedule") -> dict[str, Any]:
+    """Refresh total credits for every account and keep the local overlay.
+
+    Account-level check-in locks serialize this with manual credit refreshes.
+    A failed upstream query leaves the last known balance intact and only marks
+    the in-memory status stale.
+    """
+
+    summary = {"total": 0, "ok": 0, "failed": 0, "skipped": 0}
+    for account_id, record in list(auth.get_accounts_raw()):
+        summary["total"] += 1
+        if not (record.get("token") or ""):
+            summary["skipped"] += 1
+            continue
+        try:
+            async with _checkin_account_lock(account_id):
+                await _fetch_credit_account_snapshot(account_id, record)
+            _CREDIT_RECONCILE_STATE[account_id] = {
+                "status": "ok",
+                "at": time.time(),
+                "trigger": trigger,
+            }
+            summary["ok"] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Do not overwrite the cached balance with a zero/empty response.
+            auth.mark_account_credit_reconcile_stale(account_id)
+            _CREDIT_RECONCILE_STATE[account_id] = {
+                "status": "stale",
+                "at": time.time(),
+                "trigger": trigger,
+                "error": str(exc)[:160],
+            }
+            summary["failed"] += 1
+            logger.debug("credit reconciliation failed account=%s: %s", account_id, exc)
+    return summary
+
+
+async def _credit_reconcile_loop():
+    """Periodically calibrate the dashboard's aggregate total credits."""
+
+    try:
+        initial_delay = float(
+            os.environ.get("TRAE_CREDIT_RECONCILE_INITIAL_DELAY_SECONDS", "2")
+            or "2"
+        )
+    except (TypeError, ValueError):
+        initial_delay = 2.0
+    if initial_delay > 0:
+        await asyncio.sleep(min(initial_delay, 60.0))
+    while True:
+        try:
+            await _credit_reconcile_cycle("schedule")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("credit reconciliation cycle error: %s", exc)
+        await asyncio.sleep(_credit_reconcile_interval_seconds())
 
 
 async def _web_reaper_loop():
@@ -9791,13 +12140,29 @@ async def lifespan(app: FastAPI):
     terminal_reaper = asyncio.create_task(_terminal_session_reaper_loop())
     checkin_retry = asyncio.create_task(_checkin_auto_retry_loop())
     auto_checkin = asyncio.create_task(_auto_checkin_loop())
+    usage_enrichment = asyncio.create_task(_usage_enrichment_loop())
+    credit_reconcile = asyncio.create_task(_credit_reconcile_loop())
     try:
         yield
     finally:
-        for reaper in (web_reaper, terminal_reaper, checkin_retry, auto_checkin):
+        for reaper in (
+            web_reaper,
+            terminal_reaper,
+            checkin_retry,
+            auto_checkin,
+            usage_enrichment,
+            credit_reconcile,
+        ):
             reaper.cancel()
-        await asyncio.gather(web_reaper, terminal_reaper, return_exceptions=True)
-        await asyncio.gather(checkin_retry, auto_checkin, return_exceptions=True)
+        await asyncio.gather(
+            web_reaper,
+            terminal_reaper,
+            checkin_retry,
+            auto_checkin,
+            usage_enrichment,
+            credit_reconcile,
+            return_exceptions=True,
+        )
         await _cancel_usage_tasks()
 
 
@@ -9814,6 +12179,8 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
     """Dashboard home: token totals by day plus account and service state."""
     accounts = auth.list_accounts()
     remaining = 0.0
+    official_remaining = 0.0
+    local_debit = 0.0
     credits_known = False
     unlimited = False
     for account in accounts:
@@ -9826,7 +12193,26 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
                 credits_known = True
             except (TypeError, ValueError):
                 pass
+        try:
+            official = credits.get(
+                "official_remaining", credits.get("remaining")
+            )
+            if official is not None:
+                official_remaining += float(official)
+            local_debit += float(credits.get("local_debit") or 0)
+        except (TypeError, ValueError):
+            pass
     polling = auth.get_polling_status()
+    reconcile_statuses = {
+        str(account.get("credits_reconcile_status") or "").strip().lower()
+        for account in accounts
+    }
+    if reconcile_statuses.intersection({"stale", "error"}):
+        aggregate_reconcile_status = "stale"
+    elif "projected" in reconcile_statuses:
+        aggregate_reconcile_status = "projected"
+    else:
+        aggregate_reconcile_status = "ok"
     with _USAGE_LOCK:
         in_flight = sum(_USAGE_ACTIVE_ACCOUNTS.values())
         recent = [_public_usage_record(record) for record in _USAGE_HISTORY[:5]]
@@ -9842,6 +12228,28 @@ async def api_overview(days: int = Query(30, ge=1, le=366)):
                 "checked_in": sum(1 for account in accounts if account.get("checked_in") is True),
                 "credits_remaining": (
                     "unlimited" if unlimited else round(remaining, 2) if credits_known else None
+                ),
+                "credits_official_remaining": (
+                    "unlimited"
+                    if unlimited
+                    else round(official_remaining, 2) if credits_known else None
+                ),
+                "credits_local_debit": round(local_debit, 4),
+                "credits_reconcile_status": aggregate_reconcile_status,
+                "credits_reconciled_at": max(
+                    (
+                        float(account.get("credits_reconciled_at") or 0)
+                        for account in accounts
+                    ),
+                    default=0,
+                ),
+                "credits_reconcile_confidence": min(
+                    (
+                        float(account.get("credits_reconcile_confidence"))
+                        for account in accounts
+                        if account.get("credits_reconcile_confidence") is not None
+                    ),
+                    default=None,
                 ),
                 "active": auth.get_active_account_id() or None,
             },
@@ -10141,7 +12549,7 @@ async def api_model_test(req: Request):
     options["max_tokens"] = 64
     effort = str(body.get("reasoning_effort") or "").strip().lower()
     if effort:
-        if effort not in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+        if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
             return JSONResponse(
                 {"success": False, "error": f"unsupported reasoning_effort: {effort}"},
                 status_code=400,
@@ -10593,22 +13001,27 @@ async def api_checkin_credits(account_id: str):
     path look like an account whose id is literally ``accounts``.
     """
     rec = auth.get_account_record(account_id)
-    token = rec.get("token") or ""
-    if not token:
+    if not (rec.get("token") or ""):
         return JSONResponse(
             {"success": False, "error": "account not found or token missing"},
             status_code=404,
         )
     try:
-        raw = await trae_client.fetch_account_credits(token)
-        parsed = trae_client.parse_account_credits(raw)
-        auth.merge_account_credits(account_id, {"account_credits": parsed})
+        # Keep the single-account endpoint on the same reconciliation path as
+        # bulk and scheduled refreshes.  Directly merging the provider result
+        # here used to erase the weighted local debit until the next poll.
+        async with _checkin_account_lock(account_id):
+            snapshot = await _fetch_credit_account_snapshot(account_id, rec)
+        parsed = snapshot.get("account_credits") or {}
         return JSONResponse(
             {
                 "success": True,
                 "id": account_id,
                 "credits": parsed,
-                "raw": raw,
+                # ``raw`` remains for older clients.  It is returned only
+                # from the single-account diagnostic endpoint; the persisted
+                # cache still stores the parsed, credential-free projection.
+                "raw": snapshot.get("_raw", parsed),
             }
         )
     except Exception as e:
@@ -10646,6 +13059,9 @@ async def _fetch_full_credits(token: str) -> dict:
     return {
         "account_credits": trae_client.parse_account_credits(raw_ac),
         "user_name": _credits_user_name(raw_ac),
+        # Keep the original payload available to the legacy single-account
+        # endpoint without making callers perform a second upstream request.
+        "_raw": raw_ac,
     }
 
 
@@ -10669,6 +13085,39 @@ def _cached_checkin_account_snapshot(
         "credits": cached.get("credits"),
         "checkin_enable": cached.get("enable"),
         "account_credits": cached.get("account_credits"),
+        "credits_official_remaining": (
+            cached.get("account_credits", {}).get(
+                "official_remaining",
+                cached.get("account_credits", {}).get("remaining"),
+            )
+            if isinstance(cached.get("account_credits"), Mapping)
+            else None
+        ),
+        "credits_official_used": (
+            cached.get("account_credits", {}).get("official_used")
+            if isinstance(cached.get("account_credits"), Mapping)
+            else None
+        ),
+        "credits_local_debit": (
+            cached.get("account_credits", {}).get("local_debit", 0)
+            if isinstance(cached.get("account_credits"), Mapping)
+            else 0
+        ),
+        "credits_reconciled_at": (
+            cached.get("account_credits", {}).get("credits_reconciled_at", 0)
+            if isinstance(cached.get("account_credits"), Mapping)
+            else 0
+        ),
+        "credits_reconcile_status": (
+            cached.get("account_credits", {}).get("reconcile_status", "unknown")
+            if isinstance(cached.get("account_credits"), Mapping)
+            else "unknown"
+        ),
+        "credits_reconcile_confidence": (
+            cached.get("account_credits", {}).get("reconcile_confidence")
+            if isinstance(cached.get("account_credits"), Mapping)
+            else None
+        ),
         "checkin_updated_at": record.get(
             "checkin_status_updated_at", record.get("checkin_updated_at", 0)
         ),
@@ -10730,11 +13179,42 @@ async def _fetch_credit_account_snapshot(
         else:
             raise
     patch = {key: value for key, value in full.items() if value is not None}
-    merged = (
-        auth.merge_account_credits(account_id, patch)
-        if patch
-        else dict(record.get("checkin") or {})
-    )
+    if patch and isinstance(patch.get("account_credits"), Mapping):
+        observed_at = time.time()
+        reconcile_state, effective = _credit_snapshot_projection(
+            account_id,
+            patch["account_credits"],
+            observed_at,
+        )
+        merged = auth.reconcile_account_credits(
+            account_id,
+            patch,
+            effective_remaining=effective.get("effective_remaining"),
+            local_debit=reconcile_state.get("local_debit", 0),
+            status=reconcile_state.get("status", "ok"),
+            source=reconcile_state.get("source", "upstream"),
+            confidence=reconcile_state.get("confidence", 1.0),
+            observed_at=observed_at,
+        )
+        # A test harness or a legacy storage adapter may expose a record
+        # through ``get_account_record`` without registering it in the
+        # persistence map used by ``reconcile_account_credits``.  Preserve the
+        # fetched projection for that adapter; normal auth storage returns the
+        # reconciled mapping above.
+        if not merged:
+            merged = dict(record.get("checkin") or {})
+            merged["account_credits"] = dict(patch["account_credits"])
+            merged["account_credits"].update(
+                {
+                    "remaining": effective.get("effective_remaining"),
+                    "local_debit": reconcile_state.get("local_debit", 0),
+                    "reconcile_status": reconcile_state.get("status", "ok"),
+                    "reconcile_source": reconcile_state.get("source", "upstream"),
+                    "reconcile_confidence": reconcile_state.get("confidence", 1.0),
+                }
+            )
+    else:
+        merged = dict(record.get("checkin") or {})
     row = _cached_checkin_account_snapshot(account_id, record)
     row.update(
         {
@@ -10742,6 +13222,8 @@ async def _fetch_credit_account_snapshot(
             "checkin": merged,
         }
     )
+    if "_raw" in full:
+        row["_raw"] = full.get("_raw")
     return row
 
 
@@ -11271,19 +13753,27 @@ async def api_checkin_claim_credits():
 
         credits_sort = 0
         try:
-            full = await _fetch_full_credits(token)
-            row.update(full)
-            parsed = full.get("account_credits") or {}
+            # Reconcile against the last official anchor before sorting.  This
+            # preserves any confirmed local debit that the provider has not
+            # reflected yet and serializes the refresh with other credit reads.
+            async with _checkin_account_lock(aid):
+                snapshot = await _fetch_credit_account_snapshot(aid, rec)
+            parsed = snapshot.get("account_credits") or {}
+            row["account_credits"] = parsed
+            row["checkin"] = snapshot.get("checkin") or row["checkin"]
+            # Keep compatibility with callers that expect the full checkin
+            # mapping in the claim response.  The mapping is already the
+            # reconciled projection; this does not re-merge raw provider data.
+            if row["checkin"]:
+                row["checkin"] = auth.merge_account_credits(aid, row["checkin"])
             # Every pack lives in the merged 通用积分 pool, so the single
             # account_credits value drives the credit-priority ordering.
             credits_sort = parsed.get("remaining") or parsed.get("total_limit") or 0
             if parsed.get("unlimited"):
                 credits_sort = 999999999
-            fresh_checkin = dict(rec.get("checkin") or {})
-            fresh_checkin.update({key: value for key, value in full.items() if value is not None})
-            row["checkin"] = auth.merge_account_credits(aid, fresh_checkin)
-        except Exception:
+        except Exception as exc:
             row["account_credits"] = None
+            row["credit_error"] = str(exc)
             credits_sort = 0
 
         row["credits_sort"] = credits_sort
@@ -11528,6 +14018,24 @@ async def api_settings(request: Request):
                 {"success": False, "error": "endpoint_id does not match URL/mode"},
                 status_code=400,
             )
+        # Older consoles persisted only the shared host (for example
+        # ``https://trae-api-cn.mchost.guru``) when selecting IDE/SOLO.  The
+        # endpoint id is authoritative, so accept that host-only form and
+        # normalize it to the concrete Remote path instead of rejecting a
+        # harmless migration request.
+        try:
+            submitted = urlsplit(web_base_url)
+            canonical = urlsplit(preset_web_base)
+            submitted_is_host_only = (
+                bool(submitted.scheme)
+                and bool(submitted.netloc)
+                and not submitted.path.rstrip("/")
+                and submitted.netloc.lower() == canonical.netloc.lower()
+            )
+        except ValueError:
+            submitted_is_host_only = False
+        if submitted_is_host_only:
+            web_base_url = preset_web_base
         if web_base_url not in (preset_web_base, legacy_gateway) and legacy_gateway:
             return JSONResponse(
                 {"success": False, "error": "endpoint_id does not match URL"},
@@ -11637,6 +14145,25 @@ async def api_settings(request: Request):
         global UPSTREAM_MODE
         UPSTREAM_MODE = upstream_mode
         os.environ["UPSTREAM_MODE"] = upstream_mode
+    if web_base_url:
+        # Remote clients read this environment value directly. Keep it aligned
+        # with the saved preset so endpoint changes take effect immediately.
+        global WEB_BASE
+        WEB_BASE = web_base_url
+        os.environ["TRAE_WEB_BASE_URL"] = web_base_url
+    if model_base_url is not None:
+        if upstream_mode in {"work", "work-agent"}:
+            if model_base_url:
+                os.environ["TRAE_RAW_BASE_URL"] = model_base_url
+                os.environ["TRAE_WORK_BASE_URL"] = model_base_url
+            else:
+                os.environ.pop("TRAE_RAW_BASE_URL", None)
+                os.environ.pop("TRAE_WORK_BASE_URL", None)
+        elif upstream_mode in {"ide", "solo"}:
+            if model_base_url:
+                os.environ["TRAE_CODE_BASE_URL"] = model_base_url
+            else:
+                os.environ.pop("TRAE_CODE_BASE_URL", None)
     note = (
         "Relay 端口已保存；需同步 Docker 端口映射并重启容器生效"
         if relay_port

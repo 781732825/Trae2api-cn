@@ -30,6 +30,9 @@ _ALIASES = {
     "very_high": "extra_high",
     "max": "extra_high",
     "maximum": "extra_high",
+    # Public API callers commonly use ``ultra`` for the highest setting.
+    # Trae's native model schema calls the same tier ``extra_high``.
+    "ultra": "extra_high",
 }
 
 

@@ -33,6 +33,13 @@ def _visible_text(chunks):
     )
 
 
+async def _async_chunks(chunks):
+    """Adapt a synchronous fixture iterator to the async stream contract."""
+
+    for chunk in chunks:
+        yield chunk
+
+
 class _LineResponse:
     def __init__(self, lines):
         self._lines = lines
@@ -43,7 +50,7 @@ class _LineResponse:
 
 
 class QueueTelemetryTests(unittest.TestCase):
-    def test_queue_position_is_not_assistant_text(self):
+    def test_queue_position_is_assistant_text(self):
         response = _LineResponse(
             [
                 'data: {"event":"request_wait_in_queue","position":2}',
@@ -59,11 +66,11 @@ class QueueTelemetryTests(unittest.TestCase):
         )
         parsed, done = _parse_chunks(chunks)
         text = _visible_text(parsed)
-        self.assertEqual(text, "ready")
-        self.assertNotIn("排队", text)
-        self.assertNotIn("位置", text)
+        self.assertEqual(text, "排队中，当前位置：2\n排队中，当前位置：1\nready")
         self.assertTrue(done)
-        self.assertTrue(any(chunk.startswith(":") for chunk in chunks))
+        # The raw protocol exposes queue status as assistant content. It is
+        # intentionally not emitted as a synthetic SSE comment.
+        self.assertFalse(any(chunk.startswith(":") for chunk in chunks))
         self.assertEqual(metadata.get("queue_position"), 1)
 
     def test_queue_position_is_recorded_for_nonstream(self):
@@ -79,6 +86,9 @@ class QueueTelemetryTests(unittest.TestCase):
         result = asyncio.run(
             sse.collect_nonstream_ide(response, "m", upstream_metadata=metadata)
         )
+        # The non-stream collector follows the historical behavior and
+        # exposes queue position through metadata while returning only the
+        # completed answer content.
         self.assertEqual(result["choices"][0]["message"]["content"], "ready")
         self.assertEqual(metadata.get("queue_position"), 4)
 
@@ -526,15 +536,21 @@ class ContinuationStreamTests(unittest.TestCase):
                 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}\n\n'
                 "data: [DONE]\n\n"
             )
+
+            async def first_round():
+                yield first
+
             stream = main_module._stream_with_continuation(
                 [{"role": "user", "content": "write"}],
                 "m",
                 {"_relay_request_id": "req-coalesced"},
-                iter([first]),
+                first_round(),
             )
             return [chunk async for chunk in stream]
 
-        with patch.object(main_module, "_dispatch_chat", new=fake_dispatch):
+        with patch.object(main_module, "_dispatch_chat", new=fake_dispatch), patch.dict(
+            main_module.os.environ, {"TRAE_AUTO_CONTINUE": "1"}, clear=False
+        ):
             chunks = asyncio.run(run())
         parsed, done = _parse_chunks(chunks)
         self.assertEqual(_visible_text(parsed), "partial,rest.")
@@ -670,7 +686,7 @@ class ContinuationStreamTests(unittest.TestCase):
                 [{"role": "user", "content": "hi"}],
                 "m",
                 {},
-                make_response("A complete sentence."),
+                _async_chunks(make_response("A complete sentence.")),
             )
             return [chunk async for chunk in stream]
 
@@ -700,7 +716,10 @@ class ContinuationStreamTests(unittest.TestCase):
 
         async def run():
             stream = main_module._stream_with_continuation(
-                [{"role": "user", "content": "hi"}], "m", {}, gen()
+                [{"role": "user", "content": "hi"}],
+                "m",
+                {},
+                _async_chunks(gen()),
             )
             return [chunk async for chunk in stream]
 

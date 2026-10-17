@@ -1030,14 +1030,43 @@ async def _stream_events_unbounded(
                     data = {"value": data}
                 yield event_name or str(data.get("event") or "message"), data
                 event_name = None
-        if buffer.strip().startswith("data:"):
-            payload = buffer.strip()[5:].strip()
-            try:
-                data = json.loads(payload)
-            except Exception:
-                data = {"_raw": payload}
-            if isinstance(data, dict):
-                yield "message", data
+        # A proxy may close immediately after the last ``data:`` line and
+        # omit the blank line that normally terminates an SSE event.  Keep the
+        # pending ``event:`` name here; dropping it turns a final
+        # ``event: done`` frame into a plain ``message`` and the outer stream
+        # wrapper then raises RemoteStreamIncomplete for an otherwise complete
+        # response.  This is especially common when the client closes after
+        # the final model snapshot but before the upstream flushes its extra
+        # newline.
+        trailing = buffer.strip()
+        if trailing:
+            trailing_event = event_name
+            trailing_data: list[str] = []
+            for raw_line in trailing.splitlines():
+                line = raw_line.rstrip("\r")
+                if line.startswith(":"):
+                    continue
+                if line.startswith("event:"):
+                    trailing_event = line[6:].strip()
+                    continue
+                if line.startswith("data:"):
+                    trailing_data.append(line[5:].strip())
+            if trailing_data:
+                payload = "\n".join(trailing_data).strip()
+                if payload == "[DONE]":
+                    yield "done", {}
+                    return
+                try:
+                    data = json.loads(payload)
+                except Exception:
+                    data = {"_raw": payload}
+                if not isinstance(data, dict):
+                    data = {"value": data}
+                yield (
+                    trailing_event
+                    or str(data.get("event") or data.get("event_type") or "message"),
+                    data,
+                )
 
 
 async def stream_events(

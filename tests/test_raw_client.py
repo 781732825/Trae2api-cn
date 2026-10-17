@@ -956,6 +956,53 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
         with raw_client._RAW_SESSION_GATES_LOCK:
             self.assertEqual(raw_client._RAW_SESSION_GATES, {})
 
+    def test_raw_base_prefers_saved_model_gateway_and_strips_api_path(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_RAW_BASE_URL": "https://diagnostic.example/api/ide/v2",
+                "TRAE_MODEL_API_HOST": "https://saved.example/api/remote/v1",
+                "TRAE_WORK_BASE_URL": "https://work.example",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                raw_client.resolve_raw_base_url(
+                    {"_upstream_mode": "work", "model_base_url": "https://saved.example/api/ide/v2"}
+                ),
+                "https://saved.example",
+            )
+
+    def test_raw_base_honors_work_environment_before_diagnostic_raw(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_RAW_BASE_URL": "https://diagnostic.example/api/ide/v2",
+                "TRAE_MODEL_API_HOST": "",
+                "TRAE_WORK_BASE_URL": "https://work.example/api/agent/v3",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                raw_client.resolve_raw_base_url({"_upstream_mode": "work"}),
+                "https://work.example",
+            )
+
+    def test_raw_base_keeps_diagnostic_raw_override_for_raw_mode(self):
+        with patch.dict(
+            os.environ,
+            {
+                "TRAE_RAW_BASE_URL": "https://diagnostic.example/api/ide/v2",
+                "TRAE_MODEL_API_HOST": "https://saved.example",
+                "TRAE_WORK_BASE_URL": "https://work.example",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                raw_client.resolve_raw_base_url({"_upstream_mode": "raw"}),
+                "https://diagnostic.example",
+            )
+
     async def test_model_lookup_uses_bound_billing_identity(self):
         with patch(
             "src.trae_client.resolve_model_config",
@@ -980,6 +1027,59 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
             token_override="token-b",
             user_id_override="account-b",
         )
+
+    async def test_lowercase_model_uses_exact_live_config_without_catalog_warmup(self):
+        """Raw body must pin the exact config for a fresh lower-case request."""
+
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b'event: output\ndata: {"response":"ok"}\n\n',
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def client_factory(**kwargs):
+            return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+        with (
+            patch.object(
+                raw_client.auth, "maybe_refresh", new=AsyncMock(return_value=False)
+            ),
+            patch.object(raw_client.auth, "get_token", return_value="jwt-token"),
+            patch.object(raw_client.auth, "get_user_id", return_value="user-1"),
+            patch.dict(
+                os.environ, {"TRAE_RAW_BASE_URL": "https://raw.example"}, clear=False
+            ),
+            patch("src.trae_client.build_headers", return_value={}),
+            patch(
+                "src.trae_client.resolve_model_config",
+                new=AsyncMock(
+                    return_value={
+                        "name": "GLM-5.3 Flash",
+                        "config_name": "GLM-5.3-Flash",
+                        "model_name": "glm-5.3-flash",
+                        "display_name": "GLM-5.3 Flash",
+                    }
+                ),
+            ) as lookup,
+            patch("src.raw_client.httpx.Client", side_effect=client_factory),
+        ):
+            wrapped = await raw_client.send_raw_chat_request(
+                [{"role": "user", "content": "hello"}],
+                "glm-5.3-flash",
+            )
+
+        self.assertEqual(captured["body"]["config_name"], "GLM-5.3-Flash")
+        self.assertEqual(captured["body"]["model_name"], "glm-5.3-flash")
+        lookup.assert_awaited_once_with(
+            "glm-5.3-flash", token_override="jwt-token"
+        )
+        wrapped.close()
 
     async def test_display_model_label_uses_config_name_in_body(self):
         captured = {}

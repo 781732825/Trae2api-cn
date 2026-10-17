@@ -30,6 +30,7 @@ class ReasoningEffortTests(unittest.TestCase):
 
     def test_responses_and_anthropic_shapes(self):
         self.assertEqual(requested_level({"reasoning": {"effort": "minimal"}}), "light")
+        self.assertEqual(requested_level({"reasoning_effort": "ultra"}), "extra_high")
         self.assertEqual(
             requested_level({"thinking": {"type": "enabled", "budget_tokens": 32000}}),
             "extra_high",

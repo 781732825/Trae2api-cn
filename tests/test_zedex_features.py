@@ -27,9 +27,9 @@ from src import (
 )
 
 class QueueTelemetryTests(unittest.TestCase):
-    """Queue position is transport telemetry, never answer text."""
+    """Queue position remains part of the raw assistant stream contract."""
 
-    def test_queue_position_is_a_keepalive_not_content(self):
+    def test_queue_position_is_assistant_text(self):
         response = _LineResponse(
             [
                 'data: {"event":"request_wait_in_queue","position":7}',
@@ -39,15 +39,14 @@ class QueueTelemetryTests(unittest.TestCase):
             ]
         )
         chunks = asyncio.run(_collect(sse.translate_ide_stream(response, "m", True)))
-        self.assertIn(": relay-keepalive\n\n", chunks)
         parsed, done = _parse_chunks(chunks)
         content = "".join(
             choice.get("delta", {}).get("content", "")
             for event in parsed
             for choice in event.get("choices", [])
         )
-        self.assertEqual(content, "the answer")
-        self.assertNotIn("7", content)
+        self.assertEqual(content, "排队中，当前位置：7\nthe answer")
+        self.assertNotIn(": relay-keepalive\n\n", chunks)
         self.assertTrue(done)
 
     def test_queue_position_reaches_upstream_metadata(self):
