@@ -518,6 +518,69 @@ class AnthropicEndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["type"], "error")
 
+    def test_nonstream_messages_invalid_tool_arguments_return_502(self):
+        for arguments in ('{"path":', '["not-an-object"]'):
+            with self.subTest(arguments=arguments):
+                async def fake_dispatch(messages, model, stream, options=None):
+                    self.assertFalse(stream)
+                    return JSONResponse(
+                        {
+                            "id": "chatcmpl-invalid-tool",
+                            "object": "chat.completion",
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_invalid",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "read_file",
+                                                    "arguments": arguments,
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+                        }
+                    )
+
+                with patch.object(
+                    main_module, "_dispatch_chat", new=fake_dispatch
+                ):
+                    response = self.client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "glm-5.3",
+                            "max_tokens": 32,
+                            "stream": False,
+                            "tools": [
+                                {
+                                    "name": "read_file",
+                                    "input_schema": {
+                                        "type": "object",
+                                        "properties": {"path": {"type": "string"}},
+                                    },
+                                }
+                            ],
+                            "messages": [{"role": "user", "content": "Read a.txt"}],
+                        },
+                        headers={"x-api-key": "smoke-key"},
+                    )
+                self.assertEqual(response.status_code, 502, response.text)
+                payload = response.json()
+                self.assertEqual(payload["type"], "error")
+                self.assertEqual(payload["error"]["type"], "api_error")
+                self.assertIn("Tool input for read_file", payload["error"]["message"])
+                self.assertNotIn("content", payload)
+
     def test_count_tokens_endpoint_returns_estimate_without_dispatch(self):
         response = self.client.post(
             "/v1/messages/count_tokens",

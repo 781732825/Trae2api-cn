@@ -771,6 +771,10 @@ class ToolCallAccumulator:
     def __init__(self, max_calls: Optional[int] = None):
         self._calls: dict[str, dict] = {}
         self._order: list[str] = []
+        # Upstream indexes correlate fragments. Public indexes identify
+        # distinct OpenAI tool calls and must be unique even when an upstream
+        # reuses index 0 for several completed calls.
+        self._source_indexes: dict[str, int] = {}
         self._indexes: dict[str, int] = {}
         self._max_calls = max_calls
 
@@ -782,6 +786,8 @@ class ToolCallAccumulator:
         key = call.get("id")
         if key in self._calls:
             return key
+        if call.get("_explicit_id") is True:
+            return None
         function = call.get("function") or {}
         requested_index = call.get("index")
         # Trae native stream: tool-call argument fragments. The first item of
@@ -792,7 +798,8 @@ class ToolCallAccumulator:
         # so index-based merge is the correct path when present.
         if call.get("_synthetic_id") or not function.get("name"):
             if isinstance(requested_index, int):
-                for existing_key, existing_index in self._indexes.items():
+                for existing_key in reversed(self._order):
+                    existing_index = self._source_indexes[existing_key]
                     if existing_index != requested_index:
                         continue
                     existing_name = (self._calls[existing_key].get("function") or {}).get(
@@ -802,6 +809,7 @@ class ToolCallAccumulator:
                         return existing_key
             # No usable index: nameless delta fragments are ordered, so merge
             # into the latest open delta call (upstream order == merge order).
+                return None
             if call.get("_synthetic_id") and not function.get("name"):
                 last_key = self._order[-1] if self._order else None
                 if last_key is not None:
@@ -813,17 +821,6 @@ class ToolCallAccumulator:
                     ):
                         return last_key
                 return None
-        if isinstance(requested_index, int) and (
-            call.get("_synthetic_id") or not function.get("name")
-        ):
-            for existing_key, existing_index in self._indexes.items():
-                if existing_index != requested_index:
-                    continue
-                existing_name = (self._calls[existing_key].get("function") or {}).get(
-                    "name"
-                )
-                if not function.get("name") or function.get("name") == existing_name:
-                    return existing_key
         return None
 
     @staticmethod
@@ -865,6 +862,18 @@ class ToolCallAccumulator:
                 continue
             function = call.get("function") or {}
             existing_key = self._existing_key(call)
+            if (
+                existing_key is None
+                and call.get("_explicit_id") is True
+                and not function.get("name")
+                and str(function.get("arguments") or "").strip()
+            ):
+                raise InvalidNativeToolArguments(
+                    "Trae upstream returned tool arguments for an unknown call "
+                    "without a function name",
+                    retryable=False,
+                    observed_model_event=True,
+                )
             if existing_key is not None:
                 existing = self._calls[existing_key]
                 existing_function = existing.get("function") if existing else None
@@ -951,7 +960,10 @@ class ToolCallAccumulator:
                         existing.get("_explicit_index") is True
                         and call.get("_explicit_index") is True
                     )
-                    same_index = both_indexed and self._indexes[existing_key] == requested_index
+                    same_index = (
+                        both_indexed
+                        and self._source_indexes[existing_key] == requested_index
+                    )
                     if both_indexed and not same_index:
                         continue
                     previous_args = str(existing_function.get("arguments") or "")
@@ -967,9 +979,15 @@ class ToolCallAccumulator:
             if key not in self._calls:
                 if self._max_calls is not None and len(self._order) >= self._max_calls:
                     continue
-                index = requested_index if isinstance(requested_index, int) else len(self._order)
+                source_index = (
+                    requested_index
+                    if isinstance(requested_index, int)
+                    else len(self._order)
+                )
+                index = len(self._order)
                 self._calls[key] = call
                 self._order.append(key)
+                self._source_indexes[key] = source_index
                 self._indexes[key] = index
                 deltas.append({
                     "index": index,
@@ -1031,6 +1049,11 @@ class ToolCallAccumulator:
                             "_source_index": call.get("_source_index", 0),
                         }
                         self._order.append(new_key)
+                        self._source_indexes[new_key] = (
+                            requested_index
+                            if isinstance(requested_index, int)
+                            else len(self._order) - 1
+                        )
                         self._indexes[new_key] = len(self._order) - 1
                         deltas.append(
                             {
@@ -1078,17 +1101,19 @@ class ToolCallAccumulator:
         """Replace the aggregated calls (used after repair/split)."""
         self._calls = {}
         self._order = []
+        self._source_indexes = {}
         self._indexes = {}
         for idx, c in enumerate(calls):
             cid = str(c.get("id") or f"call_repair_{idx}")
             self._calls[cid] = c
             self._order.append(cid)
-            call_index = c.get("index")
-            if not isinstance(call_index, int):
-                call_index = idx
-            else:
-                c.setdefault("index", call_index)
-            self._indexes[cid] = call_index
+            source_index = c.get("index")
+            if not isinstance(source_index, int):
+                source_index = c.get("_source_index")
+            if not isinstance(source_index, int):
+                source_index = idx
+            self._source_indexes[cid] = source_index
+            self._indexes[cid] = idx
 
 
 def _repair_json_arguments(arguments: str) -> str:
@@ -1160,18 +1185,16 @@ def _split_json_stream(text: str):
 
 
 def _ensure_native_tool_arguments(
-    calls: list[dict], usage: Any = None
+    calls: list[dict], usage: Any = None, *, strict: bool = False
 ) -> list[dict]:
     """Validate/repair/split malformed native delta tool arguments."""
     repaired_any = False
     kept: list[dict] = []
     for call in calls:
-        if call.get("_arguments_mode") != "delta":
-            kept.append(call)
-            continue
         function = call.get("function") or {}
         arguments = function.get("arguments")
-        if not arguments:
+        if arguments is None or not str(arguments).strip():
+            function["arguments"] = "{}"
             kept.append(call)
             continue
         try:
@@ -1235,6 +1258,14 @@ def _ensure_native_tool_arguments(
             str(arguments)[:200],
         )
         repaired_any = True
+        if strict:
+            raise InvalidNativeToolArguments(
+                "Trae upstream returned invalid JSON arguments for tool "
+                f"{function.get('name') or '?'}",
+                retryable=False,
+                usage=usage,
+                observed_model_event=True,
+            )
     if repaired_any:
         logger.warning("[repair] repaired/split/dropped unusable tool call(s) this turn")
     return kept
@@ -1440,6 +1471,42 @@ def _emit_tool_deltas(
         openai_chunk(prefix_id, model, {"tool_calls": [delta]})
         for delta in accumulator.add(calls)
     ]
+
+
+def _emit_complete_tool_calls(
+    prefix_id: str,
+    model: str,
+    calls: list[dict],
+) -> list[str]:
+    """Emit validated calls with one unique public index per logical call."""
+
+    chunks: list[str] = []
+    for index, call in enumerate(calls):
+        function = call.get("function") or {}
+        chunks.append(
+            openai_chunk(
+                prefix_id,
+                model,
+                {
+                    "tool_calls": [
+                        {
+                            "index": index,
+                            "id": str(call.get("id") or f"call_{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": str(function.get("name") or ""),
+                                "arguments": str(
+                                    function.get("arguments")
+                                    if function.get("arguments") is not None
+                                    else "{}"
+                                ),
+                            },
+                        }
+                    ]
+                },
+            )
+        )
+    return chunks
 
 
 def _visible_text(text: Any) -> str:
@@ -1784,10 +1851,8 @@ async def translate_ide_stream(
         if _contains_completed_tool_repeat(calls, completed_tool_signatures):
             saw_completed_repeat = True
 
-        tool_chunks = list(
-            _emit_tool_deltas(
-                prefix_id,
-                model,
+        tool_calls.add(
+            _filter_for_accumulator(
                 tool_calls,
                 calls,
                 allowed_tools,
@@ -1796,14 +1861,6 @@ async def translate_ide_stream(
                 completed_tool_signatures,
             )
         )
-        if tool_chunks and not started:
-            started = True
-            yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
-        for chunk in tool_chunks:
-            yield chunk
 
         text_delta = response_delta
         if text_delta:
@@ -1836,10 +1893,8 @@ async def translate_ide_stream(
     final_calls = reasoning_calls + response_calls
     if _contains_completed_tool_repeat(final_calls, completed_tool_signatures):
         saw_completed_repeat = True
-    final_tool_chunks = list(
-        _emit_tool_deltas(
-            prefix_id,
-            model,
+    tool_calls.add(
+        _filter_for_accumulator(
             tool_calls,
             final_calls,
             allowed_tools,
@@ -1848,14 +1903,6 @@ async def translate_ide_stream(
             completed_tool_signatures,
         )
     )
-    if final_tool_chunks and not started:
-        started = True
-        yield openai_chunk(prefix_id, model, {"role": "assistant"})
-        for pending in pending_queue_chunks:
-            yield pending
-        pending_queue_chunks.clear()
-    for chunk in final_tool_chunks:
-        yield chunk
 
     final_text_delta = response_delta
     if final_text_delta:
@@ -1872,18 +1919,6 @@ async def translate_ide_stream(
     reasoning_summary = (
         compact_reasoning_text(reasoning_text.raw) if include_reasoning else ""
     )
-    if reasoning_summary:
-        if not started:
-            started = True
-            yield openai_chunk(prefix_id, model, {"role": "assistant"})
-            for pending in pending_queue_chunks:
-                yield pending
-            pending_queue_chunks.clear()
-        yield openai_chunk(
-            prefix_id,
-            model,
-            {"reasoning_content": reasoning_summary},
-        )
 
     if terminal_event_pending:
         saw_terminal = True
@@ -1906,8 +1941,33 @@ async def translate_ide_stream(
             observed_model_event=observed_model_event,
         )
     tool_calls.set_calls(
-        _ensure_native_tool_arguments(tool_calls.calls(), final_usage)
+        _ensure_native_tool_arguments(
+            tool_calls.calls(), final_usage, strict=True
+        )
     )
+    if reasoning_summary:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
+        yield openai_chunk(
+            prefix_id,
+            model,
+            {"reasoning_content": reasoning_summary},
+        )
+    if tool_calls.has_calls:
+        if not started:
+            started = True
+            yield openai_chunk(prefix_id, model, {"role": "assistant"})
+            for pending in pending_queue_chunks:
+                yield pending
+            pending_queue_chunks.clear()
+        for chunk in _emit_complete_tool_calls(
+            prefix_id, model, tool_calls.calls()
+        ):
+            yield chunk
     if content_count == 0 and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
@@ -3125,7 +3185,9 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    tool_calls.set_calls(_ensure_native_tool_arguments(tool_calls.calls(), usage))
+    tool_calls.set_calls(
+        _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
+    )
     if not full and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",

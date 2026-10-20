@@ -983,7 +983,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.7"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -8761,6 +8761,13 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
     )
     upstream_metadata: dict[str, Any] = {}
 
+    def _can_fallback(error: BaseException) -> bool:
+        # Buffered native tools may not have reached the wire yet, but an
+        # observed model turn is still billable and cannot be safely replayed.
+        return not isinstance(error, EmptyUpstreamResponse) or (
+            error.retryable and not error.observed_model_event
+        )
+
     def _legacy_options() -> dict:
         legacy = dict(options)
         legacy.pop("_traecode_raw_chat_function", None)
@@ -8826,7 +8833,11 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
             try:
                 current_wrapper = await _open(current_kind)
             except Exception as exc:
-                if current_kind == "raw" and legacy_fallback_allowed:
+                if (
+                    current_kind == "raw"
+                    and legacy_fallback_allowed
+                    and _can_fallback(exc)
+                ):
                     _mark_raw_fallback(exc)
                     current_kind = "legacy"
                     current_wrapper = await _open(current_kind)
@@ -8878,6 +8889,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                         current_kind == "raw"
                         and legacy_fallback_allowed
                         and not emitted_model_output
+                        and _can_fallback(exc)
                     ):
                         await close_current()
                         _mark_raw_fallback(exc)
@@ -8924,6 +8936,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
             if (
                 current_kind == "raw"
                 and legacy_fallback_allowed
+                and _can_fallback(exc)
             ):
                 _mark_raw_fallback(exc)
                 current_kind = "legacy"
@@ -11910,11 +11923,19 @@ async def handle_anthropic_messages(req: Request):
                 },
             },
         )
-    return JSONResponse(
-        content=anthropic_api.completion_to_message(
+    try:
+        message = anthropic_api.completion_to_message(
             completion, model, request_input_tokens=input_tokens
         )
-    )
+    except anthropic_api.AnthropicRequestError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {"type": "api_error", "message": str(exc)},
+            },
+        )
+    return JSONResponse(content=message)
 
 
 async def handle_anthropic_count_tokens(req: Request):

@@ -1566,7 +1566,7 @@ class RawClientRequestTests(unittest.IsolatedAsyncioTestCase):
             return call_ids, json.loads(arguments)
 
         for transport in ("raw", "traecode"):
-            for capacity in (2, 3):
+            for capacity in (2, 4):
                 with self.subTest(transport=transport, capacity=capacity):
                     options = {
                         **self.raw_options(f"slots-{transport}-{capacity}"),

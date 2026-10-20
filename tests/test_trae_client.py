@@ -10,6 +10,51 @@ from unittest.mock import AsyncMock, patch
 from src import raw_client, trae_client
 
 
+class ModelRequestParallelLimitTests(unittest.TestCase):
+    def test_default_capacity_is_four(self):
+        self.assertEqual(
+            trae_client._configured_model_request_parallel_limit({}),
+            4,
+        )
+
+    def test_new_setting_precedes_legacy_alias(self):
+        self.assertEqual(
+            trae_client._configured_model_request_parallel_limit(
+                {
+                    "TRAE_MODEL_REQUEST_PARALLEL_LIMIT": "6",
+                    "TRAE_WEB_PARALLEL_LIMIT": "2",
+                }
+            ),
+            6,
+        )
+
+    def test_legacy_alias_and_bounds_remain_supported(self):
+        self.assertEqual(
+            trae_client._configured_model_request_parallel_limit(
+                {"TRAE_WEB_PARALLEL_LIMIT": "5"}
+            ),
+            5,
+        )
+        self.assertEqual(
+            trae_client._configured_model_request_parallel_limit(
+                {"TRAE_MODEL_REQUEST_PARALLEL_LIMIT": "0"}
+            ),
+            1,
+        )
+        self.assertEqual(
+            trae_client._configured_model_request_parallel_limit(
+                {"TRAE_MODEL_REQUEST_PARALLEL_LIMIT": "1000"}
+            ),
+            64,
+        )
+        self.assertEqual(
+            trae_client._configured_model_request_parallel_limit(
+                {"TRAE_MODEL_REQUEST_PARALLEL_LIMIT": "invalid"}
+            ),
+            4,
+        )
+
+
 def _fake_jwt(user_id: str, issued_at: int) -> str:
     def encode(value: dict) -> str:
         raw = json.dumps(value, separators=(",", ":")).encode("utf-8")

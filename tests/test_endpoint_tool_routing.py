@@ -1079,6 +1079,114 @@ class IdeRawLegacyFallbackTests(unittest.IsolatedAsyncioTestCase):
         raw.assert_awaited_once()
         legacy_send.assert_awaited_once()
 
+    async def test_invalid_native_tool_json_does_not_replay_through_legacy(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                native_wrapper = self._wrapper(
+                    self._ReplayResponse(
+                        [
+                            "event: output",
+                            "data: " + json.dumps(
+                                {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_native",
+                                            "function_call": {
+                                                "name": "read_file",
+                                                "arguments": '{"path":',
+                                            },
+                                        }
+                                    ]
+                                }
+                            ),
+                            "",
+                            "event: token_usage",
+                            'data: {"input_token":3,"output_token":5}',
+                            "",
+                            "event: done",
+                            'data: {"finish_reason":"tool_calls"}',
+                            "",
+                        ]
+                    )
+                )
+                legacy_wrapper = self._wrapper(
+                    self._ReplayResponse(
+                        [
+                            "event: output",
+                            'data: {"response":"unexpected legacy replay"}',
+                            "",
+                            "event: done",
+                            'data: {"finish_reason":"stop"}',
+                            "",
+                        ]
+                    )
+                )
+                raw = AsyncMock(return_value=native_wrapper)
+                legacy_send = AsyncMock(return_value=legacy_wrapper)
+                with (
+                    patch.object(
+                        main_module.raw_client, "send_traecode_chat_request", raw
+                    ),
+                    patch.object(
+                        main_module.trae_client, "send_chat_request", legacy_send
+                    ),
+                ):
+                    with self.assertRaises(InvalidNativeToolArguments) as error:
+                        response = await main_module.run_ide_chat(
+                            [{"role": "user", "content": "Read a.txt"}],
+                            "glm-5.3",
+                            stream,
+                            self._options(),
+                        )
+                        if stream:
+                            async for _ in response.body_iterator:
+                                pass
+
+                self.assertFalse(error.exception.retryable)
+                self.assertTrue(error.exception.observed_model_event)
+                self.assertEqual(error.exception.usage["total_tokens"], 8)
+                raw.assert_awaited_once()
+                legacy_send.assert_not_awaited()
+                native_wrapper.close.assert_called_once()
+                legacy_wrapper.close.assert_not_called()
+
+    async def test_guarded_raw_open_errors_do_not_replay_through_legacy(self):
+        for stream in (False, True):
+            for retryable, observed in ((False, False), (True, True)):
+                with self.subTest(
+                    stream=stream, retryable=retryable, observed=observed
+                ):
+                    native_error = EmptyUpstreamResponse(
+                        "native turn cannot be replayed",
+                        retryable=retryable,
+                        observed_model_event=observed,
+                    )
+                    raw = AsyncMock(side_effect=native_error)
+                    legacy_send = AsyncMock()
+                    with (
+                        patch.object(
+                            main_module.raw_client,
+                            "send_traecode_chat_request",
+                            raw,
+                        ),
+                        patch.object(
+                            main_module.trae_client,
+                            "send_chat_request",
+                            legacy_send,
+                        ),
+                    ):
+                        with self.assertRaises(EmptyUpstreamResponse) as error:
+                            await main_module.run_ide_chat(
+                                [{"role": "user", "content": "Read a.txt"}],
+                                "glm-5.3",
+                                stream,
+                                self._options(),
+                            )
+                    self.assertIs(error.exception, native_error)
+                    raw.assert_awaited_once()
+                    legacy_send.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

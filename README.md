@@ -78,7 +78,7 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
 GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
-Run workflow** 手动执行，默认会构建 `v1.0.5`。部署机器不需要安装 Python、
+Run workflow** 手动执行，默认会构建 `v1.0.7`。部署机器不需要安装 Python、
 Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
 
 ```bash
@@ -89,7 +89,7 @@ docker compose -f docker-compose.image.yml up -d
 
 镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
 拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
-版本标签，例如 `:1.0.5`。更新已有部署时执行
+版本标签，例如 `:1.0.7`。更新已有部署时执行
 `docker compose -f docker-compose.image.yml pull`，再执行
 `docker compose -f docker-compose.image.yml up -d`。
 
@@ -206,7 +206,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_WEB_BASE_URL` | `https://trae-api-cn.mchost.guru/api/remote/v1` | remote 上游端点；`remote` 模式按 9router 的 `chat_sessions` + `events` 协议转发 |
 | `TRAE_CODE_BASE_URL` | `https://trae-api-cn.mchost.guru` | TraeCode IDE / Solo 模型网关主机地址；仅填写主机名，relay 自动追加 `/api/ide/v2/llm_raw_chat`。默认失败会在 TraeCode v1 与已知调度主机间重试；显式自定义主机不会被覆盖。旧变量 `TRAE_MODEL_API_HOST` 仍作为兼容别名 |
 | `TRAE_WORK_BASE_URL` | 空 | 旧版 TraeWork raw 诊断链路的可选网关；正常 `work` 请求使用 `TRAE_WEB_BASE_URL` 的 Remote `chat_sessions` |
-| `TRAE_WEB_PARALLEL_LIMIT` | `2` | 模型请求并发容量；Web/Remote 按账号限流，Raw/IDE 工具流的模型绑定会话使用相同容量 |
+| `TRAE_MODEL_REQUEST_PARALLEL_LIMIT` | `4` | 统一的模型请求与原生工具流并发容量（限制为 1-64）；Web/Remote 按账号限流，Raw/IDE 按模型绑定会话限流。旧变量 `TRAE_WEB_PARALLEL_LIMIT` 仅在新变量未设置时作为兼容别名 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
 | `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表合并 Remote 的 Agent / Work / Design 目录与 Solo 原生 `get_detail_param` 目录，保留上游精确大小写并为混合大小写配置提供小写别名，条目带 `endpoint`/`endpoints` 并按端点排序；控制类内部模型会隐藏，保留 `auto`；上游拉取失败时回落内置列表 |
@@ -439,7 +439,7 @@ export ANTHROPIC_MODEL=glm-5.3
 - **端点选择**：不想手动切换时打开「自动路由」；需要工具调用时优先用 IDE Agent 或 Remote。IDE Raw 已从正式控制台和打包预设中移除，个人账号不要选择 `UPSTREAM_MODE=raw`。切换端点或开关后无需重启，立即生效。
 - **截断处理**：relay 不会自动续写或隐式重放模型请求；收到 `finish_reason=length` 或上游提前断流时，由调用端决定是否发起下一轮，避免重复消费和工具回合错乱。
 - **上下文长度**：remote 扁平化 query 约 500K 字符时上游会静默断流，relay 默认在 480K 字符处裁剪最早的历史。长会话建议客户端自行压缩上下文。
-- **并发**：`TRAE_WEB_PARALLEL_LIMIT` 默认 2；Web/Remote 按账号分配槽位，Raw/IDE 的模型绑定会话使用相同容量，工具流不再固定为单槽。原生请求从打开连接到响应关闭始终占用槽位，取消等待或清理迟到响应不会提前释放或重复释放。多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；Web/Remote 槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。
+- **并发**：`TRAE_MODEL_REQUEST_PARALLEL_LIMIT` 默认 4（旧 `TRAE_WEB_PARALLEL_LIMIT` 仍可兼容）；Web/Remote 按账号分配槽位，Raw/IDE 的模型绑定会话和原生工具流使用同一容量。原生请求从打开连接到响应关闭始终占用槽位，取消等待或清理迟到响应不会提前释放或重复释放。多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；Web/Remote 槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。该值只控制 relay 本地容量，上游仍可能按账号实施更低限制并返回 4011/429，此时应增加可轮询账号或下调容量。
 - **签到 9074**：9074 是上游风控码。relay 会自动轮换签到设备 ID 并指数退避重试，无需手动反复点击；若长期失败，可在 `TRAE_CHECKIN_DEVICE_IDS_JSON` 中填入真实客户端的设备 ID。
 - **自动签到**：定时签到按顺序逐个账号执行，已签到和无凭证的账号会跳过，账号之间沿用 `TRAE_CHECKIN_INTERVAL_SECONDS` 间隔，遇到 9074 的账号交给后台退避重试。时间以北京时间计算，每天只触发一次定时任务；「立即执行」不会占用当天的定时任务。
 - **用量统计**：缓存 tokens 仅在上游返回时统计，旧记录按 0 计；日期按北京时间划分，最多保留 400 天。

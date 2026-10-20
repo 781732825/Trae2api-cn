@@ -267,6 +267,17 @@ def normalize_request(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], di
             options["tool_choice"] = "none"
         else:
             options["tool_choice"] = "auto"
+    parallel_tool_calls = body.get("parallel_tool_calls")
+    if isinstance(parallel_tool_calls, bool):
+        # Compatibility with callers that use the OpenAI spelling directly.
+        # Check the value by type so an explicit False is not lost.
+        options["parallel_tool_calls"] = parallel_tool_calls
+    if isinstance(choice, Mapping) and isinstance(
+        choice.get("disable_parallel_tool_use"), bool
+    ):
+        disable_parallel = choice["disable_parallel_tool_use"]
+        if disable_parallel or "parallel_tool_calls" not in options:
+            options["parallel_tool_calls"] = not disable_parallel
 
     thinking = body.get("thinking")
     if isinstance(thinking, Mapping):
@@ -319,12 +330,16 @@ def _tool_use_block(call: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(arguments, str):
         try:
             parsed: Any = json.loads(arguments or "{}")
-        except json.JSONDecodeError:
-            parsed = {"_raw": arguments}
+        except json.JSONDecodeError as exc:
+            raise AnthropicRequestError(
+                f"Tool input for {function.get('name') or 'tool'} is invalid JSON"
+            ) from exc
     else:
         parsed = arguments if arguments is not None else {}
     if not isinstance(parsed, Mapping):
-        parsed = {"value": parsed}
+        raise AnthropicRequestError(
+            f"Tool input for {function.get('name') or 'tool'} must be a JSON object"
+        )
     return {
         "type": "tool_use",
         "id": str(call.get("id") or make_id("toolu")),
@@ -407,14 +422,15 @@ async def translate_chat_stream(
     started = False
     text_index: Optional[int] = None
     thinking_index: Optional[int] = None
-    tool_indexes: dict[int, int] = {}
-    tool_names: dict[int, str] = {}
-    tool_ids: dict[int, str] = {}
+    tools: list[dict[str, Any]] = []
+    tools_by_id: dict[str, dict[str, Any]] = {}
+    tools_by_source: dict[tuple[str, int], dict[str, Any]] = {}
     next_index = 0
     finish_reason = "stop"
     usage_values: dict[str, Any] = {}
     saw_tool_use = False
     saw_finish_reason = False
+    stream_error = ""
     buffer = ""
 
     def open_message() -> list[str]:
@@ -477,25 +493,46 @@ async def translate_chat_stream(
         )
         return events
 
-    def start_tool(call: Mapping[str, Any]) -> list[str]:
+    def tool_source_key(
+        call: Mapping[str, Any], position: int
+    ) -> tuple[str, int]:
+        raw_index = call.get("index")
+        if isinstance(raw_index, int) and not isinstance(raw_index, bool):
+            return ("index", raw_index)
+        return ("position", position)
+
+    def start_tool(call: Mapping[str, Any], position: int) -> tuple[list[str], dict[str, Any]]:
         nonlocal next_index, saw_tool_use
         events = open_message()
-        raw_index = call.get("index")
-        try:
-            key = int(raw_index)
-        except (TypeError, ValueError):
-            key = 0
-        if key in tool_indexes:
-            return events
-        block_index = next_index
-        next_index += 1
-        tool_indexes[key] = block_index
         function = call.get("function")
         function = function if isinstance(function, Mapping) else {}
-        name = str(function.get("name") or call.get("name") or "tool")
-        call_id = str(call.get("id") or make_id("toolu"))
-        tool_names[key] = name
-        tool_ids[key] = call_id
+        source_key = tool_source_key(call, position)
+        explicit_id = str(call.get("id") or "").strip()
+        state = tools_by_id.get(explicit_id) if explicit_id else None
+        if state is None and not explicit_id:
+            state = tools_by_source.get(source_key)
+        if state is not None:
+            tools_by_source[source_key] = state
+            return events, state
+
+        name = str(function.get("name") or call.get("name") or "").strip()
+        if not name:
+            # A continuation without an id/name can only attach to a known
+            # source slot. Starting an anonymous block would make every later
+            # fragment ambiguous and produces an unusable Anthropic tool_use.
+            raise ValueError("Tool call started without a name")
+        call_id = explicit_id or make_id("toolu")
+        block_index = next_index
+        next_index += 1
+        state = {
+            "block_index": block_index,
+            "id": call_id,
+            "name": name,
+            "arguments": "",
+        }
+        tools.append(state)
+        tools_by_id[call_id] = state
+        tools_by_source[source_key] = state
         saw_tool_use = True
         events.append(
             _event(
@@ -511,19 +548,51 @@ async def translate_chat_stream(
                 },
             )
         )
-        return events
+        return events, state
+
+    def append_tool_arguments(state: dict[str, Any], value: str) -> str:
+        """Return the new wire delta while retaining the complete JSON text."""
+
+        if not value:
+            return ""
+        previous = str(state.get("arguments") or "")
+        # The Chat Completions layer already resolves native snapshots and
+        # replays. Its arguments field is a true delta; prefix heuristics here
+        # would silently drop valid repeated braces inside a JSON string.
+        state["arguments"] = previous + value
+        return value
+
+    def tool_input_error() -> str:
+        for state in tools:
+            arguments = str(state.get("arguments") or "")
+            if not arguments.strip():
+                continue
+            try:
+                parsed = json.loads(arguments)
+            except (TypeError, ValueError):
+                return (
+                    f"Tool input for {state['name']} is invalid JSON: "
+                    "upstream tool arguments ended before a complete object"
+                )
+            if not isinstance(parsed, Mapping):
+                return f"Tool input for {state['name']} must be a JSON object"
+        return ""
 
     def close_blocks() -> list[str]:
         events: list[str] = []
         for index in (
             [thinking_index] if thinking_index is not None else []
-        ) + ([text_index] if text_index is not None else []) + list(tool_indexes.values()):
+        ) + ([text_index] if text_index is not None else []) + [
+            state["block_index"] for state in tools
+        ]:
             events.append(_event("content_block_stop", {"index": index}))
         return events
 
     def handle_chunk(chunk: Mapping[str, Any]) -> list[str]:
-        nonlocal finish_reason, saw_finish_reason
+        nonlocal finish_reason, saw_finish_reason, stream_error
         events: list[str] = []
+        if stream_error:
+            return events
         if isinstance(chunk.get("usage"), Mapping):
             usage_values.update(chunk["usage"])
         for key in ("reasoning_content", "reasoning", "thinking"):
@@ -577,27 +646,37 @@ async def translate_chat_stream(
                 )
             calls = delta.get("tool_calls")
             if isinstance(calls, list):
-                for call in calls:
+                for position, call in enumerate(calls):
                     if not isinstance(call, Mapping):
                         continue
-                    events.extend(start_tool(call))
-                    raw_index = call.get("index")
                     try:
-                        key = int(raw_index)
-                    except (TypeError, ValueError):
-                        key = 0
+                        start_events, state = start_tool(call, position)
+                    except ValueError as exc:
+                        stream_error = str(exc)
+                        events.append(error_event(stream_error))
+                        return events
+                    events.extend(start_events)
                     function = call.get("function")
                     function = function if isinstance(function, Mapping) else {}
                     arguments = function.get("arguments")
-                    if isinstance(arguments, str) and arguments:
+                    if arguments is None:
+                        arguments_text = ""
+                    elif isinstance(arguments, str):
+                        arguments_text = arguments
+                    else:
+                        arguments_text = _json_text(arguments)
+                    if arguments_text:
+                        argument_delta = append_tool_arguments(state, arguments_text)
+                        if not argument_delta:
+                            continue
                         events.append(
                             _event(
                                 "content_block_delta",
                                 {
-                                    "index": tool_indexes.get(key, 0),
+                                    "index": state["block_index"],
                                     "delta": {
                                         "type": "input_json_delta",
-                                        "partial_json": arguments,
+                                        "partial_json": argument_delta,
                                     },
                                 },
                             )
@@ -607,6 +686,9 @@ async def translate_chat_stream(
     def terminal_events() -> list[str]:
         """Build the Anthropic terminal envelope exactly once."""
 
+        input_error = tool_input_error()
+        if input_error:
+            return [error_event(input_error)]
         events = close_blocks()
         if not started:
             events.extend(open_message())
@@ -679,6 +761,8 @@ async def translate_chat_stream(
                 return
             for event in handle_chunk(parsed):
                 yield event
+            if stream_error:
+                return
 
     # A few proxies close an SSE response after writing the final ``data:``
     # line without the usual blank-line delimiter.  Process that buffered
@@ -711,10 +795,16 @@ async def translate_chat_stream(
                         return
                     for event in handle_chunk(parsed):
                         yield event
+                    if stream_error:
+                        return
 
     # A final finish-reason frame is sufficient evidence of completion if a
     # proxy drops only the trailing [DONE]. Without it, report a broken stream
     # instead of presenting a partial response as a successful end_turn.
+    input_error = tool_input_error()
+    if input_error:
+        yield error_event(input_error)
+        return
     for event in close_blocks():
         yield event
     if not started:

@@ -176,7 +176,32 @@ _DEVICE_BRANDS = ["92L3", "91C9", "814S", "8P15V", "35G4", "65G4", "55G4"]
 _WEB_SLOTS: dict[str, asyncio.Semaphore] = {}
 _WEB_LEASES: dict[str, dict] = {}
 _WEB_MODEL_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
-_WEB_PARALLEL_LIMIT = int(os.environ.get("TRAE_WEB_PARALLEL_LIMIT", "2"))
+
+
+def _configured_model_request_parallel_limit(
+    environ: Optional[Mapping[str, str]] = None,
+) -> int:
+    """Read the shared model/native-tool stream capacity.
+
+    ``TRAE_WEB_PARALLEL_LIMIT`` remains a compatibility alias for existing
+    deployments. New configurations should use the transport-neutral name so
+    Raw/IDE and Web/Remote cannot accidentally be tuned to different limits.
+    """
+
+    values = os.environ if environ is None else environ
+    raw = values.get("TRAE_MODEL_REQUEST_PARALLEL_LIMIT")
+    if raw is None or not str(raw).strip():
+        raw = values.get("TRAE_WEB_PARALLEL_LIMIT", "4")
+    try:
+        limit = int(str(raw).strip())
+    except (TypeError, ValueError):
+        limit = 4
+    return max(1, min(limit, 64))
+
+
+# Keep the legacy internal name because older integrations patch it in process.
+# Every transport reads it through ``model_request_parallel_limit()``.
+_WEB_PARALLEL_LIMIT = _configured_model_request_parallel_limit()
 _WEB_IDLE_TIMEOUT = float(os.environ.get("TRAE_WEB_IDLE_TIMEOUT", "60"))
 _WEB_MODEL_CACHE_TTL = float(os.environ.get("TRAE_WEB_MODEL_CACHE_TTL", "300"))
 _WORKSPACE_PREFIXES = ["User", "home", "workspace", "data"]
