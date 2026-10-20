@@ -17,7 +17,8 @@
 - 源码打包及授权助手专项测试：`50 passed, 6 skipped, 30 subtests passed`。
 - 工具 JSON、多个调用隔离、Messages 严格流和并发容量已补充定向回归测试。
 - 最终全量测试：`986 passed, 6 skipped, 458 subtests passed`。
-- 发布前会在候选镜像上验证健康状态、版本、4 路并发容量和严格工具 JSON 流。
+- 候选镜像已验证健康，版本 `1.0.7`，revision 为发布提交，`in_flight=0`，统一容量为 `4`。
+- DeepSeek `deepseek-v4.1-flash` 严格探针通过：Chat Completions 与 Messages 均返回合法工具 JSON；同一 session 的 4 路并发请求全部成功，观测最大 `in_flight=4`，工具路径未串线。
 
 ## 发布物
 
