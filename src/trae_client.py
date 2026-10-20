@@ -1311,11 +1311,17 @@ def _web_account_key() -> str:
     return uid or (auth.get_token()[:16] or "default")
 
 
+def model_request_parallel_limit() -> int:
+    """Return the shared capacity setting for model and native tool streams."""
+
+    return _WEB_PARALLEL_LIMIT
+
+
 def _web_slot(account_id: str = "") -> asyncio.Semaphore:
     key = account_id or _web_account_key()
     sem = _WEB_SLOTS.get(key)
     if sem is None:
-        sem = asyncio.Semaphore(_WEB_PARALLEL_LIMIT)
+        sem = asyncio.Semaphore(model_request_parallel_limit())
         _WEB_SLOTS[key] = sem
     return sem
 

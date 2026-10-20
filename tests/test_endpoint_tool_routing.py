@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -402,6 +403,91 @@ class ExplicitEndpointToolRoutingTests(unittest.IsolatedAsyncioTestCase):
         fallback_options = remote.await_args.args[3]
         self.assertEqual(fallback_options["tools"], TOOLS)
         self.assertEqual(fallback_options["_remote_agent_type"], "solo_agent_remote")
+
+    async def test_streaming_ide_body_failure_preserves_remote_query_limit_error(self):
+        async def broken_ide_body():
+            raise RuntimeError("IDE body failed before output")
+            yield "unreachable"
+
+        messages = [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,QUJD"},
+            }],
+        }]
+        selected = AsyncMock(
+            return_value=main_module.StreamingResponse(broken_ide_body())
+        )
+        remote = AsyncMock(
+            side_effect=main_module.RemoteQueryTooLarge(2_895_151, 480_000)
+        )
+        with (
+            patch.object(main_module, "UPSTREAM_MODE", "ide"),
+            patch.object(main_module, "_remote_only_models", return_value=set()),
+            patch.object(main_module.auth, "get_polling_status", return_value={"enabled": False}),
+            patch.object(main_module, "run_ide_chat", selected),
+            patch.object(main_module, "_run_remote_with_retry", remote),
+        ):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    messages, "glm-5.2", {"_upstream_mode": "ide"}
+                )
+            ]
+
+        joined = "".join(chunks)
+        events = [
+            json.loads(line[6:])
+            for line in joined.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        errors = [event["error"] for event in events if "error" in event]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["type"], "context_length_exceeded")
+        self.assertEqual(errors[0]["param"], "messages")
+        self.assertIn("configured input limit", errors[0]["message"])
+        self.assertNotIn("IDE body failed", errors[0]["message"])
+        self.assertEqual(joined.count("data: [DONE]"), 1)
+        selected.assert_awaited_once()
+        remote.assert_awaited_once()
+        self.assertEqual(remote.await_args.args[1], "glm-5.2")
+        self.assertEqual(remote.await_args.args[3]["_upstream_fallback_from"], "ide")
+
+    async def test_streaming_initial_query_limit_error_does_not_dispatch_fallback(self):
+        response = main_module.JSONResponse(
+            {
+                "error": {
+                    "message": "Trae remote query exceeds the configured input limit",
+                    "type": "context_length_exceeded",
+                    "param": "messages",
+                }
+            },
+            status_code=413,
+        )
+        dispatch = AsyncMock(return_value=response)
+        with patch.object(main_module, "_dispatch_chat", dispatch):
+            chunks = [
+                chunk
+                async for chunk in main_module._deferred_dispatch_stream(
+                    [{"role": "user", "content": "oversized"}],
+                    "glm-5.2",
+                    {"_upstream_mode": "ide"},
+                )
+            ]
+
+        joined = "".join(chunks)
+        events = [
+            json.loads(line[6:])
+            for line in joined.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        errors = [event["error"] for event in events if "error" in event]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["type"], "context_length_exceeded")
+        self.assertEqual(errors[0]["param"], "messages")
+        self.assertEqual(joined.count("data: [DONE]"), 1)
+        dispatch.assert_awaited_once()
 
     async def test_work_streaming_failure_falls_back_to_remote_before_output(self):
         async def broken_work_body():

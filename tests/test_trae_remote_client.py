@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -1267,6 +1268,170 @@ class RemoteClientTests(unittest.TestCase):
                     480_000,
                 )
                 self.assertIn("older context omitted", bounded[-1]["content"])
+
+    def test_bounded_remote_query_counts_large_images_without_truncating_them(self):
+        image = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + "A" * 600_000},
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "describe"}, image],
+            }
+        ]
+        original = json.dumps(messages)
+        self.assertLess(len(main_module.trae_client.flatten_query(messages)), 1_000)
+
+        with self.assertRaises(main_module.RemoteQueryTooLarge) as raised:
+            main_module._bounded_remote_query(
+                messages, {"trae_remote_query_max_chars": 480_000}
+            )
+
+        self.assertGreater(raised.exception.query_chars, 600_000)
+        self.assertIn("Attached images", str(raised.exception))
+        self.assertEqual(json.dumps(messages), original)
+
+    def test_bounded_remote_query_rejects_image_only_overflow(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "A" * 8_000,
+                        },
+                    }
+                ],
+            }
+        ]
+        with self.assertRaises(main_module.RemoteQueryTooLarge):
+            main_module._bounded_remote_query(
+                messages, {"trae_remote_query_max_chars": 4_000}
+            )
+
+    def test_bounded_remote_query_trims_text_but_preserves_image_data(self):
+        image = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + "A" * 1_000},
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "START\n" + "x" * 10_000 + "\nEND"},
+                    image,
+                ],
+            }
+        ]
+        bounded, removed = main_module._bounded_remote_query(
+            messages, {"trae_remote_query_max_chars": 4_000}
+        )
+
+        self.assertEqual(removed, 0)
+        self.assertLessEqual(
+            len(main_module.trae_client.flatten_query_parts(bounded)), 4_000
+        )
+        self.assertEqual(bounded[0]["content"][-1], image)
+        text = bounded[0]["content"][0]["text"]
+        self.assertIn("START", text)
+        self.assertIn("END", text)
+        self.assertIn("older context omitted", text)
+        parts = json.loads(main_module.trae_client.flatten_query_parts(bounded))
+        media = next(part for part in parts if part["type"] == "image_url")
+        self.assertEqual(media["data"]["data"], "A" * 1_000)
+
+    def test_bounded_remote_query_removes_old_image_turn_as_a_whole(self):
+        latest = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "latest"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                },
+            ],
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + "A" * 8_000},
+                    }
+                ],
+            },
+            latest,
+        ]
+        bounded, removed = main_module._bounded_remote_query(
+            messages, {"trae_remote_query_max_chars": 4_000}
+        )
+        self.assertEqual(removed, 1)
+        self.assertEqual(bounded, [latest])
+        self.assertLessEqual(
+            len(main_module.trae_client.flatten_query_parts(bounded)), 4_000
+        )
+
+    def test_oversized_image_returns_413_before_session_or_account_rotation(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + "A" * 600_000},
+                    }
+                ],
+            }
+        ]
+
+        async def run(stream):
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "jwt-token", "provider_specific": {}},
+                ),
+                patch.object(main_module, "_ensure_model_account_enabled"),
+                patch.object(
+                    main_module.auth, "get_polling_status", return_value={"enabled": True}
+                ),
+                patch.object(main_module, "_polling_retry_limit", return_value=2),
+                patch.object(main_module, "_next_retry_account_snapshot") as rotate,
+                patch.object(
+                    main_module.trae_client, "acquire_web_slot", new=AsyncMock()
+                ) as acquire,
+                patch.object(
+                    main_module.trae_remote_client, "create_session", new=AsyncMock()
+                ) as create,
+                patch.dict(os.environ, {"TRAE_REMOTE_QUERY_MAX_CHARS": "480000"}),
+            ):
+                result = await main_module._dispatch_chat(
+                    messages,
+                    "glm-5.2",
+                    stream,
+                    {
+                        "_upstream_mode": "remote",
+                        "_account_id": "account-1",
+                        "_auth_token": "jwt-token",
+                    },
+                )
+                rotate.assert_not_called()
+                acquire.assert_not_awaited()
+                create.assert_not_awaited()
+                return result
+
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = asyncio.run(run(stream))
+                self.assertEqual(response.status_code, 413)
+                error = json.loads(response.body)["error"]
+                self.assertEqual(error["type"], "context_length_exceeded")
+                self.assertIn("IDE/Solo", error["message"])
 
     def test_short_continuation_retains_active_client_tool_task(self):
         messages = [

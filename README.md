@@ -18,7 +18,7 @@ Trae CN / Trae Solo CN 模型反代。把 Trae 的 Remote / IDE / Work 模型通
 - thinking 与正文分离：思考内容只进 `reasoning_content` / Responses reasoning 事件，不混入正文，且默认压缩为关键结论
 - 思考强度：`reasoning_effort` / `thinking.budget_tokens` 映射到 Trae 原生 `light` / `high` / `extra_high`，按模型声明的档位自动钳制
 - 四个正式可切换上游端点：Remote、Work、Solo、IDE，原生端点失败时可自动回落 Remote
-- 自动路由开关：按请求是否带工具自动选端点（工具走 IDE Agent，纯聊天走 Remote），失败保底回落 Remote
+- 自动路由开关：工具或图片请求走 IDE Agent，纯文字聊天走 Remote；失败可回落 Remote，超限图片保留原端点错误
 - 多账号：网页 OAuth 登录、手动添加凭证、账号模型请求开关（不影响签到）、顺序轮询 / 积分优先轮询、每账号并发槽位与排队
 - 每日签到：一键签到、定时自动签到（控制台开关 + 每日时间，北京时间）、9074 风控自动换设备 ID 并退避重试、后台错峰自动重试
 - 积分与消费记录：统一显示通用积分，按请求记录 tokens、单次积分、状态、思考强度、上下文模式及工具调用
@@ -187,8 +187,8 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_REMOTE_ONLY_MODELS` | 空 | 仅将列出的显式模型强制送往 remote；逗号分隔，`*` 表示全部强制 remote |
 | `TRAE_REMOTE_MAX_MESSAGES` | `500` | remote 会话保留的非系统历史消息上限 |
 | `TRAE_REMOTE_MAX_HISTORY_CHARS` | `480000` | remote 历史文本字符上限（压缩阶段） |
-| `TRAE_REMOTE_QUERY_MAX_CHARS` | `480000` | remote 扁平化 query 的硬上限；上游超过约 500K 字符会静默结束事件流，超限时从最早的非系统消息开始裁剪 |
-| `TRAE_AUTO_ROUTE` | `0` | 自动路由默认值，控制台「自动路由」开关保存后以控制台为准；开启后带 `tools` / `tool_choice` 或工具历史的请求走 IDE Agent，其余走 Remote，失败回落 Remote |
+| `TRAE_REMOTE_QUERY_MAX_CHARS` | `480000` | remote 实际 query（含图片 Base64）的硬上限；上游超过约 500K 字符会静默结束事件流，超限时从最早的非系统消息开始裁剪；仅裁文字，不截断图片，仍超限则在请求上游前返回 413 |
+| `TRAE_AUTO_ROUTE` | `0` | 自动路由默认值，控制台「自动路由」开关保存后以控制台为准；开启后带图片、`tools` / `tool_choice` 或工具历史的请求走 IDE Agent，纯文字聊天走 Remote；失败可回落 Remote，压缩后仍超过 Remote query 上限的图片请求不回落 |
 | `TRAE_AUTO_CHECKIN` | `0` | 定时自动签到默认值，控制台「自动签到」开关保存后以控制台为准 |
 | `TRAE_AUTO_CHECKIN_TIME` | `08:30` | 每日自动签到时间（`HH:MM`，北京时间）；relay 晚于该时间启动时当天会补签一次 |
 | `TRAE_REMOTE_MAX_MODE` | `0` | 默认值，控制台「1M 上下文」开关保存后以控制台为准（写入 `data/accounts.json`，重启后保留）；remote 会话启用 1M Max 模式；对账号配置 `max_mode=true` 的模型注入 `strategy=max` 与 1M/936K/64K 参数，并使用独立的 max 会话 ID |
@@ -206,7 +206,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_WEB_BASE_URL` | `https://trae-api-cn.mchost.guru/api/remote/v1` | remote 上游端点；`remote` 模式按 9router 的 `chat_sessions` + `events` 协议转发 |
 | `TRAE_CODE_BASE_URL` | `https://trae-api-cn.mchost.guru` | TraeCode IDE / Solo 模型网关主机地址；仅填写主机名，relay 自动追加 `/api/ide/v2/llm_raw_chat`。默认失败会在 TraeCode v1 与已知调度主机间重试；显式自定义主机不会被覆盖。旧变量 `TRAE_MODEL_API_HOST` 仍作为兼容别名 |
 | `TRAE_WORK_BASE_URL` | 空 | 旧版 TraeWork raw 诊断链路的可选网关；正常 `work` 请求使用 `TRAE_WEB_BASE_URL` 的 Remote `chat_sessions` |
-| `TRAE_WEB_PARALLEL_LIMIT` | `2` | 每账号最大并行会话数 |
+| `TRAE_WEB_PARALLEL_LIMIT` | `2` | 模型请求并发容量；Web/Remote 按账号限流，Raw/IDE 工具流的模型绑定会话使用相同容量 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
 | `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表合并 Remote 的 Agent / Work / Design 目录与 Solo 原生 `get_detail_param` 目录，保留上游精确大小写并为混合大小写配置提供小写别名，条目带 `endpoint`/`endpoints` 并按端点排序；控制类内部模型会隐藏，保留 `auto`；上游拉取失败时回落内置列表 |
@@ -322,7 +322,7 @@ IDE Agent 使用原生工具协议：schema 放入上游 `tools`，`parameters` 
 
 路由规则：选中的端点总是第一个尝试。`ide` / `solo` / `work`（以及旧别名 `work-agent`）失败时回落 `remote`；Raw 仅在显式内部诊断模式下按兼容逻辑处理。空响应仅在允许重试且未观察到模型活动时可跨端点回落。已收到输出、provider、usage 或工具事件，或返回不可重试错误时，不重放模型请求，避免重复消费。公开流的初始空 delta / 心跳不是模型输出。`TRAE_REMOTE_ONLY_MODELS` 可把指定模型强制送往 remote，`*` 表示全部。
 
-自动路由：在「轮询与设置 → 自动路由」打开开关（或 `POST /api/auto-route {"enabled":true}`）后，每个请求按内容选端点：请求带 `tools` / `tool_choice` / `parallel_tool_calls`，或历史中有工具调用 / 工具结果时走 IDE Agent，否则走 Remote；IDE Agent 失败时按上面的规则回落 Remote。开关开启时预设端点的模式选择不再生效，关闭后恢复预设端点。本地 CLI / TraeWork native 模式不受影响。模型测试页可选「自动路由」单独验证，不需要打开全局开关。
+自动路由：在「轮询与设置 → 自动路由」打开开关（或 `POST /api/auto-route {"enabled":true}`）后，每个请求按内容选端点：请求带图片、`tools` / `tool_choice` / `parallel_tool_calls`，或历史中有工具调用 / 工具结果时走 IDE Agent，纯文字聊天走 Remote；IDE Agent 失败时按上面的规则回落 Remote。图片经 IDE 原生媒体通道发送，不占用 Remote 的扁平化 query 预算；显式指定的模型保持不变。显式指定端点不受自动路由改写；回落前会检查含图片的完整 query，压缩后仍超限则跳过 Remote 并保留原端点错误，小图仍可正常回落。显式选择 Remote 时，超限请求返回 413，不再轮询重放。开关开启时预设端点的模式选择不再生效，关闭后恢复预设端点。本地 CLI / TraeWork native 模式不受影响。模型测试页可选「自动路由」单独验证，不需要打开全局开关。
 
 内部 Raw 诊断端点的 HTTP body 固定为 `config_name`、`conversation_id`、`messages`、`model_name`、`session_id`、`stream` 六个字段，OpenAI 工具字段由 relay 转成系统提示，再把模型文本中的工具调用解析回 OpenAI 事件；个人账号因缺少企业 app config 仍无法通过上游绑定校验。
 
@@ -439,7 +439,7 @@ export ANTHROPIC_MODEL=glm-5.3
 - **端点选择**：不想手动切换时打开「自动路由」；需要工具调用时优先用 IDE Agent 或 Remote。IDE Raw 已从正式控制台和打包预设中移除，个人账号不要选择 `UPSTREAM_MODE=raw`。切换端点或开关后无需重启，立即生效。
 - **截断处理**：relay 不会自动续写或隐式重放模型请求；收到 `finish_reason=length` 或上游提前断流时，由调用端决定是否发起下一轮，避免重复消费和工具回合错乱。
 - **上下文长度**：remote 扁平化 query 约 500K 字符时上游会静默断流，relay 默认在 480K 字符处裁剪最早的历史。长会话建议客户端自行压缩上下文。
-- **并发**：每账号默认 2 个并行会话（`TRAE_WEB_PARALLEL_LIMIT`），多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。
+- **并发**：`TRAE_WEB_PARALLEL_LIMIT` 默认 2；Web/Remote 按账号分配槽位，Raw/IDE 的模型绑定会话使用相同容量，工具流不再固定为单槽。原生请求从打开连接到响应关闭始终占用槽位，取消等待或清理迟到响应不会提前释放或重复释放。多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；Web/Remote 槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。
 - **签到 9074**：9074 是上游风控码。relay 会自动轮换签到设备 ID 并指数退避重试，无需手动反复点击；若长期失败，可在 `TRAE_CHECKIN_DEVICE_IDS_JSON` 中填入真实客户端的设备 ID。
 - **自动签到**：定时签到按顺序逐个账号执行，已签到和无凭证的账号会跳过，账号之间沿用 `TRAE_CHECKIN_INTERVAL_SECONDS` 间隔，遇到 9074 的账号交给后台退避重试。时间以北京时间计算，每天只触发一次定时任务；「立即执行」不会占用当天的定时任务。
 - **用量统计**：缓存 tokens 仅在上游返回时统计，旧记录按 0 计；日期按北京时间划分，最多保留 400 天。

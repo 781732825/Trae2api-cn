@@ -74,7 +74,7 @@ TRAECODE_IDE_FUNCTIONS = {"chat_v3", "builder_v3", "builder_with_mcp_v3"}
 
 @dataclass
 class _RawSessionGate:
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    slots: threading.BoundedSemaphore
     users: int = 0
 
 
@@ -93,23 +93,27 @@ def _unregister_raw_session_gate(session_id: str, gate: _RawSessionGate) -> None
 
 
 async def _acquire_raw_session_gate(session_id: str) -> Callable[[], None]:
-    """Serialize streams that share Trae's model-bound raw conversation."""
+    """Apply the model-request capacity to a model-bound raw conversation."""
+
+    from . import trae_client
 
     with _RAW_SESSION_GATES_LOCK:
         gate = _RAW_SESSION_GATES.get(session_id)
         if gate is None:
-            gate = _RawSessionGate()
+            gate = _RawSessionGate(
+                threading.BoundedSemaphore(trae_client.model_request_parallel_limit())
+            )
             _RAW_SESSION_GATES[session_id] = gate
         gate.users += 1
 
     acquired = False
     try:
-        while not gate.lock.acquire(blocking=False):
+        while not gate.slots.acquire(blocking=False):
             await asyncio.sleep(_RAW_SESSION_GATE_POLL_SECONDS)
         acquired = True
     except BaseException:
         if acquired:
-            gate.lock.release()
+            gate.slots.release()
         _unregister_raw_session_gate(session_id, gate)
         raise
 
@@ -123,7 +127,7 @@ async def _acquire_raw_session_gate(session_id: str) -> Callable[[], None]:
                 return
             released = True
         try:
-            gate.lock.release()
+            gate.slots.release()
         finally:
             _unregister_raw_session_gate(session_id, gate)
 
@@ -2828,8 +2832,8 @@ async def send_raw_chat_request(
     except asyncio.CancelledError:
         # ``to_thread`` cannot cancel a synchronous httpx send already in
         # progress. Close the response as soon as it materializes so the
-        # model-bound gate is still released without allowing an overlapping
-        # request on the same raw conversation.
+        # occupied model-request slot is not made available before the worker
+        # has finished using the raw conversation.
         def close_cancelled_open(task: asyncio.Task[RawChatResponse]) -> None:
             try:
                 wrapped = task.result()

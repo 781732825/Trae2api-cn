@@ -2207,7 +2207,7 @@ def _web_login_html() -> str:
   </div>
   <div id="endpoint-lock-note" class="lock-note" hidden>
     {ic['lock']}
-    <div><strong>自动路由已开启，手动端点选择已锁定。</strong>当前由自动路由决定实际通道：带工具调用走 IDE Agent，纯聊天走 Remote，失败保底回落 Remote。如需手动指定端点，请先在下方关闭自动路由。</div>
+    <div><strong>自动路由已开启，手动端点选择已锁定。</strong>当前由自动路由决定实际通道：工具或图片请求走 IDE Agent，纯文字聊天走 Remote，失败保底回落 Remote。如需手动指定端点，请先在下方关闭自动路由。</div>
   </div>
   <div id="endpoint-fields" class="{endpoint_fields_class}">
   <div class="form-group">
@@ -2253,7 +2253,7 @@ def _web_login_html() -> str:
     <span id="auto-route-state" class="state-pill{auto_route_pill}">{auto_route_state_text}</span>
   </div>
   <div class="switch-row">
-    <div class="switch-text"><strong>启用自动路由</strong><span>工具调用走 IDE Agent，纯聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
+    <div class="switch-text"><strong>启用自动路由</strong><span>工具或图片请求走 IDE Agent，纯文字聊天走 Remote，失败回落 Remote；开启后忽略预设端点的模式</span></div>
     <label class="switch" title="启用自动路由">
       <input type="checkbox" id="auto-route-toggle" {auto_route_checked} onchange="markAutoRouteDirty()" aria-label="启用自动路由"><span class="track"></span>
     </label>
@@ -2303,7 +2303,7 @@ def _web_login_html() -> str:
     <div class="form-group">
       <label for="conn-endpoint">指定上游（测试期间禁止跨端点回落）</label>
     <select id="conn-endpoint">
-        <option value="auto-route">自动路由（工具 IDE Agent / 聊天 Remote）</option>
+        <option value="auto-route">自动路由（工具或图片 IDE Agent / 文字 Remote）</option>
         <option value="remote">Remote / chat_sessions</option>
         <option value="work">TraeWork / chat_sessions（Work tier）</option>
         <option value="solo">TraeCode Solo / llm_raw_chat</option>
@@ -4362,8 +4362,10 @@ async def _deferred_dispatch_stream(
             "native",
             "traework",
         }
+        and _remote_fallback_allowed_for_request(messages, options)
     )
     fallback_attempted = False
+    fallback_input_error_event = None
     task = asyncio.create_task(_dispatch_chat(messages, model, True, options))
     dispatch_claimed = False
     response = None
@@ -4401,7 +4403,7 @@ async def _deferred_dispatch_stream(
     async def try_remote_fallback(reason: str):
         """Open one Remote stream after a native path fails before output."""
 
-        nonlocal fallback_attempted, response
+        nonlocal fallback_attempted, response, fallback_input_error_event
         if not fallback_allowed or fallback_attempted:
             return None
         fallback_attempted = True
@@ -4439,6 +4441,8 @@ async def _deferred_dispatch_stream(
                 requested_mode,
                 _upstream_response_error(fallback),
             )
+            if getattr(fallback, "status_code", 200) == 413:
+                fallback_input_error_event = _stream_error_event(fallback)
             response = fallback
             await close_current()
             return None
@@ -4522,15 +4526,18 @@ async def _deferred_dispatch_stream(
                 yield ": relay-keepalive\n\n"
 
         if getattr(response, "status_code", 200) >= 400:
+            input_too_large = getattr(response, "status_code", 200) == 413
             upstream_error = _upstream_response_error(response) or "http error"
             error_event = _stream_error_event(response)
             await close_current()
-            fallback = await try_remote_fallback(
-                upstream_error
+            fallback = (
+                None
+                if input_too_large
+                else await try_remote_fallback(upstream_error)
             )
             if fallback is None:
                 stream_status = "upstream_error"
-                yield error_event
+                yield fallback_input_error_event or error_event
                 yield "data: [DONE]\n\n"
                 saw_done = True
                 return
@@ -4567,7 +4574,13 @@ async def _deferred_dispatch_stream(
             await close_current()
             fallback = await try_remote_fallback(str(exc))
             if fallback is None:
-                raise
+                if fallback_input_error_event is None:
+                    raise
+                stream_status = "upstream_error"
+                yield fallback_input_error_event
+                yield "data: [DONE]\n\n"
+                saw_done = True
+                return
             response = fallback
             async for chunk in forward_response(response):
                 yield chunk
@@ -7399,7 +7412,9 @@ class RemoteQueryTooLarge(ValueError):
         self.limit = max(0, int(limit))
         super().__init__(
             "Trae remote query exceeds the configured input limit "
-            f"({self.query_chars} > {self.limit} characters after compaction)"
+            f"({self.query_chars} > {self.limit} characters after compaction). "
+            "Attached images count toward this limit; reduce the input size "
+            "or use the IDE/Solo endpoint for larger image payloads."
         )
 
 
@@ -7412,7 +7427,7 @@ def _bounded_remote_query(
     Trae's remote session silently ends the event stream (no text, no ``done``)
     when initial_message.query exceeds roughly 500k chars.  Keep the system
     prompt and the newest turns intact and drop the oldest conversation from
-    the front until ``flatten_query`` is under the configured cap.
+    the front until the complete wire query, including images, fits the cap.
     """
 
     raw_limit = _raw_history_limit_int(
@@ -7426,7 +7441,7 @@ def _bounded_remote_query(
     bounded = [dict(m) for m in messages]
     removed = 0
     while True:
-        query = trae_client.flatten_query(bounded)
+        query = trae_client.flatten_query_parts(bounded)
         if len(query) <= raw_limit:
             return bounded, removed
         non_system = [
@@ -7457,7 +7472,7 @@ def _bounded_remote_query(
     # account and end with a burst of 502 responses.  Clamp message content as
     # a final step so a single large turn cannot bypass the upstream limit.
     bounded = _fit_remote_query_contents(bounded, raw_limit)
-    final_query_chars = len(trae_client.flatten_query(bounded))
+    final_query_chars = len(trae_client.flatten_query_parts(bounded))
     if final_query_chars > raw_limit:
         # Never send a request that the provider is known to accept only
         # partially. A non-text tool payload or an intentionally tiny custom
@@ -7466,6 +7481,29 @@ def _bounded_remote_query(
         # deterministic client error from being replayed on every account.
         raise RemoteQueryTooLarge(final_query_chars, raw_limit)
     return bounded, removed
+
+
+def _remote_fallback_allowed_for_request(
+    messages: Optional[list[Mapping[str, Any]]],
+    options: Optional[Mapping[str, Any]],
+) -> bool:
+    """Return whether a native failure may safely retry the request on Remote.
+
+    Remote can compact ordinary conversation history, but an image attachment
+    is intentionally kept intact.  When that attachment alone leaves the
+    flattened query above Remote's hard input cap, retrying the same payload
+    would only replace a useful IDE error with a deterministic 413 (and may
+    replay it across polling accounts).  Text, tool requests, and images that
+    fit after compaction retain the normal fallback behavior.
+    """
+
+    if not images.messages_have_images(messages):
+        return True
+    try:
+        _bounded_remote_query(messages or [], options or {})
+    except RemoteQueryTooLarge:
+        return False
+    return True
 
 
 _REMOTE_QUERY_TRUNCATION_MARKER = (
@@ -7496,7 +7534,7 @@ def _truncate_remote_text(text: str, limit: int) -> str:
 
 
 def _remote_message_text(message: Mapping[str, Any]) -> str:
-    """Return the text that ``flatten_query`` contributes for one message."""
+    """Return the trimmable text, excluding intact image attachments."""
 
     content = message.get("content")
     if content in (None, "", []) and not message.get("tool_calls"):
@@ -7505,7 +7543,7 @@ def _remote_message_text(message: Mapping[str, Any]) -> str:
             if candidate not in (None, "", [], {}):
                 content = candidate
                 break
-    return raw_client._content_to_text(content)
+    return raw_client._content_to_text(raw_client._without_native_images(content))
 
 
 def _truncate_remote_message(
@@ -7514,14 +7552,28 @@ def _truncate_remote_message(
 ) -> dict[str, Any]:
     """Copy one message while bounding its text contribution.
 
-    Structured content is converted to text only when it must be truncated.
-    Tool call metadata remains on the message so the caller-owned tool history
-    is still represented in the compacted prompt.
+    Image attachments and tool call metadata remain intact. Only text may be
+    shortened; an attachment that cannot fit must produce an explicit error.
     """
 
     updated = dict(message)
     text = _remote_message_text(message)
-    updated["content"] = _truncate_remote_text(text, content_limit)
+    truncated = _truncate_remote_text(text, content_limit)
+    content = message.get("content")
+    attachments = (
+        [
+            part
+            for part in content
+            if isinstance(part, Mapping) and images.is_image_part(part)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    updated["content"] = (
+        [{"type": "text", "text": truncated}, *attachments]
+        if attachments
+        else truncated
+    )
     for key in ("parts", "text", "prompt", "message", "input"):
         if key in updated and key != "content":
             updated.pop(key, None)
@@ -7537,8 +7589,8 @@ def _fit_remote_query_contents(
     if raw_limit <= 0:
         return messages
     bounded = [dict(message) for message in messages]
-    while len(trae_client.flatten_query(bounded)) > raw_limit:
-        before_query_chars = len(trae_client.flatten_query(bounded))
+    while len(trae_client.flatten_query_parts(bounded)) > raw_limit:
+        before_query_chars = len(trae_client.flatten_query_parts(bounded))
         candidates = sorted(
             (
                 (index, len(_remote_message_text(message)))
@@ -7560,7 +7612,7 @@ def _fit_remote_query_contents(
             candidate = _truncate_remote_message(current, middle)
             probe = list(bounded)
             probe[index] = candidate
-            if len(trae_client.flatten_query(probe)) <= raw_limit:
+            if len(trae_client.flatten_query_parts(probe)) <= raw_limit:
                 best = candidate
                 low = middle + 1
             else:
@@ -7573,7 +7625,7 @@ def _fit_remote_query_contents(
                 max(1, min(text_length, len(_REMOTE_QUERY_TRUNCATION_MARKER))),
             )
         bounded[index] = best
-        if len(trae_client.flatten_query(bounded)) >= before_query_chars:
+        if len(trae_client.flatten_query_parts(bounded)) >= before_query_chars:
             # Avoid spinning forever when a non-text tool payload alone is
             # larger than the configured budget.  The normal cap leaves ample
             # room for tool metadata; this is only a defensive escape hatch
@@ -8255,11 +8307,11 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
     prepared_messages, omitted_history = raw_client._compact_raw_history(
         prepared_messages, compact_options
     )
-    query_chars_before_bound = len(trae_client.flatten_query(prepared_messages))
+    query_chars_before_bound = len(trae_client.flatten_query_parts(prepared_messages))
     prepared_messages, query_trimmed = _bounded_remote_query(
         prepared_messages, compact_options
     )
-    query_chars_after_bound = len(trae_client.flatten_query(prepared_messages))
+    query_chars_after_bound = len(trae_client.flatten_query_parts(prepared_messages))
     if omitted_history:
         logger.info(
             "remote history compacted input_messages=%d output_messages=%d omitted=%d",
@@ -10857,9 +10909,9 @@ def _apply_auto_route(
 
     Auto routing runs when the caller asked for ``auto-route`` explicitly, or
     when the console switch is on and the request carries no explicit
-    endpoint.  Tool requests (tool definitions or tool history) go to IDE
-    Agent, plain chat goes to Remote; the dispatcher's existing fallback then
-    lands on Remote if the chosen endpoint fails.
+    endpoint. Tool and image requests go to IDE Agent, where media travels
+    natively instead of inflating Remote's flattened query. Plain text chat
+    goes to Remote; the existing dispatcher owns endpoint fallback.
     """
 
     options = dict(options or {})
@@ -10877,9 +10929,14 @@ def _apply_auto_route(
         ):
             return options
     uses_tools = _tool_protocol_requested(options, messages)
-    endpoint = AUTO_ROUTE_TOOL_ENDPOINT if uses_tools else AUTO_ROUTE_CHAT_ENDPOINT
+    has_images = images.messages_have_images(messages)
+    endpoint = (
+        AUTO_ROUTE_TOOL_ENDPOINT
+        if uses_tools or has_images
+        else AUTO_ROUTE_CHAT_ENDPOINT
+    )
     options["_upstream_mode"] = endpoint
-    options["_auto_route"] = "tools" if uses_tools else "chat"
+    options["_auto_route"] = "tools" if uses_tools else "images" if has_images else "chat"
     trace = options.get("_upstream_trace")
     if isinstance(trace, dict):
         trace.update(auto_route=True, auto_route_reason=options["_auto_route"])
@@ -11147,10 +11204,34 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         "native",
         "traework",
     }
+    remote_fallback_allowed = (
+        fallback_enabled
+        and _remote_fallback_allowed_for_request(messages, options)
+    )
     if fallback_enabled and active_mode in ("raw", "direct"):
         modes.append("ide")
-    if fallback_enabled and active_mode in fallback_modes and "remote" not in modes:
+    if (
+        remote_fallback_allowed
+        and active_mode in fallback_modes
+        and "remote" not in modes
+    ):
         modes.append("remote")
+    elif (
+        fallback_enabled
+        and active_mode in fallback_modes
+        and "remote" not in modes
+        and images.messages_have_images(messages)
+    ):
+        # Preserve the native endpoint error when the image cannot fit Remote
+        # even after history compaction; retrying would only produce a
+        # deterministic 413 and may rotate the same payload through accounts.
+        logger.info(
+            "skip remote fallback for oversized image request id=%s mode=%s",
+            str(options.get("_relay_request_id") or ""),
+            active_mode,
+        )
+        if isinstance(trace, dict):
+            trace["fallback_skipped"] = "remote_query_limit"
     route_initial_mode = modes[0] if modes else active_mode
     raw_skipped = False
     if (
