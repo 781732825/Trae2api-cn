@@ -1109,14 +1109,34 @@ def _string_or_empty(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _json_default(value: Any) -> Any:
+    """Keep tool arguments JSON-shaped when adapters leak Python values."""
+
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=repr)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _stringify_tool_arguments(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=_json_default,
+        )
     if value is None:
         return "{}"
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    )
 
 
 def _stable_tool_id(name: str, arguments: str, index: int = 0) -> str:

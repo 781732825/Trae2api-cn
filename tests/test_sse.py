@@ -129,6 +129,55 @@ def _parse_chunks(chunks):
 
 
 class TranslateCliStreamTests(unittest.TestCase):
+    def test_openai_chunk_normalizes_nested_sets_deterministically(self):
+        chunk = sse.openai_chunk(
+            "chatcmpl-test",
+            "deepseek-v4",
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "function": {
+                            "name": "read_file",
+                            "metadata": {"capabilities": {"read", "search"}},
+                        },
+                    }
+                ]
+            },
+            usage={"labels": {"tool", "stream"}},
+        )
+
+        payload = json.loads(chunk[6:].strip())
+        metadata = payload["choices"][0]["delta"]["tool_calls"][0]["function"][
+            "metadata"
+        ]
+        self.assertEqual(metadata["capabilities"], ["read", "search"])
+        self.assertEqual(payload["usage"]["labels"], ["stream", "tool"])
+
+    def test_openai_completion_normalizes_sets_in_tool_payload(self):
+        response = sse.openai_completion(
+            "chatcmpl-test",
+            "deepseek-v4",
+            None,
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"paths": {"README.md", "pyproject.toml"}},
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(
+            response["choices"][0]["message"]["tool_calls"][0]["function"][
+                "arguments"
+            ]["paths"],
+            ["README.md", "pyproject.toml"],
+        )
+
     def test_provider_qualified_deepseek_model_matches_requested_family(self):
         sse._check_provider_model("DeepSeek-V4-Pro", "ali-deepseek-v4-pro")
 

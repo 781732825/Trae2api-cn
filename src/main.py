@@ -983,7 +983,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -8440,6 +8440,9 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                             _track_usage_from_exception(exc, model)
                         polling_retry_enabled = bool(
                             auth.get_polling_status().get("enabled")
+                            and not options.get(
+                                "_disable_remote_stream_account_retry"
+                            )
                         )
                         if (
                             not exc_retryable
@@ -9333,6 +9336,231 @@ async def _run_web_with_retry(
     return await run_web_session(messages, model, stream, options)
 
 
+async def _run_remote_stream_with_retry(
+    messages,
+    model,
+    options: Optional[dict] = None,
+    *,
+    tracker: Optional[_UsageTracker] = None,
+):
+    """Keep a streaming Remote request inside the polling-account retry loop.
+
+    ``run_remote_session(..., stream=True)`` returns before its body iterator
+    is consumed.  Consequently the ordinary ``_run_remote_with_retry`` loop
+    cannot observe a first-event timeout or an early Remote error: by then it
+    has already returned the ``StreamingResponse`` to Starlette.  This wrapper
+    owns the body iterator and rotates credentials when an attempt ends before
+    model output.  Each nested attempt disables its own account rotation so
+    there is one bounded retry loop and no duplicate account/slot ownership.
+    """
+
+    options = dict(options or {})
+    if not auth.get_polling_status().get("enabled"):
+        return await run_remote_session(messages, model, True, options)
+
+    attempts = _polling_retry_limit(options)
+    attempted_accounts: set[str] = set()
+    current_options = dict(options)
+
+    def _account_key(attempt_index: int) -> str:
+        return _retry_account_key(current_options, attempt_index)
+
+    def _runtime_retry_reason(error: BaseException) -> Optional[str]:
+        lowered = str(error).lower()
+        if (
+            "remote model is not available for the bound account" in lowered
+            or "model binding mismatch" in lowered
+        ):
+            return "model unavailable"
+        if "parallel" in lowered or "429" in lowered:
+            return "parallel limit"
+        return None
+
+    async def rotate_account(reason: str, attempt_index: int) -> bool:
+        nonlocal current_options
+        next_snapshot = _next_retry_account_snapshot(
+            attempted_accounts, max(1, attempts)
+        )
+        if next_snapshot is None:
+            return False
+        account_id, record = next_snapshot
+        token = str(record.get("token") or "")
+        billing_id = _account_id_from_token(token) or account_id
+        provider_specific = (
+            record.get("provider_specific")
+            or record.get("providerSpecificData")
+            or {}
+        )
+        current_options = dict(current_options)
+        current_options["_account_id"] = account_id
+        current_options["_billing_id"] = billing_id
+        current_options["_auth_token"] = token
+        current_options["_auth_user_id"] = billing_id
+        if isinstance(provider_specific, Mapping):
+            current_options["provider_specific"] = dict(provider_specific)
+        if tracker is not None:
+            await tracker.rebind(current_options)
+        _rebind_chat_session_account(
+            str(
+                current_options.get("session_id")
+                or current_options.get("sessionId")
+                or ""
+            ),
+            account_id,
+            billing_id,
+            token,
+            provider_specific,
+        )
+        logger.warning(
+            "remote stream %s; rotating account attempt=%d/%d account=%s",
+            reason,
+            attempt_index + 1,
+            attempts,
+            account_id,
+        )
+        return True
+
+    async def close_response(response) -> None:
+        iterator = getattr(response, "body_iterator", None)
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
+
+    # Open the first session before returning so deterministic request errors
+    # (notably RemoteQueryTooLarge -> HTTP 413) keep their status code instead
+    # of being deferred into a 200 streaming wrapper.  Creation failures are
+    # handled here too because the response body has not reached Starlette yet.
+    initial_response = None
+    initial_response_started = False
+    initial_response_closed = False
+    initial_attempt_index = 0
+    for initial_attempt_index in range(max(1, attempts)):
+        account_key = _account_key(initial_attempt_index)
+        if account_key in attempted_accounts:
+            break
+        attempted_accounts.add(account_key)
+        initial_options = dict(current_options)
+        initial_options["_disable_remote_stream_account_retry"] = True
+        try:
+            initial_response = await run_remote_session(
+                messages, model, True, initial_options
+            )
+            break
+        except RemoteQueryTooLarge:
+            raise
+        except (
+            EmptyUpstreamResponse,
+            trae_remote_client.RemoteFirstEventTimeout,
+        ) as exc:
+            if (
+                not bool(getattr(exc, "retryable", True))
+                or initial_attempt_index + 1 >= max(1, attempts)
+                or not await rotate_account(
+                    "empty upstream response", initial_attempt_index
+                )
+            ):
+                raise
+        except RuntimeError as exc:
+            reason = _runtime_retry_reason(exc)
+            if (
+                reason is None
+                or initial_attempt_index + 1 >= max(1, attempts)
+                or not await rotate_account(reason, initial_attempt_index)
+            ):
+                raise
+    if initial_response is None:
+        raise RuntimeError("remote stream retry ended without a response")
+
+    async def gen():
+        nonlocal current_options, initial_response_started
+        attempt_index = initial_attempt_index
+        response = initial_response
+        while True:
+            account_key = _account_key(attempt_index)
+            if account_key not in attempted_accounts:
+                attempted_accounts.add(account_key)
+            elif attempt_index != initial_attempt_index:
+                break
+            local_options = dict(current_options)
+            # The outer wrapper is the sole owner of account rotation.  The
+            # inner session may still perform its same-account Agent -> Work
+            # fallback, but must not start a second account loop.
+            local_options["_disable_remote_stream_account_retry"] = True
+            try:
+                if attempt_index == initial_attempt_index:
+                    initial_response_started = True
+                if attempt_index != initial_attempt_index:
+                    response = await run_remote_session(
+                        messages, model, True, local_options
+                    )
+                iterator = getattr(response, "body_iterator", None)
+                if iterator is None:
+                    body = getattr(response, "body", b"")
+                    if body:
+                        yield (
+                            body.decode("utf-8", errors="replace")
+                            if isinstance(body, bytes)
+                            else str(body)
+                        )
+                    return
+                async for chunk in iterator:
+                    yield chunk
+                return
+            except asyncio.CancelledError:
+                raise
+            except RemoteQueryTooLarge:
+                # Request-size errors are deterministic and cannot be repaired
+                # by another account.
+                raise
+            except (
+                EmptyUpstreamResponse,
+                trae_remote_client.RemoteFirstEventTimeout,
+            ) as exc:
+                if not bool(getattr(exc, "retryable", True)):
+                    raise
+                if attempt_index + 1 >= max(1, attempts):
+                    raise
+                if not await rotate_account("empty upstream response", attempt_index):
+                    raise
+                attempt_index += 1
+                continue
+            except RuntimeError as exc:
+                reason = _runtime_retry_reason(exc)
+                if reason is None:
+                    raise
+                if attempt_index + 1 >= max(1, attempts):
+                    raise
+                if not await rotate_account(
+                    reason,
+                    attempt_index,
+                ):
+                    raise
+                attempt_index += 1
+                continue
+            finally:
+                # A failed nested stream normally runs its own generator
+                # cleanup.  Explicitly closing the wrapper prevents a
+                # transport-specific iterator from retaining the slot.
+                if response is not None:
+                    await close_response(response)
+
+    async def close_unconsumed_initial_response() -> None:
+        nonlocal initial_response_closed
+        if initial_response_started or initial_response_closed:
+            return
+        initial_response_closed = True
+        await close_response(initial_response)
+
+    return StreamingResponse(
+        _SessionStreamIterator(gen(), close_unconsumed_initial_response),
+        media_type="text/event-stream",
+        headers=_sse_headers(),
+    )
+
+
 async def _run_remote_with_retry(
     messages,
     model,
@@ -9343,6 +9571,10 @@ async def _run_remote_with_retry(
 ):
     """Retry 9router-style remote sessions on the provider's parallel limit."""
     tracker = tracker or _USAGE_TRACKER.get()
+    if stream and auth.get_polling_status().get("enabled"):
+        return await _run_remote_stream_with_retry(
+            messages, model, options, tracker=tracker
+        )
     if auth.get_polling_status().get("enabled"):
         attempts = _polling_retry_limit(options)
         attempted_accounts: set[str] = set()
@@ -9481,7 +9713,13 @@ async def _run_ide_stream_with_retry(
     if not polling.get("enabled"):
         return await run_ide_chat(messages, model, True, options)
 
-    attempts = min(2, _polling_retry_limit(options))
+    # A rate-limit response is account-scoped.  The old hard cap of two
+    # attempts made a large polling pool effectively useless: after the first
+    # account and one fallback account both returned 4011/429, the request was
+    # surfaced as a 502 even when other enabled accounts were idle.  Rotate
+    # through every usable account once, while retaining the pre-output-only
+    # replay guard below.
+    attempts = _polling_retry_limit(options)
     attempted_accounts: set[str] = set()
 
     async def rotate_account() -> bool:
@@ -9649,7 +9887,10 @@ async def _run_ide_with_retry(
     if not polling.get("enabled"):
         return await run_ide_chat(messages, model, stream, options)
 
-    attempts = min(2, _polling_retry_limit(options))
+    # Keep non-stream and stream native requests consistent.  Both paths may
+    # safely replay only before model output, but neither should stop after an
+    # arbitrary two-account prefix when polling has more usable credentials.
+    attempts = _polling_retry_limit(options)
     attempted_accounts: set[str] = set()
     for attempt_index in range(max(1, attempts)):
         account_key = _retry_account_key(options, attempt_index)

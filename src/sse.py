@@ -497,6 +497,83 @@ def estimate_tokens(text: str) -> int:
     return max(1, int(total + 0.999))
 
 
+def _json_sort_key(value: Any) -> str:
+    """Return a stable key for values originating in unordered containers."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        # Values accepted by `_json_safe` are JSON-compatible after
+        # normalization.  This fallback is only used while ordering a set
+        # whose members have not yet been normalized.
+        return repr(value)
+
+
+def _json_safe(value: Any, *, _active: Optional[set[int]] = None) -> Any:
+    """Normalize stream payloads before crossing the JSON serialization edge.
+
+    Upstream adapters are expected to return JSON values, but tool metadata can
+    pass through Python sets (for example a set of capability names).  A set
+    cannot be encoded by ``json.dumps`` and previously aborted the public SSE
+    generator after the model had already started producing output.  Keep
+    mappings and scalar values intact, and represent unordered containers as
+    deterministic lists so retries and client-visible tool deltas stay stable.
+    """
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if _active is None:
+        _active = set()
+    if isinstance(value, Mapping):
+        marker = id(value)
+        if marker in _active:
+            raise TypeError("circular value is not JSON serializable")
+        _active.add(marker)
+        try:
+            normalized: dict[Any, Any] = {}
+            for key, item in value.items():
+                if isinstance(key, (str, int, float, bool)) or key is None:
+                    safe_key = key
+                else:
+                    # JSON object keys cannot be tuples or arbitrary objects.
+                    # Convert only the key; values retain their native shape.
+                    safe_key = _json_sort_key(_json_safe(key, _active=_active))
+                normalized[safe_key] = _json_safe(item, _active=_active)
+            return normalized
+        finally:
+            _active.remove(marker)
+    if isinstance(value, (set, frozenset)):
+        marker = id(value)
+        if marker in _active:
+            raise TypeError("circular value is not JSON serializable")
+        _active.add(marker)
+        try:
+            items = [_json_safe(item, _active=_active) for item in value]
+        finally:
+            _active.remove(marker)
+        return sorted(items, key=_json_sort_key)
+    if isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in _active:
+            raise TypeError("circular value is not JSON serializable")
+        _active.add(marker)
+        try:
+            return [_json_safe(item, _active=_active) for item in value]
+        finally:
+            _active.remove(marker)
+    # The stream boundary must remain alive even when an adapter leaks a
+    # Python-only scalar (bytes, Decimal, Enum, etc.).  Preserve the value's
+    # readable representation rather than aborting a model turn that already
+    # has public output.
+    return str(value)
+
+
 def openai_chunk(
     prefix_id: str,
     model: str,
@@ -519,7 +596,7 @@ def openai_chunk(
         chunk["error"] = error
     if provider_model_name:
         chunk["provider_model_name"] = provider_model_name
-    return "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+    return "data: " + json.dumps(_json_safe(chunk), ensure_ascii=False) + "\n\n"
 
 
 def openai_completion(
@@ -572,7 +649,7 @@ def openai_completion(
     }
     if provider_model_name:
         resp["provider_model_name"] = provider_model_name
-    return resp
+    return _json_safe(resp)
 
 
 def _map_usage(usage: Any) -> Optional[dict]:

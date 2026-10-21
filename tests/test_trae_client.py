@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import threading
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace
@@ -890,6 +891,113 @@ class ConvertOpenAiMessagesTests(unittest.TestCase):
 
 
 class IdeRequestContextTests(unittest.TestCase):
+    def test_legacy_ide_response_holds_shared_slot_until_close(self):
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                self.closed = True
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+                self.response = None
+
+            def build_request(self, *args, **kwargs):
+                return (args, kwargs)
+
+            def send(self, request, stream=True):
+                self.response = FakeResponse()
+                return self.response
+
+            def close(self):
+                self.closed = True
+
+        with (
+            patch.object(trae_client, "_WEB_SLOTS", {}),
+            patch.object(trae_client, "_WEB_PARALLEL_LIMIT", 1),
+            patch(
+                "src.trae_client.auth.get_account_record",
+                return_value={"user_id": "acct"},
+            ),
+            patch("src.trae_client.auth.get_auth", return_value=SimpleNamespace(host="https://example.test")),
+            patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+            patch("src.trae_client.build_headers", return_value={}),
+        ):
+            response = asyncio.run(
+                trae_client.send_chat_request(
+                    [{"role": "user", "content": "hello"}],
+                    "auto",
+                    True,
+                    {"_account_id": "acct", "_auth_token": "bound-token"},
+                )
+            )
+            sem = trae_client._WEB_SLOTS["acct"]
+            self.assertTrue(sem.locked())
+            response.close()
+            response.close()
+            self.assertFalse(sem.locked())
+
+    def test_legacy_ide_cancel_waits_for_sync_send_before_releasing_slot(self):
+        started = threading.Event()
+        finish = threading.Event()
+
+        class FakeResponse:
+            status_code = 200
+
+            def close(self):
+                self.closed = True
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.headers = kwargs["headers"]
+
+            def build_request(self, *args, **kwargs):
+                return (args, kwargs)
+
+            def send(self, request, stream=True):
+                started.set()
+                finish.wait(2)
+                return FakeResponse()
+
+            def close(self):
+                self.closed = True
+
+        async def exercise():
+            with (
+                patch.object(trae_client, "_WEB_SLOTS", {}),
+                patch.object(trae_client, "_WEB_PARALLEL_LIMIT", 1),
+                patch(
+                    "src.trae_client.auth.get_account_record",
+                    return_value={"user_id": "acct"},
+                ),
+                patch("src.trae_client.auth.get_auth", return_value=SimpleNamespace(host="https://example.test")),
+                patch("src.trae_client.httpx.Client", side_effect=FakeClient),
+                patch("src.trae_client.build_headers", return_value={}),
+            ):
+                task = asyncio.create_task(
+                    trae_client.send_chat_request(
+                        [{"role": "user", "content": "hello"}],
+                        "auto",
+                        True,
+                        {"_account_id": "acct", "_auth_token": "bound-token"},
+                    )
+                )
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                sem = trae_client._WEB_SLOTS["acct"]
+                self.assertTrue(sem.locked())
+                finish.set()
+                for _ in range(100):
+                    if not sem.locked():
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertFalse(sem.locked())
+
+        asyncio.run(exercise())
+
     def test_runtime_prompt_uses_inherited_response_tools(self):
         messages = trae_client._messages_with_client_runtime(
             [{"role": "user", "content": "继续"}],

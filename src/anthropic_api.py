@@ -43,6 +43,47 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _repair_json_arguments(arguments: str) -> str:
+    """Close a safely truncated JSON object before emitting Messages blocks."""
+
+    if not arguments:
+        return arguments
+    try:
+        json.loads(arguments)
+        return arguments
+    except (TypeError, ValueError):
+        pass
+    repaired = arguments.rstrip()
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in repaired:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]":
+            if stack:
+                stack.pop()
+    if in_string:
+        repaired += '"'
+    for opener in reversed(stack):
+        repaired += {"{": "}", "[": "]"}[opener]
+    try:
+        json.loads(repaired)
+    except (TypeError, ValueError):
+        return arguments
+    return repaired
+
+
 def _text_from_blocks(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -559,24 +600,49 @@ async def translate_chat_stream(
         # The Chat Completions layer already resolves native snapshots and
         # replays. Its arguments field is a true delta; prefix heuristics here
         # would silently drop valid repeated braces inside a JSON string.
+        # Remote/Web adapters can still expose a cumulative snapshot, however.
+        # Recognize only the unambiguous prefix/replay forms so a snapshot is
+        # not concatenated into an invalid ``{...}{...}`` tool input.
+        if previous and value.startswith(previous) and len(value) > len(previous):
+            state["arguments"] = value
+            return value[len(previous):]
+        if previous and previous.startswith(value):
+            try:
+                json.loads(value)
+            except (TypeError, ValueError):
+                pass
+            else:
+                return ""
         state["arguments"] = previous + value
         return value
 
-    def tool_input_error() -> str:
+    def tool_input_error() -> tuple[str, list[tuple[int, str]]]:
+        repaired_deltas: list[tuple[int, str]] = []
         for state in tools:
             arguments = str(state.get("arguments") or "")
             if not arguments.strip():
                 continue
+            repaired = _repair_json_arguments(arguments)
+            if repaired != arguments:
+                state["arguments"] = repaired
+                repaired_deltas.append(
+                    (int(state["block_index"]), repaired[len(arguments) :])
+                )
+                arguments = repaired
             try:
                 parsed = json.loads(arguments)
             except (TypeError, ValueError):
                 return (
                     f"Tool input for {state['name']} is invalid JSON: "
-                    "upstream tool arguments ended before a complete object"
+                    "upstream tool arguments ended before a complete object",
+                    repaired_deltas,
                 )
             if not isinstance(parsed, Mapping):
-                return f"Tool input for {state['name']} must be a JSON object"
-        return ""
+                return (
+                    f"Tool input for {state['name']} must be a JSON object",
+                    repaired_deltas,
+                )
+        return "", repaired_deltas
 
     def close_blocks() -> list[str]:
         events: list[str] = []
@@ -686,10 +752,25 @@ async def translate_chat_stream(
     def terminal_events() -> list[str]:
         """Build the Anthropic terminal envelope exactly once."""
 
-        input_error = tool_input_error()
+        input_error, repaired_deltas = tool_input_error()
+        events: list[str] = []
+        for index, delta in repaired_deltas:
+            if delta:
+                events.append(
+                    _event(
+                        "content_block_delta",
+                        {
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": delta,
+                            },
+                        },
+                    )
+                )
         if input_error:
-            return [error_event(input_error)]
-        events = close_blocks()
+            return [*events, error_event(input_error)]
+        events.extend(close_blocks())
         if not started:
             events.extend(open_message())
             events.extend(close_blocks())
@@ -801,7 +882,19 @@ async def translate_chat_stream(
     # A final finish-reason frame is sufficient evidence of completion if a
     # proxy drops only the trailing [DONE]. Without it, report a broken stream
     # instead of presenting a partial response as a successful end_turn.
-    input_error = tool_input_error()
+    input_error, repaired_deltas = tool_input_error()
+    for index, delta in repaired_deltas:
+        if delta:
+            yield _event(
+                "content_block_delta",
+                {
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": delta,
+                    },
+                },
+            )
     if input_error:
         yield error_event(input_error)
         return

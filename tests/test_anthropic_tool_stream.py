@@ -436,6 +436,68 @@ class AnthropicTranslatorToolStreamTests(unittest.TestCase):
         self.assertNotIn("message_stop", event_types)
         self.assertIn("invalid JSON", events[-1]["error"]["message"])
 
+    def test_cumulative_argument_snapshots_are_not_concatenated(self):
+        async def stream():
+            yield _openai_chunk(
+                [
+                    {
+                        "index": 0,
+                        "id": "call_snapshot",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"',
+                        },
+                    }
+                ]
+            )
+            yield _openai_chunk(
+                [
+                    {
+                        "index": 0,
+                        "function": {
+                            "arguments": '{"path":"README.md"}',
+                        },
+                    }
+                ]
+            )
+            yield _openai_chunk(finish_reason="tool_calls")
+            yield "data: [DONE]\n\n"
+
+        events = asyncio.run(
+            _collect_payloads(anthropic_api.translate_chat_stream(stream(), "deepseek"))
+        )
+
+        self.assertEqual(
+            _closed_tool_inputs(events), {"call_snapshot": {"path": "README.md"}}
+        )
+
+    def test_truncated_json_is_closed_before_messages_block_stop(self):
+        async def stream():
+            yield _openai_chunk(
+                [
+                    {
+                        "index": 0,
+                        "id": "call_truncated",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"README.md"',
+                        },
+                    }
+                ]
+            )
+            yield _openai_chunk(finish_reason="tool_calls")
+            yield "data: [DONE]\n\n"
+
+        events = asyncio.run(
+            _collect_payloads(anthropic_api.translate_chat_stream(stream(), "deepseek"))
+        )
+
+        self.assertEqual(
+            _closed_tool_inputs(events),
+            {"call_truncated": {"path": "README.md"}},
+        )
+        self.assertEqual(events[-1]["type"], "message_stop")
+
     def test_nonstream_invalid_arguments_are_not_hidden_in_raw_wrapper(self):
         completion = {
             "choices": [

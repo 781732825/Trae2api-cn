@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from fastapi.responses import StreamingResponse
 
 from src import trae_remote_client
 from src import main as main_module
@@ -142,6 +143,59 @@ class RemoteClientTests(unittest.TestCase):
         self.assertEqual(body["initial_message"]["agent_id"], "solo_agent_remote")
         self.assertEqual(body["initial_message"]["model_selection_strategy"], "auto")
         self.assertIn("hello", body["initial_message"]["query"])
+
+    def test_create_session_normalizes_nested_non_json_values(self):
+        async def run():
+            client = _Client()
+            custom = {
+                "name": "glm-5.3",
+                "config_name": "glm-5.3",
+                "model_name": "glm-5.3",
+                "config_source": 1,
+                "adapter_metadata": {
+                    "flags": {"zeta", "alpha"},
+                    "limits": frozenset({3, 1}),
+                    "raw": b"legacy",
+                },
+            }
+            with patch.object(
+                trae_remote_client.trae_client,
+                "resolve_model_config",
+                new=AsyncMock(return_value=custom),
+            ):
+                await trae_remote_client.create_session(
+                    client,
+                    "jwt-token",
+                    "glm-5.3",
+                    [{"role": "user", "content": "hello"}],
+                    options={
+                        "_trae_common_params": {
+                            "adapter_flags": {"zeta", "alpha"},
+                        }
+                    },
+                )
+            return client.posts[0][1]["json"]
+
+        body = asyncio.run(run())
+        # The exact object sent to the transport must be JSON encodable and
+        # must use stable ordering for set values.
+        self.assertEqual(
+            body["initial_message"]["custom_model"]["adapter_metadata"]["flags"],
+            ["alpha", "zeta"],
+        )
+        self.assertEqual(
+            body["initial_message"]["custom_model"]["adapter_metadata"]["limits"],
+            [1, 3],
+        )
+        self.assertEqual(
+            body["initial_message"]["custom_model"]["adapter_metadata"]["raw"],
+            "b'legacy'",
+        )
+        self.assertEqual(
+            json.loads(body["initial_message"]["common_params"])["adapter_flags"],
+            ["alpha", "zeta"],
+        )
+        self.assertEqual(json.loads(json.dumps(body)), body)
 
     def test_work_mode_sends_work_executor_type(self):
         async def run():
@@ -1120,6 +1174,141 @@ class RemoteClientTests(unittest.TestCase):
             ["account-a", "account-b"],
         )
         self.assertEqual(release_calls, ["account-a", "account-b"])
+
+    def test_stream_retry_rotates_after_same_account_work_fallback_is_empty(self):
+        """Body-level stream failures must reach every enabled account once."""
+
+        async def run():
+            calls = []
+            rotations = iter(
+                [
+                    ("account-b", {"token": "token-b"}),
+                    ("account-c", {"token": "token-c"}),
+                ]
+            )
+
+            async def fake_remote(_messages, _model, _stream, options):
+                account = str((options or {}).get("_account_id") or "")
+                calls.append((account, dict(options or {})))
+
+                async def body():
+                    if account != "account-c":
+                        raise trae_remote_client.RemoteFirstEventTimeout(
+                            f"silent {account}"
+                        )
+                    yield 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(
+                    body(),
+                    media_type="text/event-stream",
+                    headers=main_module._sse_headers(),
+                )
+
+            def next_account(_attempted, _limit):
+                try:
+                    return next(rotations)
+                except StopIteration:
+                    return None
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_polling_status",
+                    return_value={"enabled": True},
+                ),
+                patch.object(
+                    main_module.auth,
+                    "list_accounts",
+                    return_value=[
+                        {"id": "account-a", "is_valid": True},
+                        {"id": "account-b", "is_valid": True},
+                        {"id": "account-c", "is_valid": True},
+                    ],
+                ),
+                patch.object(
+                    main_module.auth,
+                    "get_account_record",
+                    return_value={"token": "token-a"},
+                ),
+                patch.object(
+                    main_module,
+                    "_next_retry_account_snapshot",
+                    side_effect=next_account,
+                ),
+                patch.object(main_module, "run_remote_session", new=fake_remote),
+            ):
+                response = await main_module._run_remote_with_retry(
+                    [{"role": "user", "content": "hello"}],
+                    "glm-5.3",
+                    True,
+                    {"_account_id": "account-a", "_auth_token": "token-a"},
+                )
+                chunks = [chunk async for chunk in response.body_iterator]
+            return calls, chunks
+
+        calls, chunks = asyncio.run(run())
+        self.assertEqual(
+            [account for account, _options in calls],
+            ["account-a", "account-b", "account-c"],
+        )
+        self.assertTrue(
+            all(
+                options.get("_disable_remote_stream_account_retry") is True
+                for _account, options in calls
+            )
+        )
+        self.assertIn("data: [DONE]", "".join(chunks))
+
+    def test_stream_retry_closes_eager_session_before_first_body_iteration(self):
+        """A client disconnect before iteration must release the first slot."""
+
+        async def run():
+            closed = []
+
+            async def fake_remote(_messages, _model, _stream, options):
+                class Body:
+                    def __aiter__(self):
+                        return self
+
+                    async def __anext__(self):
+                        await asyncio.sleep(60)
+                        raise StopAsyncIteration
+
+                    async def aclose(self):
+                        closed.append(
+                            str((options or {}).get("_account_id") or "")
+                        )
+
+                return StreamingResponse(
+                    Body(),
+                    media_type="text/event-stream",
+                    headers=main_module._sse_headers(),
+                )
+
+            with (
+                patch.object(
+                    main_module.auth,
+                    "get_polling_status",
+                    return_value={"enabled": True},
+                ),
+                patch.object(
+                    main_module.auth,
+                    "list_accounts",
+                    return_value=[{"id": "account-a", "is_valid": True}],
+                ),
+                patch.object(main_module, "run_remote_session", new=fake_remote),
+            ):
+                response = await main_module._run_remote_with_retry(
+                    [{"role": "user", "content": "hello"}],
+                    "glm-5.3",
+                    True,
+                    {"_account_id": "account-a", "_auth_token": "token-a"},
+                )
+                await response.body_iterator.aclose()
+            return closed
+
+        self.assertEqual(asyncio.run(run()), ["account-a"])
 
     def test_remote_session_compacts_oversized_history_before_create(self):
         messages = []

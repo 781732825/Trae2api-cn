@@ -21,12 +21,13 @@ import math
 import os
 import random
 import string
+import threading
 import time
 import uuid
 from urllib.parse import urlsplit, urlunsplit
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any, AsyncIterator, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Mapping, Optional
 
 import anyio
 import httpx
@@ -285,10 +286,27 @@ class IdeChatResponse:
     """IDE 端点的响应与所属客户端，调用方消费完流式内容后负责关闭。"""
     response: httpx.Response
     client: httpx.Client
+    release_slot: Optional[Callable[[], None]] = field(default=None, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def close(self) -> None:
-        self.response.close()
-        self.client.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            release_slot = self.release_slot
+            self.release_slot = None
+        try:
+            self.response.close()
+        finally:
+            try:
+                self.client.close()
+            finally:
+                if release_slot is not None:
+                    release_slot()
 
 
 _current_device: Optional[DeviceInfo] = None
@@ -2724,111 +2742,245 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
     if requested_endpoint and requested_endpoint not in IDE_ENDPOINTS:
         raise ValueError(f"Unsupported IDE endpoint: {requested_endpoint}")
     endpoints = [requested_endpoint] if requested_endpoint else IDE_ENDPOINTS
-    for endpoint in endpoints:
-        endpoint_headers = build_headers(
-            token_override=bound_token,
-            user_id_override=bound_user_id,
-        )
-        # Match TraeWork's legacy adapter headers for ide-v1.  The
-        # account OAuth host and the old IDE version headers are accepted by
-        # some endpoints but produce a generic "param is invalid" response on
-        # the current gateway.
-        endpoint_headers.update(
-            {
-                "x-app-version": "default",
-                "x-app-version-code": SOLO_GATEWAY_VERSION_CODE,
-                "x-ide-version": SOLO_GATEWAY_VERSION,
-                "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
-                "x-ide-version-type": "stable",
-                "x-device-brand": SOLO_DEVICE_BRAND,
-                "x-device-type": SOLO_DEVICE_TYPE,
-                "x-device-platform": SOLO_PLATFORM,
-                "x-version-code": SOLO_GATEWAY_VERSION_CODE,
-                "x-os-version": SOLO_OS_VERSION,
-                # These CN/SOLO routing headers are present on the native
-                # Trae client requests.  They are deliberately kept
-                # configurable because account snapshots may come from a
-                # different desktop build, while the defaults match the
-                # current Trae CN stable client.
-                "package-type": SOLO_PACKAGE_TYPE,
-                "x-lscbd-aid": SOLO_LSCBD_AID,
-                "x-lscbd-platform": SOLO_PLATFORM,
-                "x-ss-dp": SOLO_LSCBD_AID,
-                "x-plugin-channel": "icube-ai",
-                "app-version": SOLO_GATEWAY_VERSION,
-                "x-bridge-transport": "aha",
-                "x-ahanet-timeout": "86400",
-                "x-lgw-req-sdk-type": "3",
-                "x-net-sdk-domain-dispatch": "1",
-                "x-ttnet-bypass-decompression": "1",
-                "x-ttnet-bypass-cookie": "0",
-                "request-traffic-type": "prod",
-                "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
-            }
-        )
-        if endpoint == "/api/agent/v3/create_agent_task":
-            endpoint_headers.update(
-                {
-                    "x-app-id": WORK_AGENT_APP_ID_CHAT,
-                    "x-device-type": "macos",
-                    "x-device-platform": "darwin",
-                    "x-platform": "darwin",
-                    "x-os": "darwin",
-                    "x-ostype": "darwin",
-                    "x-system": "darwin",
-                    "x-ide-version": WORK_AGENT_VERSION,
-                    "x-ide-version-code": WORK_AGENT_VERSION_CODE,
-                    "x-app-version-code": WORK_AGENT_VERSION_CODE,
-                    "x-version-code": WORK_AGENT_VERSION_CODE,
-                    "request-traffic-type": "prod",
-                    "User-Agent": f"Trae/{WORK_AGENT_VERSION}",
-                }
-            )
-        client = httpx.Client(
-            headers=endpoint_headers,
-            timeout=timeout,
-            http2=False,
+    # Legacy IDE/Work requests must consume the same per-account model-request
+    # capacity as Remote/Web sessions. Hold the slot from the first upstream
+    # connection attempt until the response wrapper is closed.
+    slot_account_id = _checkin_identity(bound_token, bound_account_id)
+    if not bound_account_id and slot_account_id == bound_token and bound_token:
+        # Opaque test/custom credentials are not JWTs. Keep the semaphore key
+        # stable without retaining the credential itself in process state.
+        slot_account_id = "token:" + hashlib.sha256(
+            bound_token.encode("utf-8")
+        ).hexdigest()
+    try:
+        slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+    except (TypeError, ValueError):
+        slot_timeout = 60.0
+    await acquire_web_slot(slot_account_id, timeout=max(0.0, slot_timeout))
+    slot_released = False
+    slot_handed_off = False
+    slot_release_lock = threading.Lock()
+
+    def release_slot_once() -> None:
+        nonlocal slot_released
+        with slot_release_lock:
+            if slot_released:
+                return
+            slot_released = True
+        release_web_slot(slot_account_id)
+
+    # When a synchronous send runs in a worker thread, cancellation cannot
+    # stop that thread. Keep the slot occupied until the worker has returned
+    # and its response/client have been closed.
+    cancel_cleanup_pending = False
+
+    async def send_stream(client: httpx.Client, request: Any):
+        nonlocal cancel_cleanup_pending
+        send_task = asyncio.create_task(
+            asyncio.to_thread(client.send, request, stream=True)
         )
         try:
-            if endpoint == "/api/ide/v1/chat":
-                _, trae_req = await build_trae_ide_request(
-                    messages,
-                    model_name,
-                    max_tokens,
-                    options,
-                )
-            elif endpoint == "/api/agent/v3/create_agent_task":
-                trae_req = build_work_agent_body(messages, model_name, stream, options)
-            else:
-                trae_req = build_llm_chat_body(
-                    messages,
-                    model_name,
-                    stream,
-                    max_tokens,
-                    options,
-                )
-            request_base = WORK_AGENT_HOST if endpoint == "/api/agent/v3/create_agent_task" else base
-            # The native client sends a route-specific referer.  Supplying it
-            # also makes account records that carry ``/api/remote/v1`` behave
-            # like a host-only gateway after _model_gateway_base() normalizes
-            # the stale path.
-            endpoint_headers["Referer"] = request_base + endpoint
-            logger.info("trae-client: POST %s%s model=%s tools=%s", request_base, endpoint, model_name, _tool_protocol_requested(options, messages))
-            request = client.build_request("POST", request_base + endpoint, json=trae_req)
-            resp = await asyncio.to_thread(client.send, request, stream=True)
-            if resp.status_code == 200:
-                return IdeChatResponse(response=resp, client=client)
+            return await asyncio.shield(send_task)
+        except asyncio.CancelledError:
+            cancel_cleanup_pending = True
 
-            await asyncio.to_thread(resp.read)
-            body = resp.text[:800]
-            logger.warning("trae-client: %s returned %s: %s", endpoint, resp.status_code, body)
-            errors.append(f"{endpoint} [{resp.status_code}]: {body}")
-        except Exception as e:
-            logger.warning("trae-client: %s error: %s", endpoint, e)
-            errors.append(f"{endpoint}: {e}")
-        client.close()
+            def finish_cancelled_send(task: asyncio.Task) -> None:
+                try:
+                    response = task.result()
+                except BaseException:
+                    response = None
+                try:
+                    if response is not None:
+                        response.close()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "trae-client cancelled stream cleanup failed: %s",
+                            exc,
+                        )
+                    finally:
+                        release_slot_once()
 
-    raise RuntimeError("Trae ide chat failed: " + " | ".join(errors))
+            send_task.add_done_callback(finish_cancelled_send)
+            raise
+
+    async def read_error_response(
+        client: httpx.Client, response: httpx.Response
+    ) -> None:
+        """Read an HTTP error body without releasing a slot mid-thread."""
+
+        nonlocal cancel_cleanup_pending
+        read_task = asyncio.create_task(asyncio.to_thread(response.read))
+        try:
+            await asyncio.shield(read_task)
+        except asyncio.CancelledError:
+            cancel_cleanup_pending = True
+
+            def finish_cancelled_read(task: asyncio.Task) -> None:
+                try:
+                    task.result()
+                except BaseException:
+                    pass
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        logger.warning(
+                            "trae-client cancelled error cleanup failed: %s",
+                            exc,
+                        )
+                    finally:
+                        release_slot_once()
+
+            read_task.add_done_callback(finish_cancelled_read)
+            raise
+
+    try:
+        for endpoint in endpoints:
+            endpoint_headers = build_headers(
+                token_override=bound_token,
+                user_id_override=bound_user_id,
+            )
+            # Match TraeWork's legacy adapter headers for ide-v1.  The
+            # account OAuth host and the old IDE version headers are accepted by
+            # some endpoints but produce a generic "param is invalid" response
+            # on the current gateway.
+            endpoint_headers.update(
+                {
+                    "x-app-version": "default",
+                    "x-app-version-code": SOLO_GATEWAY_VERSION_CODE,
+                    "x-ide-version": SOLO_GATEWAY_VERSION,
+                    "x-ide-version-code": SOLO_GATEWAY_VERSION_CODE,
+                    "x-ide-version-type": "stable",
+                    "x-device-brand": SOLO_DEVICE_BRAND,
+                    "x-device-type": SOLO_DEVICE_TYPE,
+                    "x-device-platform": SOLO_PLATFORM,
+                    "x-version-code": SOLO_GATEWAY_VERSION_CODE,
+                    "x-os-version": SOLO_OS_VERSION,
+                    # These CN/SOLO routing headers are present on the native
+                    # Trae client requests.  They are deliberately kept
+                    # configurable because account snapshots may come from a
+                    # different desktop build, while the defaults match the
+                    # current Trae CN stable client.
+                    "package-type": SOLO_PACKAGE_TYPE,
+                    "x-lscbd-aid": SOLO_LSCBD_AID,
+                    "x-lscbd-platform": SOLO_PLATFORM,
+                    "x-ss-dp": SOLO_LSCBD_AID,
+                    "x-plugin-channel": "icube-ai",
+                    "app-version": SOLO_GATEWAY_VERSION,
+                    "x-bridge-transport": "aha",
+                    "x-ahanet-timeout": "86400",
+                    "x-lgw-req-sdk-type": "3",
+                    "x-net-sdk-domain-dispatch": "1",
+                    "x-ttnet-bypass-decompression": "1",
+                    "x-ttnet-bypass-cookie": "0",
+                    "request-traffic-type": "prod",
+                    "User-Agent": f"Trae/{SOLO_GATEWAY_VERSION}",
+                }
+            )
+            if endpoint == "/api/agent/v3/create_agent_task":
+                endpoint_headers.update(
+                    {
+                        "x-app-id": WORK_AGENT_APP_ID_CHAT,
+                        "x-device-type": "macos",
+                        "x-device-platform": "darwin",
+                        "x-platform": "darwin",
+                        "x-os": "darwin",
+                        "x-ostype": "darwin",
+                        "x-system": "darwin",
+                        "x-ide-version": WORK_AGENT_VERSION,
+                        "x-ide-version-code": WORK_AGENT_VERSION_CODE,
+                        "x-app-version-code": WORK_AGENT_VERSION_CODE,
+                        "x-version-code": WORK_AGENT_VERSION_CODE,
+                        "request-traffic-type": "prod",
+                        "User-Agent": f"Trae/{WORK_AGENT_VERSION}",
+                    }
+                )
+            client = httpx.Client(
+                headers=endpoint_headers,
+                timeout=timeout,
+                http2=False,
+            )
+            returned_response = False
+            try:
+                if endpoint == "/api/ide/v1/chat":
+                    _, trae_req = await build_trae_ide_request(
+                        messages,
+                        model_name,
+                        max_tokens,
+                        options,
+                    )
+                elif endpoint == "/api/agent/v3/create_agent_task":
+                    trae_req = build_work_agent_body(messages, model_name, stream, options)
+                else:
+                    trae_req = build_llm_chat_body(
+                        messages,
+                        model_name,
+                        stream,
+                        max_tokens,
+                        options,
+                    )
+                request_base = (
+                    WORK_AGENT_HOST
+                    if endpoint == "/api/agent/v3/create_agent_task"
+                    else base
+                )
+                # The native client sends a route-specific referer.  Supplying
+                # it also makes account records that carry ``/api/remote/v1``
+                # behave like a host-only gateway after _model_gateway_base()
+                # normalizes the stale path.
+                endpoint_headers["Referer"] = request_base + endpoint
+                logger.info(
+                    "trae-client: POST %s%s model=%s tools=%s",
+                    request_base,
+                    endpoint,
+                    model_name,
+                    _tool_protocol_requested(options, messages),
+                )
+                request = client.build_request(
+                    "POST", request_base + endpoint, json=trae_req
+                )
+                resp = await send_stream(client, request)
+                if resp.status_code == 200:
+                    returned_response = True
+                    slot_handed_off = True
+                    return IdeChatResponse(
+                        response=resp,
+                        client=client,
+                        release_slot=release_slot_once,
+                    )
+
+                await read_error_response(client, resp)
+                body = resp.text[:800]
+                logger.warning(
+                    "trae-client: %s returned %s: %s",
+                    endpoint,
+                    resp.status_code,
+                    body,
+                )
+                errors.append(f"{endpoint} [{resp.status_code}]: {body}")
+            except Exception as e:
+                logger.warning("trae-client: %s error: %s", endpoint, e)
+                errors.append(f"{endpoint}: {e}")
+            finally:
+                if not returned_response and not cancel_cleanup_pending:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+        raise RuntimeError("Trae ide chat failed: " + " | ".join(errors))
+    finally:
+        if not cancel_cleanup_pending and not slot_handed_off and not slot_released:
+            release_slot_once()
 
 
 _MODEL_LIST_CACHE: dict[str, tuple[float, list[dict]]] = {}

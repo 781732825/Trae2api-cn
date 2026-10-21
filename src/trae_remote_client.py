@@ -47,6 +47,58 @@ DEFAULT_MAX_OUTPUT_TOKENS = 64_000
 DEFAULT_MAX_MODE_TYPE = 1
 
 
+def _json_safe(value: Any) -> Any:
+    """Return a value that can be encoded by the JSON request boundary.
+
+    Account metadata and caller options normally contain plain JSON values,
+    but browser/runtime adapters can leave Python containers such as sets in
+    nested ``custom_model`` or billing fields.  The remote client uses the
+    same normalized object for diagnostics and the actual request so a
+    logging-only serialization error cannot abort a deferred stream.
+    """
+
+    if isinstance(value, Mapping):
+        normalized: dict[Any, Any] = {}
+        for key, item in value.items():
+            # JSON object keys are strings in practice.  Keep the primitive
+            # keys accepted by ``json.dumps`` for compatibility, while
+            # converting containers/adapter objects to a deterministic string.
+            safe_key = (
+                key
+                if isinstance(key, (str, int, float, bool)) or key is None
+                else _json_safe(key)
+            )
+            if not isinstance(safe_key, (str, int, float, bool)) and safe_key is not None:
+                safe_key = _json_sort_key(safe_key)
+            normalized[safe_key] = _json_safe(item)
+        return normalized
+    if isinstance(value, (set, frozenset)):
+        items = [_json_safe(item) for item in value]
+        return sorted(items, key=_json_sort_key)
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    # Keep the request alive when an adapter leaks a non-JSON scalar (for
+    # example bytes, an Enum, or a pathlib object) into account metadata.
+    return str(value)
+
+
+def _json_sort_key(value: Any) -> str:
+    """Build a deterministic ordering key for normalized set members."""
+
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return repr(value)
+
+
 class RemoteFirstEventTimeout(EmptyUpstreamResponse):
     """A created remote session ended or timed out before its first event."""
 
@@ -396,7 +448,7 @@ def common_params(
             params.update(common_updates)
     if session_id:
         params["biz_session_id"] = session_id
-    return json.dumps(params, ensure_ascii=False)
+    return json.dumps(_json_safe(params), ensure_ascii=False)
 
 
 def flatten_query(messages: list[dict[str, Any]]) -> str:
@@ -951,6 +1003,10 @@ async def create_session(
             body["product_code"] = str(work_overlay.get("product_code"))
         if work_overlay.get("billing_source") not in (None, ""):
             body["billing_source"] = str(work_overlay.get("billing_source"))
+    # Normalize once at the HTTP boundary.  This copy is used for both the
+    # request and size logging so diagnostics cannot fail on a value that the
+    # transport would otherwise accept after normalization.
+    body = _json_safe(body)
     logger.info(
         "remote upstream request model=%s url=%s body_bytes=%d messages=%d query_chars=%d",
         model,
