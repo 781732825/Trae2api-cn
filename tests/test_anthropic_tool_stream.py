@@ -570,6 +570,111 @@ class AnthropicTranslatorToolStreamTests(unittest.TestCase):
                 self.assertIs(options["parallel_tool_calls"], expected)
 
 
+class AnthropicEmptyResponseTests(unittest.TestCase):
+    def test_nonstream_empty_completion_is_rejected(self):
+        messages = [
+            {},
+            {"content": None},
+            {"content": ""},
+            {"content": " \n\t "},
+            {"content": [], "reasoning_content": " \n "},
+            {"content": None, "tool_calls": [None]},
+        ]
+        for message in messages:
+            with self.subTest(message=message):
+                completion = {
+                    "choices": [{"message": message, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+                }
+                with self.assertRaisesRegex(
+                    anthropic_api.AnthropicRequestError, "empty response"
+                ):
+                    anthropic_api.completion_to_message(completion, "deepseek")
+
+    def test_nonstream_requested_reasoning_and_empty_tool_input_remain_valid(self):
+        for message, expected_type in (
+            ({"reasoning_content": "Inspecting the request."}, "thinking"),
+            (
+                {
+                    "tool_calls": [
+                        {"function": {"name": "read_file", "arguments": "{}"}}
+                    ]
+                },
+                "tool_use",
+            ),
+        ):
+            with self.subTest(expected_type=expected_type):
+                result = anthropic_api.completion_to_message(
+                    {"choices": [{"message": message}]}, "deepseek"
+                )
+                self.assertEqual(result["content"][0]["type"], expected_type)
+
+    def test_empty_streams_never_emit_successful_terminal(self):
+        usage_only = "data: " + json.dumps(
+            {"choices": [], "usage": {"completion_tokens": 3}}
+        ) + "\n\n"
+        cases = [
+            [],
+            ["data: [DONE]\n\n"],
+            [_openai_chunk(finish_reason="stop"), "data: [DONE]\n\n"],
+            [_openai_chunk(finish_reason="stop")],
+            [_openai_chunk(finish_reason="stop").rstrip()],
+            [usage_only, "data: [DONE]\n\n"],
+        ]
+        for frames in cases:
+            with self.subTest(frames=frames):
+                async def stream():
+                    for frame in frames:
+                        yield frame
+
+                events = asyncio.run(
+                    _collect_payloads(
+                        anthropic_api.translate_chat_stream(stream(), "deepseek")
+                    )
+                )
+                self.assertEqual(events[-1]["type"], "error")
+                self.assertIn("empty response", events[-1]["error"]["message"])
+                self.assertNotIn("message_delta", [event["type"] for event in events])
+                self.assertNotIn("message_stop", [event["type"] for event in events])
+
+    def test_whitespace_streams_never_emit_successful_terminal(self):
+        payloads = [
+            {"choices": [{"delta": {"content": " \n\t "}}]},
+            {"choices": [{"delta": {"reasoning_content": " \n "}}]},
+            {"reasoning_content": " \n "},
+        ]
+        for payload in payloads:
+            for terminal in ("data: [DONE]\n\n", _openai_chunk(finish_reason="stop")):
+                with self.subTest(payload=payload, terminal=terminal):
+                    async def stream():
+                        yield "data: " + json.dumps(payload) + "\n\n"
+                        yield terminal
+
+                    events = asyncio.run(
+                        _collect_payloads(
+                            anthropic_api.translate_chat_stream(stream(), "deepseek")
+                        )
+                    )
+                    self.assertEqual(events[-1]["type"], "error")
+                    self.assertNotIn("message_stop", [event["type"] for event in events])
+
+    def test_reasoning_stream_remains_valid(self):
+        async def stream():
+            yield "data: " + json.dumps(
+                {"choices": [{"delta": {"reasoning_content": "Inspecting."}}]}
+            ) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        events = asyncio.run(
+            _collect_payloads(anthropic_api.translate_chat_stream(stream(), "deepseek"))
+        )
+        self.assertEqual(events[-1]["type"], "message_stop")
+        self.assertIn(
+            "thinking_delta",
+            [event.get("delta", {}).get("type") for event in events],
+        )
+
+
 async def _collect_payloads(events) -> list[dict]:
     return [_payload(event) async for event in events]
 

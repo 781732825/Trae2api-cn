@@ -22,7 +22,12 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from . import auth, trae_client
-from .sse import EmptyUpstreamResponse
+from .sse import (
+    EmptyUpstreamResponse,
+    _is_account_quota_error,
+    _map_usage,
+    _upstream_error_details,
+)
 from .reasoning_effort import (
     apply_reasoning_effort,
     clamp_level,
@@ -135,11 +140,23 @@ class RemoteStreamIncomplete(EmptyUpstreamResponse):
 class RemoteFirstEventError(EmptyUpstreamResponse):
     """The remote session failed before the selected model produced output."""
 
-    def __init__(self, message: str):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Any = None,
+        usage: dict[str, Any] | None = None,
+        account_quota_exhausted: bool = False,
+    ):
+        self.code = code
+        mapped_usage = _map_usage(usage)
+        self.upstream_message = str(message or "remote session setup failed")
         super().__init__(
-            message,
-            retryable=True,
-            observed_model_event=False,
+            self.upstream_message,
+            retryable=mapped_usage is None,
+            usage=mapped_usage,
+            observed_model_event=mapped_usage is not None,
+            account_quota_exhausted=account_quota_exhausted,
         )
 
 
@@ -1215,16 +1232,20 @@ async def stream_events(
             normalized = event_name(name)
             if normalized == "error":
                 payload = data if isinstance(data, Mapping) else {}
-                code = str(payload.get("code") or "").strip()
-                message = str(
-                    payload.get("message")
-                    or payload.get("error")
-                    or payload.get("detail")
-                    or "remote session setup failed"
-                ).strip()
+                code, message = _upstream_error_details(payload)
                 suffix = f" {code}" if code else ""
+                raw_usage = payload.get("usage")
+                nested_error = payload.get("error")
+                if not isinstance(raw_usage, Mapping) and isinstance(nested_error, Mapping):
+                    raw_usage = nested_error.get("usage")
+                quota_exhausted = _is_account_quota_error(payload) or (
+                    "parallel" in message.lower()
+                )
                 raise RemoteFirstEventError(
-                    f"Trae remote upstream error{suffix}: {message}"
+                    f"Trae remote upstream error{suffix}: {message}",
+                    code=code,
+                    usage=dict(raw_usage) if isinstance(raw_usage, Mapping) else None,
+                    account_quota_exhausted=quota_exhausted,
                 )
             yield current
             observed_model_event = normalized in model_events

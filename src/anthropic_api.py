@@ -408,7 +408,7 @@ def completion_to_message(
         blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     content = message.get("content")
     text = content if isinstance(content, str) else _text_from_blocks(content)
-    if text:
+    if text.strip():
         blocks.append({"type": "text", "text": text})
     tool_calls = message.get("tool_calls")
     tool_calls = tool_calls if isinstance(tool_calls, list) else []
@@ -416,7 +416,7 @@ def completion_to_message(
         if isinstance(call, Mapping):
             blocks.append(_tool_use_block(call))
     if not blocks:
-        blocks.append({"type": "text", "text": ""})
+        raise AnthropicRequestError("Upstream returned an empty response")
     return {
         "id": make_id("msg"),
         "type": "message",
@@ -471,6 +471,7 @@ async def translate_chat_stream(
     usage_values: dict[str, Any] = {}
     saw_tool_use = False
     saw_finish_reason = False
+    saw_output = False
     stream_error = ""
     buffer = ""
 
@@ -655,7 +656,7 @@ async def translate_chat_stream(
         return events
 
     def handle_chunk(chunk: Mapping[str, Any]) -> list[str]:
-        nonlocal finish_reason, saw_finish_reason, stream_error
+        nonlocal finish_reason, saw_finish_reason, saw_output, stream_error
         events: list[str] = []
         if stream_error:
             return events
@@ -664,6 +665,7 @@ async def translate_chat_stream(
         for key in ("reasoning_content", "reasoning", "thinking"):
             value = chunk.get(key)
             if isinstance(value, str) and value:
+                saw_output = saw_output or bool(value.strip())
                 events.extend(start_thinking())
                 events.append(
                     _event(
@@ -688,6 +690,7 @@ async def translate_chat_stream(
             delta = delta if isinstance(delta, Mapping) else {}
             reasoning = delta.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning:
+                saw_output = saw_output or bool(reasoning.strip())
                 events.extend(start_thinking())
                 events.append(
                     _event(
@@ -700,6 +703,7 @@ async def translate_chat_stream(
                 )
             content = delta.get("content")
             if isinstance(content, str) and content:
+                saw_output = saw_output or bool(content.strip())
                 events.extend(start_text())
                 events.append(
                     _event(
@@ -770,6 +774,8 @@ async def translate_chat_stream(
                 )
         if input_error:
             return [*events, error_event(input_error)]
+        if not saw_output and not saw_tool_use:
+            return [error_event("Upstream returned an empty response")]
         events.extend(close_blocks())
         if not started:
             events.extend(open_message())
@@ -897,6 +903,9 @@ async def translate_chat_stream(
             )
     if input_error:
         yield error_event(input_error)
+        return
+    if not saw_output and not saw_tool_use:
+        yield error_event("Upstream returned an empty response")
         return
     for event in close_blocks():
         yield event

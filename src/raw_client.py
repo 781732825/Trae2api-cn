@@ -143,6 +143,18 @@ class RawModel:
     provider: str = ""
 
 
+class TraeCodeRateLimitError(RuntimeError):
+    """An HTTP limit that requires account rotation instead of gateway fallback."""
+
+    def __init__(self, status_code: int, code: Any, detail: str):
+        self.status_code = status_code
+        self.code = code
+        super().__init__(
+            f"TraeCode raw chat rate limit {code} (HTTP {status_code})"
+            + (f": {detail}" if detail else "")
+        )
+
+
 @dataclass
 class RawChatResponse:
     """Streaming response plus the client that owns its connection."""
@@ -1086,11 +1098,35 @@ async def send_traecode_chat_request(
                         )
                     status_code = response.status_code
                     detail = ""
+                    rate_limit_code = 429 if status_code == 429 else None
                     try:
                         # Read the body before closing it so the connection can
                         # be reused for the next host/path candidate.
-                        response.read()
-                        detail = response.text[:800]
+                        try:
+                            response.read()
+                            detail = response.text[:800]
+                        except httpx.RequestError as exc:
+                            detail = str(exc)[:800]
+                        if rate_limit_code is None:
+                            try:
+                                payload = response.json()
+                            except (httpx.ResponseNotRead, ValueError):
+                                payload = None
+                            if isinstance(payload, Mapping):
+                                nested = payload.get("error")
+                                sources = [payload]
+                                if isinstance(nested, Mapping):
+                                    sources.append(nested)
+                                rate_limit_code = next(
+                                    (
+                                        source[key]
+                                        for source in sources
+                                        for key in ("code", "error_code", "errorCode")
+                                        if str(source.get(key, "")).strip()
+                                        == "3004"
+                                    ),
+                                    None,
+                                )
                     finally:
                         response.close()
                         response = None
@@ -1102,6 +1138,12 @@ async def send_traecode_chat_request(
                         status_code,
                         detail,
                     )
+                    if rate_limit_code is not None:
+                        # Every candidate uses the same credential, so probing
+                        # another host/path only repeats an account-level limit.
+                        raise TraeCodeRateLimitError(
+                            status_code, rate_limit_code, detail
+                        )
             raise RuntimeError(
                 "TraeCode raw chat request failed on "
                 + ", ".join(

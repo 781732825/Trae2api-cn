@@ -306,7 +306,7 @@ def _provider_model_name(payload: Any) -> str:
 def _is_account_quota_error(payload: Any) -> bool:
     """Return whether an upstream error is account-scoped capacity exhaustion.
 
-    Trae uses ``4008`` for a hard quota response and ``4011``/HTTP ``429``
+    Trae uses ``4008`` for a hard quota response and ``3004``/``4011``/HTTP ``429``
     for the same account-scoped capacity window on native/remote streams.
     These errors are emitted after ``model_config`` on some transports.  The
     config frame proves routing metadata only; it must not make a request
@@ -315,18 +315,16 @@ def _is_account_quota_error(payload: Any) -> bool:
 
     if not isinstance(payload, dict):
         return False
-    code = str(
-        payload.get("code")
-        or payload.get("error_code")
-        or payload.get("errorCode")
-        or ""
-    ).strip().lower()
-    text = " ".join(
+    raw_code, message = _upstream_error_details(payload)
+    code = str(raw_code or "").strip().lower()
+    text_parts = [message]
+    text_parts.extend(
         str(payload.get(key) or "")
         for key in ("message", "error", "detail", "reason")
-    ).lower()
+    )
+    text = " ".join(text_parts).lower()
     return (
-        code in {"4008", "4011", "429"}
+        code in {"3004", "4008", "4011", "429"}
         or "requests have exceeded the quota" in text
         or "quota exceeded" in text
         or "exceeded the quota" in text
@@ -388,7 +386,7 @@ def _raise_upstream_event_error(
         )
     )
     quota_exhausted = _is_account_quota_error(payload)
-    # ``model_config`` and usage-turn ids can precede a 4008/4011 error.
+    # ``model_config`` and usage-turn ids can precede a 3004/4008/4011 error.
     # They are setup metadata, not model output.  Keep the exception
     # retryable so a streaming request may rotate credentials or use its
     # configured Remote fallback before returning a 502.
@@ -1815,6 +1813,8 @@ async def translate_ide_stream(
     terminal_event_pending = False
     started = not fail_on_empty
     pending_queue_chunks: list[str] = []
+    # Preserve formatting without committing an otherwise empty probe stream.
+    pending_text = ""
 
     if started:
         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1939,8 +1939,9 @@ async def translate_ide_stream(
             )
         )
 
-        text_delta = response_delta
-        if text_delta:
+        pending_text += response_delta
+        if pending_text and response_text.visible.strip():
+            text_delta, pending_text = pending_text, ""
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -1981,8 +1982,9 @@ async def translate_ide_stream(
         )
     )
 
-    final_text_delta = response_delta
-    if final_text_delta:
+    pending_text += response_delta
+    if pending_text and response_text.visible.strip():
+        final_text_delta, pending_text = pending_text, ""
         if not started:
             started = True
             yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -2002,6 +2004,7 @@ async def translate_ide_stream(
     if not saw_terminal and require_terminal:
         observed_model_event = bool(
             content_count
+            or reasoning_text.raw
             or tool_calls.has_calls
             or final_usage is not None
             or provider_model_name
@@ -2065,14 +2068,16 @@ async def translate_ide_stream(
         )
         yield "data: [DONE]\n\n"
         return
+    has_visible_content = bool(response_text.visible.strip())
     if (
         fail_on_empty
-        and content_count == 0
+        and not has_visible_content
         and not tool_calls.has_calls
         and not reasoning_summary
     ):
         observed_model_event = bool(
             final_usage is not None
+            or reasoning_text.raw
             or provider_model_name
             or (
                 isinstance(upstream_metadata, dict)
@@ -2557,15 +2562,15 @@ async def translate_web_events(
             if emitted_tool and allowed_tools is not None:
                 break
             if content_delta:
-                if not started:
-                    started = True
-                    yield openai_chunk(prefix_id, model, {"role": "assistant"})
                 plan_streamed_text += content_delta
                 merged_text = _merge_plan_message_text(
                     plan_streamed_text, message_visible_text
                 )
                 public_delta = _cli_text_delta(streamed_text, merged_text)
-                if public_delta:
+                if public_delta and (public_delta.strip() or streamed_text.strip()):
+                    if not started:
+                        started = True
+                        yield openai_chunk(prefix_id, model, {"role": "assistant"})
                     streamed_text += public_delta
                     yield openai_chunk(prefix_id, model, {"content": public_delta})
             summary = _web_finish_summary(data)
@@ -2607,7 +2612,7 @@ async def translate_web_events(
                     plan_streamed_text, message_visible_text
                 )
                 message_delta = _cli_text_delta(streamed_text, merged_text)
-                if message_delta:
+                if message_delta and (message_delta.strip() or streamed_text.strip()):
                     if not started:
                         started = True
                         yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -2652,15 +2657,15 @@ async def translate_web_events(
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
             yield chunk
         if content_delta:
-            if not started:
-                started = True
-                yield openai_chunk(prefix_id, model, {"role": "assistant"})
             plan_streamed_text += content_delta
             merged_text = _merge_plan_message_text(
                 plan_streamed_text, message_visible_text
             )
             public_delta = _cli_text_delta(streamed_text, merged_text)
-            if public_delta:
+            if public_delta and (public_delta.strip() or streamed_text.strip()):
+                if not started:
+                    started = True
+                    yield openai_chunk(prefix_id, model, {"role": "assistant"})
                 streamed_text += public_delta
                 yield openai_chunk(prefix_id, model, {"content": public_delta})
 
@@ -2685,7 +2690,7 @@ async def translate_web_events(
     )
     if message_delta or merged_text:
         public_delta = _cli_text_delta(streamed_text, merged_text)
-        if public_delta:
+        if public_delta and (public_delta.strip() or streamed_text.strip()):
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
@@ -2732,13 +2737,13 @@ async def translate_web_events(
     # Do not present a web agent's remote tool result as the external client's
     # tool result. The API client owns execution and the following turn.
     if not tool_calls.has_calls:
-        if not streamed_text and final_summary:
+        if not streamed_text.strip() and final_summary.strip():
             if not started:
                 started = True
                 yield openai_chunk(prefix_id, model, {"role": "assistant"})
             streamed_text += final_summary
             yield openai_chunk(prefix_id, model, {"content": final_summary})
-        elif final_summary:
+        elif final_summary.strip():
             summary = final_summary.rstrip()
             streamed_head = streamed_text.strip()
             if streamed_head and summary.startswith(streamed_head):
@@ -2756,11 +2761,12 @@ async def translate_web_events(
                 yield openai_chunk(prefix_id, model, {"content": "\n\n" + final_summary})
 
     if (
-        not streamed_text
+        not streamed_text.strip()
         and not tool_calls.has_calls
         and reasoning_summary
         and not include_reasoning
         and not legacy_plan_reasoning
+        and not fail_on_empty
     ):
         # Split layout with reasoning but no answer: keep the trace in the
         # dedicated reasoning channel instead of presenting it as content.
@@ -2772,10 +2778,11 @@ async def translate_web_events(
         )
         include_reasoning = True
     if (
-        not streamed_text
+        not streamed_text.strip()
         and not tool_calls.has_calls
         and reasoning_summary
         and not include_reasoning
+        and legacy_plan_reasoning
     ):
         # Older remote variants place the final answer only in ``thought``.
         # Return a bounded fallback instead of the complete trace or an empty
@@ -2802,7 +2809,12 @@ async def translate_web_events(
         )
         yield "data: [DONE]\n\n"
         return
-    if fail_on_empty and not streamed_text and not tool_calls.has_calls and not saw_reasoning_output:
+    if (
+        fail_on_empty
+        and not streamed_text.strip()
+        and not tool_calls.has_calls
+        and not saw_reasoning_output
+    ):
         quota_exhausted = _is_account_quota_error(error_event)
         # ``model_config`` is emitted before a Trae 4008 error.  It identifies
         # the selected provider, but it is not model output and must not make
@@ -2849,7 +2861,11 @@ async def translate_web_events(
             )
             yield "data: [DONE]\n\n"
             return
-        if not tool_calls.has_calls and not streamed_text and not saw_reasoning_output:
+        if (
+            not tool_calls.has_calls
+            and not streamed_text.strip()
+            and not saw_reasoning_output
+        ):
             yield openai_chunk(
                 prefix_id,
                 model,
@@ -3185,7 +3201,16 @@ async def collect_nonstream_ide(
             provider_model_name = reported_provider
             _check_provider_model(model, reported_provider)
         reasoning = _payload_reasoning_text(obj)
+        if not reasoning and event_type == "reasoning_delta":
+            reasoning = _payload_text_delta(obj)
         raw_response = obj.get("response") if isinstance(obj.get("response"), str) else ""
+        if not raw_response and event_type in {
+            "text_delta",
+            "translated_text",
+            "accumulated",
+            "assistant_message",
+        }:
+            raw_response = _payload_text_delta(obj)
         embedded_reasoning, visible_response = _split_embedded_reasoning(raw_response)
         reasoning_delta, reasoning_calls = reasoning_text.add(reasoning)
         if embedded_reasoning:
@@ -3265,7 +3290,7 @@ async def collect_nonstream_ide(
     tool_calls.set_calls(
         _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
     )
-    if not full and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
+    if not full.strip() and not reasoning_summary and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
             "Trae upstream repeated only already completed tool calls",
             retryable=False,
@@ -3275,9 +3300,10 @@ async def collect_nonstream_ide(
     _ensure_required_tool_call(
         tool_choice, tool_calls.has_calls, tool_calls.calls()
     )
-    if fail_on_empty and not full and not reasoning_summary and not tool_calls.has_calls:
+    if fail_on_empty and not full.strip() and not reasoning_summary and not tool_calls.has_calls:
         observed_model_event = bool(
             usage is not None
+            or reasoning_text.raw
             or provider_model_name
             or (
                 isinstance(upstream_metadata, dict)
@@ -3290,7 +3316,7 @@ async def collect_nonstream_ide(
             usage=usage,
             observed_model_event=observed_model_event,
         )
-    if not full and not reasoning_summary and not tool_calls.has_calls:
+    if not full.strip() and not reasoning_summary and not tool_calls.has_calls:
         full = "(trae upstream returned an empty response)"
     if usage is None:
         usage = {
@@ -3414,9 +3440,6 @@ async def collect_nonstream_web(
         if event == "done":
             final_reason = _payload_finish_reason(data) or final_reason
             break
-    if error_event:
-        raise RuntimeError(f"trae {error_event.get('code','')}: {error_event.get('message','')}")
-
     for state in reasoning_states.values():
         _, calls = state.finalize()
         tool_calls.add(
@@ -3485,6 +3508,35 @@ async def collect_nonstream_web(
         final_summary = filtered_summary or (
             summary_text if not content and not has_plan_reasoning else ""
         )
+    reasoning_raw = "\n".join(
+        reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
+    )
+    if error_event is not None:
+        code, message = _upstream_error_details(error_event)
+        if usage is None:
+            usage = _map_usage(error_event.get("usage"))
+            nested_error = error_event.get("error")
+            if usage is None and isinstance(nested_error, Mapping):
+                usage = _map_usage(nested_error.get("usage"))
+        observed_model_event = bool(
+            content.strip()
+            or final_summary.strip()
+            or reasoning_raw
+            or tool_calls.has_calls
+            or usage is not None
+        )
+        # Preserve output evidence before the dispatcher decides whether this
+        # failed turn may be replayed on another account or through Work.
+        raise UpstreamEventError(
+            message,
+            code=code,
+            retryable=not observed_model_event,
+            usage=usage,
+            observed_model_event=observed_model_event,
+            account_quota_exhausted=(
+                _is_account_quota_error(error_event) or "parallel" in message.lower()
+            ),
+        )
     # A finish summary can carry the only client tool call. Extract it before
     # validating a required/named choice, otherwise a valid summary call is
     # reported as a missing tool and the non-stream request fails.
@@ -3498,9 +3550,6 @@ async def collect_nonstream_web(
             content = final_summary.strip()
         elif final_summary and not content.rstrip().endswith(final_summary.rstrip()):
             content = content.rstrip() + "\n\n" + final_summary
-    reasoning_raw = "\n".join(
-        reasoning_states[key].raw for key in reasoning_order if reasoning_states[key].raw
-    )
     reasoning_summary = compact_reasoning_text(reasoning_raw)
     public_reasoning = reasoning_summary if include_reasoning else ""
     if (
@@ -3509,6 +3558,7 @@ async def collect_nonstream_web(
         and reasoning_summary
         and not include_reasoning
         and not legacy_plan_reasoning
+        and not fail_on_empty
     ):
         # Split layout: never promote the reasoning trace into content.
         public_reasoning = reasoning_summary
@@ -3518,33 +3568,23 @@ async def collect_nonstream_web(
         and not tool_calls.has_calls
         and reasoning_summary
         and not include_reasoning
+        and legacy_plan_reasoning
     ):
         # Compatibility fallback for remote versions that return the final
         # answer only through plan_item.thought.  Keep it compact rather than
         # exposing the complete working trace.
         content = reasoning_summary
     if fail_on_empty and not content and not public_reasoning and not tool_calls.has_calls:
-        quota_exhausted = _is_account_quota_error(error_event)
-        # A provider/model metadata event is not output.  In particular,
-        # Trae sends it immediately before a 4008 quota error; treating it as
-        # activity prevents the dispatcher from rotating credentials.
         observed_model_event = bool(
             usage is not None
             or reasoning_raw
-            or (provider_model_name and not quota_exhausted)
+            or provider_model_name
         )
-        message = "Trae remote upstream returned no text or tool call"
-        if error_event:
-            message = (
-                f"Trae remote upstream error: {error_event.get('code', '')}: "
-                f"{error_event.get('message', '')}"
-            )
         raise EmptyUpstreamResponse(
-            message,
+            "Trae remote upstream returned no text or tool call",
             retryable=not observed_model_event,
             usage=usage,
             observed_model_event=observed_model_event,
-            account_quota_exhausted=quota_exhausted,
         )
     if not content and not public_reasoning and not tool_calls.has_calls:
         content = "(trae upstream returned an empty response)"

@@ -289,6 +289,210 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
         response.close()
         self.assertTrue(response.client.is_closed)
 
+    async def test_http_rate_limit_stops_host_and_endpoint_fallback(self):
+        cases = [
+            (429, "busy", 429),
+            (400, {"code": 3004, "message": "busy"}, 3004),
+            (403, {"code": "3004", "message": "busy"}, "3004"),
+            (500, {"error_code": 3004}, 3004),
+            (502, {"errorCode": "3004"}, "3004"),
+            (503, {"error": {"code": 3004}}, 3004),
+            (400, {"error": {"error_code": "3004"}}, "3004"),
+            (403, {"error": {"errorCode": 3004}}, 3004),
+        ]
+        for status_code, payload, expected_code in cases:
+            with self.subTest(status_code=status_code, payload=payload):
+                requests = []
+                clients = []
+                responses = []
+                session_id = "http-rate-limit-test"
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    response = (
+                        httpx.Response(status_code, text=payload)
+                        if isinstance(payload, str)
+                        else httpx.Response(status_code, json=payload)
+                    )
+                    responses.append(response)
+                    return response
+
+                transport = httpx.MockTransport(handler)
+
+                def client_factory(**kwargs):
+                    client = REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+                    clients.append(client)
+                    return client
+
+                with (
+                    patch("src.trae_client.build_headers", return_value={}),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_base_urls",
+                        return_value=[
+                            "https://trae-api-cn.mchost.guru",
+                            "https://api5-normal.mchost.guru",
+                        ],
+                    ),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_model_for_request",
+                        new=AsyncMock(
+                            return_value=raw_client.resolve_traecode_model("glm-5.2")
+                        ),
+                    ),
+                    patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                ):
+                    with self.assertRaises(raw_client.TraeCodeRateLimitError) as raised:
+                        await raw_client.send_traecode_chat_request(
+                            [{"role": "user", "content": "hello"}],
+                            "glm-5.2",
+                            options={
+                                "_account_id": "account-1",
+                                "_auth_token": "jwt",
+                                "_auth_user_id": "user-1",
+                                "_traecode_session_id": session_id,
+                            },
+                        )
+
+                self.assertIsInstance(raised.exception, RuntimeError)
+                self.assertEqual(raised.exception.status_code, status_code)
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertIn("rate limit", str(raised.exception))
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(len(clients), 1)
+                self.assertTrue(clients[0].is_closed)
+                self.assertTrue(responses[0].is_closed)
+                with raw_client._RAW_SESSION_GATES_LOCK:
+                    self.assertNotIn(session_id, raw_client._RAW_SESSION_GATES)
+
+    async def test_http_429_body_read_error_preserves_rate_limit_and_releases_slot(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                requests = []
+                clients = []
+                responses = []
+                session_id = "http-rate-limit-broken-body"
+
+                class BrokenBody(httpx.SyncByteStream):
+                    def __iter__(self):
+                        yield b'{"error":'
+                        raise httpx.ReadError("error body disconnected")
+
+                def handler(request):
+                    requests.append(request)
+                    response = httpx.Response(429, stream=BrokenBody())
+                    responses.append(response)
+                    return response
+
+                def client_factory(**kwargs):
+                    client = REAL_HTTPX_CLIENT(
+                        transport=httpx.MockTransport(handler), **kwargs
+                    )
+                    clients.append(client)
+                    return client
+
+                with (
+                    patch("src.trae_client.build_headers", return_value={}),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_base_urls",
+                        return_value=["https://first.example", "https://second.example"],
+                    ),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_model_for_request",
+                        new=AsyncMock(
+                            return_value=raw_client.resolve_traecode_model("glm-5.2")
+                        ),
+                    ),
+                    patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                ):
+                    with self.assertRaises(raw_client.TraeCodeRateLimitError) as raised:
+                        await raw_client.send_traecode_chat_request(
+                            [{"role": "user", "content": "hello"}],
+                            "glm-5.2",
+                            stream=stream,
+                            options={
+                                "_auth_token": "jwt",
+                                "_auth_user_id": "user-1",
+                                "_traecode_session_id": session_id,
+                            },
+                        )
+
+                self.assertEqual(raised.exception.code, 429)
+                self.assertEqual(raised.exception.status_code, 429)
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(clients[0].is_closed)
+                self.assertTrue(responses[0].is_closed)
+                with raw_client._RAW_SESSION_GATES_LOCK:
+                    self.assertNotIn(session_id, raw_client._RAW_SESSION_GATES)
+
+    async def test_unstructured_rate_limit_number_preserves_endpoint_fallback(self):
+        cases = [
+            "gateway reference 3004",
+            {"code": 4001, "message": "gateway reference 3004"},
+            [{"code": 3004}],
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                requests = []
+
+                def handler(request: httpx.Request) -> httpx.Response:
+                    requests.append(request)
+                    if len(requests) == 1:
+                        return (
+                            httpx.Response(502, text=payload)
+                            if isinstance(payload, str)
+                            else httpx.Response(502, json=payload)
+                        )
+                    return httpx.Response(
+                        200,
+                        headers={"content-type": "text/event-stream"},
+                        content=b"event: done\ndata: {}\n\n",
+                    )
+
+                transport = httpx.MockTransport(handler)
+
+                def client_factory(**kwargs):
+                    return REAL_HTTPX_CLIENT(transport=transport, **kwargs)
+
+                with (
+                    patch("src.trae_client.build_headers", return_value={}),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_base_urls",
+                        return_value=["https://gateway.example"],
+                    ),
+                    patch.object(
+                        raw_client,
+                        "resolve_traecode_model_for_request",
+                        new=AsyncMock(
+                            return_value=raw_client.resolve_traecode_model("glm-5.2")
+                        ),
+                    ),
+                    patch("src.raw_client.httpx.Client", side_effect=client_factory),
+                ):
+                    response = await raw_client.send_traecode_chat_request(
+                        [{"role": "user", "content": "hello"}],
+                        "glm-5.2",
+                        options={
+                            "_account_id": "account-1",
+                            "_auth_token": "jwt",
+                            "_auth_user_id": "user-1",
+                        },
+                    )
+
+                self.assertEqual(
+                    [request.url.path for request in requests],
+                    [
+                        "/api/ide/v2/llm_raw_chat",
+                        "/api/ide/v1/llm_raw_chat",
+                    ],
+                )
+                response.close()
+                self.assertTrue(response.client.is_closed)
+
     async def test_cancellation_keeps_session_gate_until_worker_finishes(self):
         entered_send = threading.Event()
         allow_return = threading.Event()

@@ -983,7 +983,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -4374,6 +4374,7 @@ async def _deferred_dispatch_stream(
     started_at = time.monotonic()
     upstream_chunks = 0
     upstream_payload_chunks = 0
+    upstream_observed_model_event = False
     saw_done = False
     stream_status = "opening"
     sent_start_event = False
@@ -4460,21 +4461,53 @@ async def _deferred_dispatch_stream(
 
         nonlocal iterator, upstream_chunks, upstream_payload_chunks
         nonlocal saw_done, stream_status, sent_start_event
-        iterator = getattr(current_response, "body_iterator", None)
-        if iterator is None:
-            body = getattr(current_response, "body", b"")
-            if body:
-                yield body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-            return
-        async for chunk in iterator:
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode("utf-8", errors="replace")
+        iterator = _response_body_iterator(current_response)
+        buffer = ""
+        saw_model_output = False
+        observed_model_event = False
+        saw_error = False
+        pending_terminal_chunks: list[str] = []
+
+        def public_chunks(chunk: str):
+            nonlocal upstream_chunks, upstream_payload_chunks
+            nonlocal upstream_observed_model_event
+            nonlocal saw_done, stream_status, sent_start_event
+            nonlocal saw_model_output, observed_model_event, saw_error
+            text = _chunk_text_delta(chunk)
+            reasoning = _chunk_reasoning_delta(chunk)
+            has_tools = _chunk_has_tool_calls(chunk)
+            has_output = bool(text.strip() or reasoning.strip() or has_tools)
+            saw_model_output = saw_model_output or has_output
+            observed_model_event = observed_model_event or bool(
+                text or reasoning or has_tools
+            )
+            payloads = list(_iter_sse_payloads(chunk))
+            for value in payloads:
+                if (
+                    isinstance(value.get("usage"), Mapping)
+                    or value.get("provider_model_name")
+                ):
+                    observed_model_event = True
+            if not payloads and any(
+                line.lstrip().startswith("data:")
+                and line.split(":", 1)[1].strip() not in {"", "[DONE]"}
+                for line in chunk.splitlines()
+            ):
+                # An invalid model frame cannot prove that replay is safe.
+                observed_model_event = True
+            state = _chunk_stream_state(chunk)
+            saw_error = saw_error or state == "error"
+            upstream_observed_model_event = bool(
+                upstream_observed_model_event or observed_model_event or saw_error
+            )
+            if state == "completed" and not saw_model_output and not saw_error:
+                # Do not let a bare finish/[DONE] turn an empty upstream into
+                # success before the EOF check can surface its real failure.
+                pending_terminal_chunks.append(chunk)
+                return
             if chunk:
                 upstream_chunks += 1
-                if any(
-                    line.lstrip().startswith("data:")
-                    for line in chunk.splitlines()
-                ):
+                if has_output:
                     upstream_payload_chunks += 1
                 if "data: [DONE]" in chunk:
                     saw_done = True
@@ -4483,6 +4516,29 @@ async def _deferred_dispatch_stream(
                     yield _stream_start_event(model)
                     sent_start_event = True
                 yield chunk
+
+        async for chunk in iterator:
+            if isinstance(chunk, (bytes, bytearray)):
+                chunk = bytes(chunk).decode("utf-8", errors="replace")
+            buffer += str(chunk or "").replace("\r\n", "\n")
+            while "\n\n" in buffer:
+                block, buffer = buffer.split("\n\n", 1)
+                for public_chunk in public_chunks(block + "\n\n"):
+                    yield public_chunk
+        if buffer.strip():
+            for public_chunk in public_chunks(buffer):
+                yield public_chunk
+        if not saw_model_output and not saw_error:
+            raise EmptyUpstreamResponse(
+                "Trae upstream stream ended without text, reasoning, or tool calls",
+                retryable=not observed_model_event,
+                observed_model_event=observed_model_event,
+            )
+        for chunk in pending_terminal_chunks:
+            upstream_chunks += 1
+            if "data: [DONE]" in chunk:
+                saw_done = True
+            yield chunk
 
     async def close_dispatch() -> None:
         nonlocal response, iterator
@@ -4569,7 +4625,11 @@ async def _deferred_dispatch_stream(
             # or a provider disconnect).  Retry Remote only before any native
             # payload has reached the caller; once partial output is visible we
             # preserve that stream and surface the original failure.
-            if upstream_payload_chunks or fallback_attempted:
+            if (
+                upstream_payload_chunks
+                or upstream_observed_model_event
+                or fallback_attempted
+            ):
                 raise
             await close_current()
             fallback = await try_remote_fallback(str(exc))
@@ -5277,6 +5337,30 @@ def _chat_history_key(messages: list[dict], length: int | None = None) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _chat_history_prefix_keys(messages: list[dict]) -> list[str]:
+    """Hash all non-empty prefixes while serializing each message once."""
+
+    digest = hashlib.sha256(b"[")
+    keys: list[str] = []
+    for index, message in enumerate(messages):
+        if index:
+            digest.update(b",")
+        encoded = json.dumps(
+            message,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest.update(encoded.encode("utf-8"))
+        # Closing only the snapshot preserves the canonical JSON array hash
+        # while the running digest remains ready for the next message.
+        prefix = digest.copy()
+        prefix.update(b"]")
+        keys.append(prefix.hexdigest())
+    return keys
+
+
 def _chat_has_prior_turn(messages: list[dict]) -> bool:
     return any(
         isinstance(message, dict)
@@ -5412,6 +5496,8 @@ def _bind_chat_session(
     rotate_for_new: bool = True,
 ) -> dict:
     """Attach a stable upstream session and account to one API request."""
+    history_keys = _chat_history_prefix_keys(messages)
+    history_key = history_keys[-1] if history_keys else _chat_history_key(messages)
     now = time.monotonic()
     with _CHAT_SESSION_LOCK:
         _prune_chat_sessions(now)
@@ -5425,8 +5511,8 @@ def _bind_chat_session(
             inferred_account_snapshot = auth.get_active_account_snapshot()
             # Prefer the most specific known prefix, then fall back to the full
             # replay for idempotent retries of the same request.
-            for length in range(len(messages), 0, -1):
-                found = _CHAT_HISTORY_SESSIONS.get(_chat_history_key(messages, length))
+            for prefix_key in reversed(history_keys):
+                found = _CHAT_HISTORY_SESSIONS.get(prefix_key)
                 if found is not None:
                     candidate_id = found[0]
                     candidate_lease = _UPSTREAM_SESSION_LEASES.get(candidate_id)
@@ -5446,7 +5532,7 @@ def _bind_chat_session(
                     ):
                         continue
                     session_id = candidate_id
-                    _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages, length))
+                    _CHAT_HISTORY_SESSIONS.move_to_end(prefix_key)
                     break
         if not session_id:
             session_id = uuid_mod.uuid4().hex
@@ -5528,8 +5614,8 @@ def _bind_chat_session(
             lease.last_client_activity = now
             _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
 
-        _CHAT_HISTORY_SESSIONS[_chat_history_key(messages)] = (session_id, now)
-        _CHAT_HISTORY_SESSIONS.move_to_end(_chat_history_key(messages))
+        _CHAT_HISTORY_SESSIONS[history_key] = (session_id, now)
+        _CHAT_HISTORY_SESSIONS.move_to_end(history_key)
 
     bound = dict(options)
     bound["session_id"] = session_id
@@ -7438,31 +7524,83 @@ def _bounded_remote_query(
     )
     if raw_limit <= 0:
         return [dict(m) for m in messages], 0
-    bounded = [dict(m) for m in messages]
+    original = [dict(m) for m in messages]
+    query = trae_client.flatten_query_parts(original)
+    if len(query) <= raw_limit:
+        return original, 0
+    non_system = [
+        index
+        for index, message in enumerate(original)
+        if str(message.get("role") or "user") not in {"system", "developer"}
+    ]
+    boundaries = [0]
+    offset = 0
+    while offset + 1 < len(non_system):
+        head = non_system[offset]
+        message = original[head]
+        paired = (
+            str(message.get("role") or "") == "assistant"
+            and bool(message.get("tool_calls") or message.get("function_call"))
+            and head + 1 == non_system[offset + 1]
+            and str(original[head + 1].get("role") or "") == "tool"
+        )
+        offset += 2 if paired else 1
+        boundaries.append(offset)
+
+    non_system_set = set(non_system)
+
+    def suffix(removed_count: int) -> list[dict[str, Any]]:
+        first = non_system[removed_count] if removed_count < len(non_system) else len(original)
+        return [
+            message
+            for index, message in enumerate(original)
+            if index >= first or index not in non_system_set
+        ]
+
+    # Ordinary histories only lose serialized text/media when a prefix is
+    # removed. Find the same first fitting suffix without re-encoding a large
+    # image once per history message on the event loop. Renderer tool results
+    # can inherit names from earlier calls, so keep their exact sequential
+    # behavior instead of assuming their serialized size is monotonic.
+    inherited_tool_names = any(
+        raw_client._renderer_tool_result_blocks(message.get("content"))
+        for message in original
+    )
     removed = 0
-    while True:
+    bounded = original
+    if inherited_tool_names:
+        for removed in boundaries[1:]:
+            bounded = suffix(removed)
+            query = trae_client.flatten_query_parts(bounded)
+            if len(query) <= raw_limit:
+                return bounded, removed
+    elif len(boundaries) > 1:
+        removed = boundaries[-1]
+        bounded = suffix(removed)
         query = trae_client.flatten_query_parts(bounded)
         if len(query) <= raw_limit:
-            return bounded, removed
-        non_system = [
-            index
-            for index, message in enumerate(bounded)
-            if str(message.get("role") or "user") not in {"system", "developer"}
-        ]
-        if len(non_system) <= 1:
-            break
-        head = non_system[0]
-        drop = {head}
-        head_message = bounded[head]
-        if str(head_message.get("role") or "") == "assistant" and (
-            head_message.get("tool_calls") or head_message.get("function_call")
-        ):
-            if head + 1 < len(bounded):
-                following = bounded[head + 1]
-                if str(following.get("role") or "") == "tool":
-                    drop.add(head + 1)
-        bounded = [m for index, m in enumerate(bounded) if index not in drop]
-        removed += len(drop)
+            low, high = 1, len(boundaries) - 1
+            while low < high:
+                middle = (low + high) // 2
+                candidate = suffix(boundaries[middle])
+                candidate_query = trae_client.flatten_query_parts(candidate)
+                if len(candidate_query) <= raw_limit:
+                    high = middle
+                    bounded, query = candidate, candidate_query
+                else:
+                    low = middle + 1
+            return bounded, boundaries[low]
+
+    # Media cannot be shortened by the text-fitting pass. Reject its fixed
+    # lower bound before repeatedly normalizing an attachment that cannot fit.
+    query_parts = json.loads(query)
+    media = [
+        part
+        for part in query_parts
+        if isinstance(part, Mapping) and part.get("type") == "image_url"
+    ]
+    if media and len(json.dumps(media, ensure_ascii=False)) > raw_limit:
+        raise RemoteQueryTooLarge(len(query), raw_limit)
 
     # The loop above can only remove complete turns.  A request containing one
     # enormous user/tool-result message has no removable non-system turn, so
@@ -8089,6 +8227,32 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
         raise
 
 
+def _is_remote_account_capacity_error(error: BaseException) -> bool:
+    """Recognize account capacity errors that cannot be repaired through Work."""
+
+    if bool(getattr(error, "account_quota_exhausted", False)):
+        return True
+    if str(getattr(error, "code", "") or "").strip() in {
+        "3004", "4008", "4011", "429"
+    }:
+        return True
+    text = str(error or "").lower()
+    return bool(
+        re.search(r"(?:\[|\bhttp\s+)(?:3004|4008|4011|429)\b", text)
+        or any(
+            marker in text
+            for marker in (
+                "parallel",
+                "rate limit",
+                "rate-limit",
+                "too many requests",
+                "quota exceeded",
+                "exceeded the quota",
+            )
+        )
+    )
+
+
 async def run_remote_session(messages, model, stream: bool, options: Optional[dict] = None):
     """9router-style Trae remote session using the current account snapshot.
 
@@ -8252,6 +8416,8 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         """
 
         text = str(error or "").lower()
+        if _is_remote_account_capacity_error(error):
+            return False
         if any(
             marker in text
             for marker in (
@@ -8446,6 +8612,8 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         )
                         if (
                             not exc_retryable
+                            or exc_observed_model_event
+                            or exc_usage is not None
                             or work_fallback_used
                             or not (can_work_fallback or polling_retry_enabled)
                             or (quota_exhausted and not polling_retry_enabled)
@@ -8663,7 +8831,14 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             return JSONResponse(content=result)
         except EmptyUpstreamResponse as exc:
             _track_usage_from_exception(exc, model)
-            if not (can_work_fallback and not work_fallback_used and exc.retryable):
+            if not (
+                can_work_fallback
+                and not work_fallback_used
+                and exc.retryable
+                and not exc.observed_model_event
+                and exc.usage is None
+                and not _is_remote_account_capacity_error(exc)
+            ):
                 raise
             logger.warning(
                 "remote upstream ended before any model event; falling back to Work "
@@ -8767,9 +8942,15 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
     def _can_fallback(error: BaseException) -> bool:
         # Buffered native tools may not have reached the wire yet, but an
         # observed model turn is still billable and cannot be safely replayed.
-        return not isinstance(error, EmptyUpstreamResponse) or (
-            error.retryable and not error.observed_model_event
-        )
+        if isinstance(error, EmptyUpstreamResponse) and (
+            not error.retryable
+            or error.observed_model_event
+            or error.usage is not None
+        ):
+            return False
+        # Account throttling affects both native protocols. Let the outer
+        # retry helper rotate credentials instead of replaying this account.
+        return not _is_native_rate_limit_error(error)
 
     def _legacy_options() -> dict:
         legacy = dict(options)
@@ -9372,7 +9553,7 @@ async def _run_remote_stream_with_retry(
             or "model binding mismatch" in lowered
         ):
             return "model unavailable"
-        if "parallel" in lowered or "429" in lowered:
+        if _is_remote_account_capacity_error(error) or "429" in lowered:
             return "parallel limit"
         return None
 
@@ -9457,6 +9638,7 @@ async def _run_remote_stream_with_retry(
         ) as exc:
             if (
                 not bool(getattr(exc, "retryable", True))
+                or bool(getattr(exc, "observed_model_event", False))
                 or initial_attempt_index + 1 >= max(1, attempts)
                 or not await rotate_account(
                     "empty upstream response", initial_attempt_index
@@ -9466,7 +9648,8 @@ async def _run_remote_stream_with_retry(
         except RuntimeError as exc:
             reason = _runtime_retry_reason(exc)
             if (
-                reason is None
+                bool(getattr(exc, "observed_model_event", False))
+                or reason is None
                 or initial_attempt_index + 1 >= max(1, attempts)
                 or not await rotate_account(reason, initial_attempt_index)
             ):
@@ -9483,12 +9666,13 @@ async def _run_remote_stream_with_retry(
             if account_key not in attempted_accounts:
                 attempted_accounts.add(account_key)
             elif attempt_index != initial_attempt_index:
-                break
+                raise RuntimeError("remote stream account already attempted")
             local_options = dict(current_options)
             # The outer wrapper is the sole owner of account rotation.  The
             # inner session may still perform its same-account Agent -> Work
             # fallback, but must not start a second account loop.
             local_options["_disable_remote_stream_account_retry"] = True
+            observed_model_event = False
             try:
                 if attempt_index == initial_attempt_index:
                     initial_response_started = True
@@ -9499,14 +9683,41 @@ async def _run_remote_stream_with_retry(
                 iterator = getattr(response, "body_iterator", None)
                 if iterator is None:
                     body = getattr(response, "body", b"")
-                    if body:
-                        yield (
-                            body.decode("utf-8", errors="replace")
-                            if isinstance(body, bytes)
-                            else str(body)
+                    body_text = (
+                        body.decode("utf-8", errors="replace")
+                        if isinstance(body, bytes)
+                        else str(body or "")
+                    )
+                    if not body_text.strip():
+                        raise EmptyUpstreamResponse(
+                            "Trae remote upstream returned an empty response",
+                            retryable=True,
+                            observed_model_event=False,
                         )
+                    observed_model_event = bool(
+                        _chunk_text_delta(body_text)
+                        or _chunk_reasoning_delta(body_text)
+                        or _chunk_has_tool_calls(body_text)
+                        or _chunk_marks_terminal(body_text)
+                        or any(
+                            isinstance(value.get("usage"), Mapping)
+                            for value in _iter_sse_payloads(body_text)
+                        )
+                    )
+                    yield body_text
                     return
                 async for chunk in iterator:
+                    if (
+                        _chunk_text_delta(chunk)
+                        or _chunk_reasoning_delta(chunk)
+                        or _chunk_has_tool_calls(chunk)
+                        or _chunk_marks_terminal(chunk)
+                        or any(
+                            isinstance(value.get("usage"), Mapping)
+                            for value in _iter_sse_payloads(chunk)
+                        )
+                    ):
+                        observed_model_event = True
                     yield chunk
                 return
             except asyncio.CancelledError:
@@ -9519,7 +9730,11 @@ async def _run_remote_stream_with_retry(
                 EmptyUpstreamResponse,
                 trae_remote_client.RemoteFirstEventTimeout,
             ) as exc:
-                if not bool(getattr(exc, "retryable", True)):
+                if (
+                    observed_model_event
+                    or not bool(getattr(exc, "retryable", True))
+                    or bool(getattr(exc, "observed_model_event", False))
+                ):
                     raise
                 if attempt_index + 1 >= max(1, attempts):
                     raise
@@ -9529,7 +9744,11 @@ async def _run_remote_stream_with_retry(
                 continue
             except RuntimeError as exc:
                 reason = _runtime_retry_reason(exc)
-                if reason is None:
+                if (
+                    observed_model_event
+                    or bool(getattr(exc, "observed_model_event", False))
+                    or reason is None
+                ):
                     raise
                 if attempt_index + 1 >= max(1, attempts):
                     raise
@@ -9626,7 +9845,12 @@ async def _run_remote_with_retry(
                 # the same payload on another account.
                 raise
             except EmptyUpstreamResponse as exc:
-                if not exc.retryable or attempt_index + 1 >= attempts:
+                if (
+                    not exc.retryable
+                    or exc.observed_model_event
+                    or exc.usage is not None
+                    or attempt_index + 1 >= attempts
+                ):
                     raise
                 if not await rotate_remote_account(
                     "upstream returned an empty response"
@@ -9634,6 +9858,11 @@ async def _run_remote_with_retry(
                     raise
                 continue
             except RuntimeError as exc:
+                if (
+                    bool(getattr(exc, "observed_model_event", False))
+                    or getattr(exc, "usage", None) is not None
+                ):
+                    raise
                 message = str(exc)
                 lowered = message.lower()
                 unavailable = (
@@ -9645,7 +9874,7 @@ async def _run_remote_with_retry(
                     # missing the requested model is not a request failure;
                     # rotate to the next polling account that can serve it.
                     reason = "model unavailable on bound account"
-                elif "parallel" in lowered or "429" in lowered:
+                elif _is_remote_account_capacity_error(exc) or "429" in lowered:
                     reason = "parallel limit"
                 else:
                     raise
@@ -9665,13 +9894,24 @@ async def _run_remote_with_retry(
 def _is_native_rate_limit_error(error: Any) -> bool:
     """Return whether a native IDE/SOLO failure is a pre-output rate limit.
 
-    TraeCode reports account-level throttling as business code ``4011`` while
-    some gateway variants expose the same condition as HTTP ``429`` or a
+    TraeCode reports account-level throttling as business codes ``3004`` and
+    ``4011`` while some gateway variants expose it as HTTP ``429`` or a
     human-readable rate-limit message.  Parameter errors such as ``4001`` are
     deliberately excluded: retrying those with another account cannot repair
     an invalid request envelope.
     """
 
+    if isinstance(error, EmptyUpstreamResponse) and (
+        not error.retryable
+        or error.observed_model_event
+        or error.usage is not None
+    ):
+        return False
+    code = str(getattr(error, "code", "") or "").strip()
+    if code in {"3004", "4011", "429"}:
+        return True
+    if code == "4001":
+        return False
     detail = str(error or "").strip().lower()
     if not detail:
         return False
@@ -9791,7 +10031,14 @@ async def _run_ide_stream_with_retry(
         return False
 
     def retryable_before_output(exc: Exception, saw_output: bool) -> bool:
-        if saw_output:
+        if saw_output or (
+            isinstance(exc, EmptyUpstreamResponse)
+            and (
+                not exc.retryable
+                or exc.observed_model_event
+                or exc.usage is not None
+            )
+        ):
             return False
         if _is_native_rate_limit_error(exc):
             return True

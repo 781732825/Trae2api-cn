@@ -2759,3 +2759,257 @@ class RawUpstreamErrorEventTests(unittest.TestCase):
         self.assertFalse(raised.exception.retryable)
         self.assertTrue(raised.exception.observed_model_event)
         self.assertEqual(raised.exception.usage["prompt_tokens"], 11)
+
+
+class EmptyResponseBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _native_response(event, payloads):
+        lines = []
+        for payload in payloads:
+            lines.extend((f"event: {event}", "data: " + json.dumps(payload)))
+        lines.append("data: [DONE]")
+        return _LineResponse(lines)
+
+    @staticmethod
+    def _remote_events(event, payloads):
+        async def events():
+            for payload in payloads:
+                yield event, payload
+            yield "done", {}
+
+        return events()
+
+    @staticmethod
+    def _content(chunks):
+        parsed, done = _parse_chunks(chunks)
+        return "".join(
+            choice.get("delta", {}).get("content", "")
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+        ), done
+
+    def test_native_whitespace_does_not_start_strict_stream(self):
+        for event, key in (("output", "response"), ("text_delta", "delta")):
+            with self.subTest(event=event):
+                emitted = []
+
+                async def run():
+                    response = self._native_response(event, [{key: " \n\t "}])
+                    async for chunk in sse.translate_ide_stream(
+                        response, "m", fail_on_empty=True
+                    ):
+                        emitted.append(chunk)
+
+                with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+                    asyncio.run(run())
+
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(emitted, [])
+
+    def test_native_whitespace_nonstream_is_empty(self):
+        for event, key in (("output", "response"), ("translated_text", "text")):
+            with self.subTest(event=event):
+                response = self._native_response(event, [{key: " \n\t "}])
+                with self.assertRaises(sse.EmptyUpstreamResponse):
+                    asyncio.run(
+                        sse.collect_nonstream_ide(response, "m", fail_on_empty=True)
+                    )
+
+    def test_native_leading_whitespace_is_preserved_when_answer_arrives(self):
+        response = self._native_response(
+            "output", [{"response": " \n "}, {"response": " \n answer\n"}]
+        )
+        chunks = asyncio.run(
+            _collect(sse.translate_ide_stream(response, "m", fail_on_empty=True))
+        )
+        content, done = self._content(chunks)
+        self.assertEqual(content, " \n answer\n")
+        self.assertTrue(done)
+
+    def test_native_nonstream_matches_text_event_stream(self):
+        cases = (
+            ("text_delta", {"delta": "real answer"}),
+            ("translated_text", {"text": "real answer"}),
+            ("accumulated", {"content": "real answer"}),
+            ("assistant_message", {"message": {"content": "real answer"}}),
+        )
+        for event, payload in cases:
+            with self.subTest(event=event):
+                chunks = asyncio.run(
+                    _collect(
+                        sse.translate_ide_stream(
+                            self._native_response(event, [payload]),
+                            "m",
+                            fail_on_empty=True,
+                        )
+                    )
+                )
+                result = asyncio.run(
+                    sse.collect_nonstream_ide(
+                        self._native_response(event, [payload]),
+                        "m",
+                        fail_on_empty=True,
+                    )
+                )
+                content, done = self._content(chunks)
+                self.assertTrue(done)
+                self.assertEqual(content, "real answer")
+                self.assertEqual(result["choices"][0]["message"]["content"], content)
+
+    def test_native_nonstream_retains_reasoning_delta_with_answer(self):
+        response = _LineResponse(
+            [
+                "event: reasoning_delta",
+                'data: {"delta":"Inspect the file."}',
+                "event: text_delta",
+                'data: {"delta":"File verified."}',
+                "data: [DONE]",
+            ]
+        )
+        result = asyncio.run(
+            sse.collect_nonstream_ide(
+                response, "m", fail_on_empty=True, include_reasoning=True
+            )
+        )
+        message = result["choices"][0]["message"]
+        self.assertEqual(message["content"], "File verified.")
+        self.assertEqual(message["reasoning_content"], "Inspect the file.")
+
+    def test_remote_whitespace_does_not_start_strict_stream(self):
+        cases = (
+            ("message", {"content": " \n\t "}),
+            ("plan_item", {"id": "p1", "content": " \n\t "}),
+            (
+                "plan_item",
+                {"id": "p1", "thought": " \n\t ", "reasoning_content": ""},
+            ),
+            (
+                "plan_item",
+                {"id": "p1", "tool_call_info": {"name": "finish", "params": {"summary": " \n\t "}}},
+            ),
+        )
+        for event, payload in cases:
+            with self.subTest(event=event, payload=payload):
+                emitted = []
+
+                async def run():
+                    async for chunk in sse.translate_web_events(
+                        self._remote_events(event, [payload]),
+                        "m",
+                        fail_on_empty=True,
+                    ):
+                        emitted.append(chunk)
+
+                with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+                    asyncio.run(run())
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(emitted, [])
+                with self.assertRaises(sse.EmptyUpstreamResponse):
+                    asyncio.run(
+                        sse.collect_nonstream_web(
+                            self._remote_events(event, [payload]),
+                            "m",
+                            fail_on_empty=True,
+                        )
+                    )
+
+    def test_remote_leading_whitespace_is_preserved_when_answer_arrives(self):
+        for event in ("message", "plan_item"):
+            with self.subTest(event=event):
+                payloads = [
+                    {"id": "p1", "content": " \n "},
+                    {"id": "p1", "content": " \n answer\n"},
+                ]
+                chunks = asyncio.run(
+                    _collect(
+                        sse.translate_web_events(
+                            self._remote_events(event, payloads),
+                            "m",
+                            fail_on_empty=True,
+                        )
+                    )
+                )
+                content, done = self._content(chunks)
+                self.assertEqual(content, " \n answer\n")
+                self.assertTrue(done)
+
+    def test_strict_split_reasoning_only_is_empty_without_disclosure(self):
+        payload = {"id": "p1", "thought": "", "reasoning_content": "private trace"}
+        emitted = []
+
+        async def run():
+            async for chunk in sse.translate_web_events(
+                self._remote_events("plan_item", [payload]),
+                "m",
+                fail_on_empty=True,
+            ):
+                emitted.append(chunk)
+
+        with self.assertRaises(sse.EmptyUpstreamResponse) as raised:
+            asyncio.run(run())
+        self.assertFalse(raised.exception.retryable)
+        self.assertTrue(raised.exception.observed_model_event)
+        self.assertEqual(emitted, [])
+        with self.assertRaises(sse.EmptyUpstreamResponse):
+            asyncio.run(
+                sse.collect_nonstream_web(
+                    self._remote_events("plan_item", [payload]),
+                    "m",
+                    fail_on_empty=True,
+                )
+            )
+
+    def test_explicit_reasoning_only_request_keeps_its_output_contract(self):
+        payload = {"id": "p1", "thought": "", "reasoning_content": "requested trace"}
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    self._remote_events("plan_item", [payload]),
+                    "m",
+                    fail_on_empty=True,
+                    include_reasoning=True,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        reasoning = "".join(
+            choice.get("delta", {}).get("reasoning_content", "")
+            for chunk in parsed
+            for choice in chunk.get("choices", [])
+        )
+        self.assertEqual(reasoning, "requested trace")
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                self._remote_events("plan_item", [payload]),
+                "m",
+                fail_on_empty=True,
+                include_reasoning=True,
+            )
+        )
+        self.assertEqual(
+            result["choices"][0]["message"]["reasoning_content"], reasoning
+        )
+
+    def test_strict_legacy_thought_only_keeps_answer_fallback(self):
+        payload = {"id": "p1", "thought": "The answer is 42."}
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    self._remote_events("plan_item", [payload]),
+                    "m",
+                    fail_on_empty=True,
+                )
+            )
+        )
+        content, done = self._content(chunks)
+        self.assertTrue(done)
+        self.assertEqual(content, "The answer is 42.")
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                self._remote_events("plan_item", [payload]),
+                "m",
+                fail_on_empty=True,
+            )
+        )
+        self.assertEqual(result["choices"][0]["message"]["content"], content)
