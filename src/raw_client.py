@@ -8,6 +8,8 @@ filesystem, shell, edit, and other tools remain owned by the API caller.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -18,7 +20,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import httpx
 
@@ -55,9 +57,9 @@ TRAECODE_DEFAULT_GATEWAY = (
     os.environ.get("TRAE_CODE_BASE_URL")
     or "https://trae-api-cn.mchost.guru"
 ).rstrip("/")
-TRAECODE_IDE_VERSION = os.environ.get("TRAE_CODE_IDE_VERSION", "3.3.105")
+TRAECODE_IDE_VERSION = os.environ.get("TRAE_CODE_IDE_VERSION", "3.4.4")
 TRAECODE_IDE_VERSION_CODE = os.environ.get(
-    "TRAE_CODE_IDE_VERSION_CODE", "20260609"
+    "TRAE_CODE_IDE_VERSION_CODE", "20260212"
 )
 TRAECODE_DEFAULT_FUNCTION = "chat_v3"
 TRAECODE_SOLO_FUNCTIONS = {
@@ -70,6 +72,16 @@ TRAECODE_SOLO_FUNCTIONS = {
     "solo_work_remote",
 }
 TRAECODE_IDE_FUNCTIONS = {"chat_v3", "builder_v3", "builder_with_mcp_v3"}
+_TRAECODE_PROTECTED_HEADERS = {
+    "authorization",
+    "x-cloudide-token",
+    "x-ide-token",
+    "x-uid",
+    "x-app-id",
+    "x-app-function",
+    "x-ide-function",
+    "extra",
+}
 
 
 @dataclass
@@ -92,10 +104,53 @@ def _unregister_raw_session_gate(session_id: str, gate: _RawSessionGate) -> None
             _RAW_SESSION_GATES.pop(session_id, None)
 
 
-async def _acquire_raw_session_gate(session_id: str) -> Callable[[], None]:
-    """Apply the model-request capacity to a model-bound raw conversation."""
+async def _acquire_raw_session_gate(
+    session_id: str,
+    account_id: str = "",
+    token: str = "",
+    reservation_id: str = "",
+) -> Callable[[], None]:
+    """Acquire one model slot for a raw request.
+
+    Persisted accounts share the entitlement-backed pool used by Web, Remote,
+    and legacy IDE transports.  The per-session semaphore remains only for
+    unregistered/single-token integrations, where no account entitlement is
+    available.
+    """
 
     from . import trae_client
+
+    canonical_account = auth.resolve_model_account_id(account_id)
+    if not canonical_account:
+        # A few direct callers provide only the bound JWT.  Resolve its
+        # immutable billing identity before falling back to the legacy gate.
+        canonical_account = auth.resolve_model_account_id(
+            _jwt_identity(str(token or ""))
+        )
+    if canonical_account:
+        try:
+            timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+        except (TypeError, ValueError):
+            timeout = 60.0
+        slot_lease_token = await trae_client.acquire_web_slot(
+            canonical_account,
+            timeout=max(0.0, timeout),
+            reservation_id=reservation_id,
+        )
+        released = False
+        release_guard = threading.Lock()
+
+        def release_account_slot() -> None:
+            nonlocal released
+            with release_guard:
+                if released:
+                    return
+                released = True
+            trae_client.release_web_slot_owned(
+                canonical_account, slot_lease_token
+            )
+
+        return release_account_slot
 
     with _RAW_SESSION_GATES_LOCK:
         gate = _RAW_SESSION_GATES.get(session_id)
@@ -199,6 +254,211 @@ def _traecode_option(options: Optional[Mapping[str, Any]], *names: str, default:
         if name in options and options[name] is not None:
             return options[name]
     return default
+
+
+def _jwt_identity(token: str) -> str:
+    """Return an immutable account id from a valid JWT payload when present."""
+
+    parts = str(token or "").strip().split(".")
+    if len(parts) != 3 or not parts[0] or not parts[1]:
+        return ""
+
+    def decode(segment: str) -> Any:
+        padding = "=" * (-len(segment) % 4)
+        return json.loads(base64.urlsafe_b64decode(segment + padding))
+
+    try:
+        header = decode(parts[0])
+        payload = decode(parts[1])
+    except (
+        binascii.Error,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return ""
+    if not isinstance(header, Mapping) or not isinstance(payload, Mapping):
+        return ""
+
+    candidates: list[Any] = []
+    for container_name in ("data", "user", "account"):
+        container = payload.get(container_name)
+        if not isinstance(container, Mapping):
+            continue
+        candidates.extend(
+            container.get(name)
+            for name in (
+                "id",
+                "sub",
+                "user_id",
+                "userId",
+                "uid",
+                "biz_user_id",
+                "bizUserId",
+            )
+        )
+    # Match the relay's account selector: Trae's nested ``data.id`` is the
+    # billing identity, while top-level ``sub`` can describe a login subject.
+    candidates.extend(
+        payload.get(name)
+        for name in (
+            "user_id",
+            "userId",
+            "sub",
+            "uid",
+            "biz_user_id",
+            "bizUserId",
+        )
+    )
+    for candidate in candidates:
+        if isinstance(candidate, bool) or not isinstance(candidate, (str, int)):
+            continue
+        identity = str(candidate).strip()
+        if identity:
+            return identity
+    return ""
+
+
+def _traecode_mapping(value: Any) -> Optional[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str) and value.strip().startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if isinstance(parsed, Mapping):
+            return parsed
+    return None
+
+
+def _traecode_context_value(
+    options: Optional[Mapping[str, Any]], *names: str, default: Any = None
+) -> Any:
+    """Read a known client value from the account-bound Trae context."""
+
+    options = options or {}
+    containers: list[Mapping[str, Any]] = [options]
+    for key in (
+        "client_context",
+        "clientContext",
+        "common_params",
+        "commonParams",
+        "native_common_params",
+        "streamlined_common_params",
+        "streamlinedCommonParams",
+        "native_streamlined_common_params",
+        "provider_specific",
+        "providerSpecificData",
+    ):
+        container = _traecode_mapping(options.get(key))
+        if container is not None:
+            containers.append(container)
+    # These are the only nested client envelopes observed in the 3.4.4
+    # request chain. Keep the search bounded so arbitrary request data cannot
+    # become a header by coincidence.
+    for container in list(containers):
+        for key in (
+            "userParams",
+            "user_params",
+            "deviceInfo",
+            "device_info",
+            "clientInfo",
+            "client_info",
+            "commonParams",
+            "common_params",
+            "streamlinedCommonParams",
+            "streamlined_common_params",
+            "headers",
+            "header",
+        ):
+            nested = _traecode_mapping(container.get(key))
+            if nested is not None:
+                containers.append(nested)
+    for container in containers:
+        for name in names:
+            if name in container and container[name] is not None:
+                return container[name]
+    return default
+
+
+def _encoded_header_value(value: Any) -> str:
+    """Match JavaScript's encodeURIComponent used by risk-control headers."""
+
+    # Direct 3.4.4 clients already send these values encoded. Normalize once
+    # before replay so a proxy hop never turns ``%20`` into ``%2520``.
+    return quote(unquote(str(value)), safe="-_.!~*'()")
+
+
+def _authorized_services_header(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, Mapping):
+        return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        services = [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, (set, frozenset)):
+            services.sort()
+        return ",".join(services)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+_TRAECODE_RAW_V2_OPTION_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("message", ("message",)),
+    ("is_custom_model", ("is_custom_model", "isCustomModel")),
+    ("provider", ("provider",)),
+    ("Request", ("Request", "request")),
+    (
+        "encrypted_model_params",
+        ("encrypted_model_params", "encryptedModelParams"),
+    ),
+    ("user_input", ("user_input", "userInput")),
+    ("request_type", ("request_type", "requestType")),
+    ("metadata", ("metadata",)),
+    ("queue_id", ("queue_id", "queueId")),
+    ("request_seq", ("request_seq", "requestSeq")),
+    ("mode_type", ("mode_type", "modeType")),
+    ("chat_mode", ("chat_mode", "chatMode")),
+    ("access_type", ("access_type", "accessType")),
+    ("image_config", ("image_config", "imageConfig")),
+    (
+        "estimate_prompt_tokens",
+        ("estimate_prompt_tokens", "estimatePromptTokens"),
+    ),
+    ("slash_command", ("slash_command", "slashCommand")),
+    ("message_origin", ("message_origin", "messageOrigin")),
+    ("reasoning_effort", ("reasoning_effort", "reasoningEffort")),
+    ("retry_times", ("retry_times", "retryTimes")),
+    ("queue_retry", ("queue_retry", "queueRetry")),
+    ("video_config", ("video_config", "videoConfig")),
+    (
+        "connect_check_param",
+        ("connect_check_param", "connectCheckParam"),
+    ),
+    (
+        "user_selected_model_name",
+        ("user_selected_model_name", "userSelectedModelName"),
+    ),
+    (
+        "reasoning_effort_level",
+        ("reasoning_effort_level", "reasoningEffortLevel"),
+    ),
+    (
+        "estimated_token_usage",
+        ("estimated_token_usage", "estimatedTokenUsage"),
+    ),
+    (
+        "custom_model_uniq_id",
+        ("custom_model_uniq_id", "customModelUniqId"),
+    ),
+    ("provider_context", ("provider_context", "providerContext")),
+    ("biz_context", ("biz_context", "bizContext")),
+    ("extra_info", ("extra_info", "extraInfo")),
+    ("use_fast_request", ("use_fast_request", "useFastRequest")),
+)
 
 
 def _normalize_traecode_function(value: Any, *, solo: bool = False) -> str:
@@ -423,6 +683,7 @@ async def resolve_traecode_model_for_request(
                     else None
                 ),
                 max_mode=max_mode,
+                raw_chat_function=str(native_function),
             )
             if isinstance(live, Mapping):
                 return RawModel(
@@ -726,15 +987,13 @@ def build_traecode_chat_body(
         "config_source": int(resolved.config_source or 1),
         "messages": body_messages,
     }
-    # The TraeCode raw-chat wire envelope is stricter than the in-process
-    # ``CustomModel`` structure described by the desktop client.  The captured
-    # IDE/SOLO request contains the model/function binding and messages, but no
-    # top-level ``reasoning_effort`` member.  The desktop model descriptor can
-    # expose an effort field without the raw gateway accepting it here; sending
-    # ``extra_high`` (the normalized value for ``ultra``) makes the gateway
-    # reject otherwise valid requests with ``param is invalid``.  Keep the
-    # requested value in relay metadata/usage records, but do not put this
-    # unverified field on the native raw request.
+    # Trae 3.4.4 expanded the shared Work/Code raw-v2 DTO. Only copy fields
+    # explicitly supplied by the caller: defaults for queueing, effort, and
+    # client mode belong to the selected upstream model configuration.
+    for wire_name, aliases in _TRAECODE_RAW_V2_OPTION_FIELDS:
+        value = _traecode_option(options, *aliases, default=None)
+        if value is not None:
+            body[wire_name] = copy.deepcopy(value)
     if native_tools and isinstance(tools, list) and tools:
         converted_tools = _traecode_tool_definitions(tools)
         if converted_tools:
@@ -760,20 +1019,20 @@ def build_traecode_headers(
     """Build the TraeCode CN header set without leaking TraeWork ``Extra``."""
 
     options = options or {}
-    user_id = str(
-        _traecode_option(
-            options,
-            "_auth_user_id",
-            "auth_user_id",
-            "_billing_id",
-            "billing_id",
-            "_account_id",
-            "account_id",
-            default=None,
-        )
-        or auth.get_user_id()
-        or ""
+    bound_user_id = _traecode_option(
+        options,
+        "_auth_user_id",
+        "auth_user_id",
+        "_billing_id",
+        "billing_id",
+        "_account_id",
+        "account_id",
+        default=None,
     )
+    # Session options can outlive a credential refresh or account rotation.
+    # When the token is a real JWT its immutable identity is authoritative;
+    # opaque legacy tokens retain the existing explicit-binding fallback.
+    user_id = str(_jwt_identity(token) or bound_user_id or auth.get_user_id() or "")
     try:
         from . import trae_client
 
@@ -836,17 +1095,115 @@ def build_traecode_headers(
     put("Accept", "text/event-stream")
     put("Connection", "keep-alive")
     put("X-App-Id", app_id)
-    put("X-App-Version", "default")
+    put(
+        "X-App-Version",
+        _traecode_context_value(
+            options,
+            "app_version",
+            "appVersion",
+            default="default",
+        ),
+    )
     put("X-App-Version-Code", version_code)
     put("X-Ide-Version", version)
     put("X-Ide-Version-Code", version_code)
-    put("X-Ide-Version-Type", "stable")
+    put(
+        "X-Ide-Version-Type",
+        _traecode_context_value(
+            options,
+            "ide_version_type",
+            "ideVersionType",
+            "version_type",
+            "versionType",
+            default="stable",
+        ),
+    )
+    put(
+        "X-Plugin-Channel",
+        _traecode_context_value(
+            options,
+            "plugin_channel",
+            "pluginChannel",
+            "channel",
+            default="desktop",
+        ),
+    )
     put("X-App-Function", raw_chat_function)
     put("X-Ide-Function", raw_chat_function)
     put("X-Request-Id", request_id)
     put("X-Custom-Trace-Id", trace_id)
     put("X-Flow-Traceparent", f"04-{trace_id}-{secrets.token_hex(8)}-01")
-    put("request-traffic-type", "prod")
+    put(
+        "request-traffic-type",
+        _traecode_context_value(
+            options,
+            "request_traffic_type",
+            "requestTrafficType",
+            default="prod",
+        ),
+    )
+
+    risk_headers = (
+        (
+            "X-Device-Cpu",
+            ("cpu", "device_cpu", "deviceCpu"),
+        ),
+        (
+            "X-Device-Id",
+            (
+                "guaranteedDeviceId",
+                "guaranteed_device_id",
+                "device_id",
+                "deviceId",
+            ),
+        ),
+        ("X-Machine-Id", ("machine_id", "machineId")),
+        ("X-Device-Brand", ("device_model", "deviceModel", "device_brand")),
+        ("X-Device-Type", ("os_name", "osName", "device_type", "deviceType")),
+        ("X-Os-Version", ("os_version", "osVersion")),
+    )
+    for header_name, aliases in risk_headers:
+        value = _traecode_context_value(options, *aliases, default=None)
+        if value not in (None, ""):
+            put(header_name, _encoded_header_value(value))
+
+    web_id = _traecode_context_value(options, "web_id", "webId", default=None)
+    if web_id not in (None, ""):
+        put("X-Web-Id", web_id)
+
+    ppe_env = _traecode_context_value(
+        options,
+        "ppe_env_name",
+        "ppeEnvName",
+        "tt_env",
+        "ttEnv",
+        "x_tt_env",
+        default=None,
+    )
+    if ppe_env not in (None, ""):
+        put("X-Tt-Env", ppe_env)
+        put(
+            "X-Use-Ppe",
+            _traecode_context_value(
+                options,
+                "use_ppe",
+                "usePpe",
+                "x_use_ppe",
+                default="1",
+            ),
+        )
+
+    authorized_services = _authorized_services_header(
+        _traecode_context_value(
+            options,
+            "authorized_services",
+            "authorizedServices",
+            "trae_authorized_services",
+            default=None,
+        )
+    )
+    if authorized_services:
+        put("X-Trae-Authorized-Services", authorized_services)
     if user_id:
         put("X-Uid", user_id)
     else:
@@ -879,6 +1236,12 @@ def build_traecode_headers(
     custom_headers = _traecode_option(options, "headers", "traecode_headers", default={})
     if isinstance(custom_headers, Mapping):
         for key, value in custom_headers.items():
+            if str(key).strip().lower() in _TRAECODE_PROTECTED_HEADERS:
+                logger.warning(
+                    "ignored TraeCode custom override for protected header %s",
+                    key,
+                )
+                continue
             put(str(key), value)
     return headers
 
@@ -1036,7 +1399,12 @@ async def send_traecode_chat_request(
         len(_traecode_tool_definitions(options.get("tools") or options.get("_inherited_tools"))),
     )
 
-    release_session = await _acquire_raw_session_gate(session_id)
+    release_session = await _acquire_raw_session_gate(
+        session_id,
+        str(options.get("_account_id") or ""),
+        token,
+        str(options.get("_account_slot_reservation_id") or ""),
+    )
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
     endpoints = [TRAECODE_RAW_CHAT_ENDPOINT]
     if bool(_traecode_option(options, "_traecode_allow_v1_fallback", default=True)):
@@ -2820,7 +3188,12 @@ async def send_raw_chat_request(
     )
     timeout = float(os.environ.get("STREAM_TIMEOUT", "300"))
 
-    release_session = await _acquire_raw_session_gate(upstream_session_id)
+    release_session = await _acquire_raw_session_gate(
+        upstream_session_id,
+        str(options.get("_account_id") or ""),
+        token,
+        str(options.get("_account_slot_reservation_id") or ""),
+    )
 
     def open_stream() -> RawChatResponse:
         client: Optional[httpx.Client] = None

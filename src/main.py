@@ -83,7 +83,9 @@ from .model_limits import (
     MULTIMODAL_FALLBACK_ORDER,
     clamp_max_completion_tokens,
     configured_multimodal_model,
-    is_multimodal_model,
+    descriptor_max_context,
+    descriptor_multimodal,
+    descriptor_supports_max_mode,
 )
 from .sse import (
     EmptyUpstreamResponse,
@@ -543,6 +545,23 @@ class _ModelAccountUnavailable(RuntimeError):
     """No enabled credential can receive this model request."""
 
 
+def _cancel_unclaimed_account_slot(options: Optional[Mapping[str, Any]]) -> bool:
+    """Return a scheduler reservation that no transport consumed."""
+
+    if not options or not options.get("_account_slot_reserved"):
+        return False
+    account_id = str(
+        options.get("_account_slot_reservation_account")
+        or options.get("_account_id")
+        or ""
+    )
+    reservation_id = str(options.get("_account_slot_reservation_id") or "")
+    cancelled = auth.cancel_account_slot_reservation(account_id, reservation_id)
+    if cancelled and isinstance(options, dict):
+        options["_account_slot_reserved"] = False
+    return cancelled
+
+
 def _ensure_model_account_enabled(account_id: str = "", token: str = "") -> None:
     identities = {str(account_id or ""), _account_id_from_token(token)} - {""}
     for identity in identities:
@@ -983,7 +1002,7 @@ def _apply_parsed_creds(p: dict) -> None:
     )
 
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 
 # Inline Lucide icons (ISC license) so the intranet console has no CDN dependency.
 _LUCIDE_ICONS = {
@@ -4681,15 +4700,18 @@ async def _deferred_dispatch_stream(
         yield "data: [DONE]\n\n"
         saw_done = True
     finally:
-        await _await_session_cleanup(asyncio.create_task(close_dispatch()))
-        logger.info(
-            "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
-            request_id,
-            stream_status,
-            upstream_chunks,
-            saw_done,
-            int((time.monotonic() - started_at) * 1000),
-        )
+        try:
+            await _await_session_cleanup(asyncio.create_task(close_dispatch()))
+        finally:
+            _cancel_unclaimed_account_slot(options)
+            logger.info(
+                "public stream closed id=%s status=%s chunks=%d done=%s elapsed_ms=%d",
+                request_id,
+                stream_status,
+                upstream_chunks,
+                saw_done,
+                int((time.monotonic() - started_at) * 1000),
+            )
 
 
 def _continuation_allowed(options: Optional[Mapping[str, Any]]) -> bool:
@@ -5030,8 +5052,11 @@ async def _nonstream_with_continuation(
         status = "error"
         raise
     finally:
-        _USAGE_TRACKER.reset(context_token)
-        await tracker.finish(status)
+        try:
+            _USAGE_TRACKER.reset(context_token)
+            await tracker.finish(status)
+        finally:
+            _cancel_unclaimed_account_slot(options)
 
     if merged is None:
         return _openai_error(502, "Upstream returned no completion", "api_error")
@@ -5501,6 +5526,7 @@ def _bind_chat_session(
     now = time.monotonic()
     with _CHAT_SESSION_LOCK:
         _prune_chat_sessions(now)
+        polling_enabled = bool(auth.get_polling_status().get("enabled"))
         session_id = requested_session_id.strip()
         inferred_account_snapshot: tuple[str, dict] | None = None
         if not session_id and _chat_has_prior_turn(messages):
@@ -5525,7 +5551,8 @@ def _bind_chat_session(
                         (inferred_account_snapshot or ("", {}))[0] or ""
                     )
                     if (
-                        active_account
+                        not polling_enabled
+                        and active_account
                         and candidate_lease is not None
                         and candidate_lease.account_id
                         and candidate_lease.account_id != active_account
@@ -5538,8 +5565,31 @@ def _bind_chat_session(
             session_id = uuid_mod.uuid4().hex
 
         lease = _UPSTREAM_SESSION_LEASES.get(session_id)
+        # A reservation belongs to this API request, not to the logical chat
+        # lease.  It is consumed by the selected transport (or cancelled by
+        # the dispatch wrapper if routing fails before a transport opens).
+        slot_reserved = False
+        slot_reservation_account = ""
+        slot_reservation_id = ""
         if lease is None:
-            if rotate_for_new and _current_upstream_mode() in (
+            upstream_mode = _current_upstream_mode()
+            slot_mode = upstream_mode not in ("", "cli")
+            selected_snapshot: tuple[str, dict] | None = None
+            account_rows = auth.get_accounts_raw() if slot_mode else []
+            if rotate_for_new and slot_mode and account_rows:
+                # Selection and reservation are one operation.  This is what
+                # lets credit-priority polling fill every entitlement slot on
+                # the richest account before moving to the next account.
+                selected_snapshot = auth.reserve_model_account(
+                    require_polling=polling_enabled
+                )
+                if selected_snapshot[0]:
+                    slot_reserved = True
+                    slot_reservation_account = selected_snapshot[0]
+                    slot_reservation_id = str(
+                        selected_snapshot[1].get("_slot_reservation_id") or ""
+                    )
+            if rotate_for_new and selected_snapshot is None and upstream_mode in (
                 "raw",
                 "direct",
                 "web",
@@ -5552,13 +5602,16 @@ def _bind_chat_session(
                 "work",
                 "work-agent",
             ):
+                # Keep the legacy rotation hook for single-token/test
+                # deployments that have no persisted account rows.  Known
+                # accounts are selected by ``reserve_model_account`` above.
                 auth.next_polling_account()
             # Read the selected id and its credential record as one snapshot.
             # Separate getter calls can race an account rotation and bind an
             # account id to a different account's token.
-            if inferred_account_snapshot is not None and not bool(
-                auth.get_polling_status().get("enabled")
-            ):
+            if selected_snapshot is not None and selected_snapshot[0]:
+                account_id, record = selected_snapshot
+            elif inferred_account_snapshot is not None and not polling_enabled:
                 account_id, record = inferred_account_snapshot
             else:
                 account_id, record = auth.get_active_account_snapshot()
@@ -5581,7 +5634,17 @@ def _bind_chat_session(
                 account_id = auth.get_active_account_id() or ""
             if account_id and not record:
                 record = auth.get_account_record(account_id)
-            _ensure_model_account_enabled(account_id, str(record.get("token") or ""))
+            try:
+                _ensure_model_account_enabled(
+                    account_id, str(record.get("token") or "")
+                )
+            except BaseException:
+                if slot_reserved:
+                    auth.cancel_account_slot_reservation(
+                        slot_reservation_account or account_id,
+                        slot_reservation_id,
+                    )
+                raise
             token = str(record.get("token") or "")
             if not token and not account_id:
                 # Preserve the CLI/env single-credential path when the
@@ -5611,6 +5674,22 @@ def _bind_chat_session(
             # A continuation must stay on the credential captured for its first
             # turn. Do not rotate accounts, call refresh, or mutate global auth.
             _ensure_model_account_enabled(lease.account_id, lease.auth_token)
+            if (
+                _current_upstream_mode() not in ("", "cli")
+                and auth.get_accounts_raw()
+            ):
+                # A logical session can have multiple simultaneous turns.  Each
+                # turn therefore reserves its own account slot while retaining
+                # the session's credential affinity.
+                selected_snapshot = auth.reserve_model_account(
+                    preferred_account_id=lease.account_id
+                )
+                if selected_snapshot[0]:
+                    slot_reserved = True
+                    slot_reservation_account = selected_snapshot[0]
+                    slot_reservation_id = str(
+                        selected_snapshot[1].get("_slot_reservation_id") or ""
+                    )
             lease.last_client_activity = now
             _UPSTREAM_SESSION_LEASES.move_to_end(session_id)
 
@@ -5619,6 +5698,12 @@ def _bind_chat_session(
 
     bound = dict(options)
     bound["session_id"] = session_id
+    if slot_reserved:
+        bound["_account_slot_reserved"] = True
+        bound["_account_slot_reservation_account"] = (
+            slot_reservation_account or lease.account_id
+        )
+        bound["_account_slot_reservation_id"] = slot_reservation_id
     if lease.account_id:
         bound["_account_id"] = lease.account_id
         if _current_upstream_mode() in ("raw", "direct", "auto"):
@@ -6136,9 +6221,10 @@ def _context_mode_metadata(
         if not requested_max
         else None
     )
+    # A max acknowledgement does not itself prove the descriptor's context
+    # window.  Keep the value unknown unless the bound model descriptor/trace
+    # supplied an explicit token count; never synthesize a 1M capability.
     window = _number_value(trace.get("max_context_tokens"))
-    if window is None and applied_max is True:
-        window = 1_000_000
     return requested, actual, window, applied_max
 
 
@@ -8004,8 +8090,11 @@ async def _tracked_dispatch(
         status = "error"
         raise
     finally:
-        _USAGE_TRACKER.reset(context_token)
-        await tracker.finish(status)
+        try:
+            _USAGE_TRACKER.reset(context_token)
+            await tracker.finish(status)
+        finally:
+            _cancel_unclaimed_account_slot(options)
 
 
 async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = None):
@@ -8146,8 +8235,12 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
     bound_options["provider_specific"] = (
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
-    await trae_client.acquire_web_slot(
-        account_id, timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+    slot_lease_token = await trae_client.acquire_web_slot(
+        account_id,
+        timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+        reservation_id=str(
+            bound_options.get("_account_slot_reservation_id") or ""
+        ),
     )
     client = None
     session_id = ""
@@ -8170,7 +8263,7 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
                 if client is not None:
                     await client.aclose()
             finally:
-                trae_client.release_web_slot(account_id)
+                trae_client.release_web_slot_owned(account_id, slot_lease_token)
 
     async def close_web_session() -> None:
         nonlocal cleanup_task
@@ -8194,6 +8287,7 @@ async def run_web_session(messages, model, stream: bool, options: Optional[dict]
             client,
             token=token,
             provider_specific=bound_options.get("provider_specific"),
+            slot_lease_token=slot_lease_token,
         )
         lease_registered = True
         event_iter = trae_client.stream_web_events(
@@ -8326,6 +8420,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         dict(provider_specific) if isinstance(provider_specific, Mapping) else {}
     )
     slot_released = False
+    slot_lease_token = ""
     cleanup_task = None
 
     def release_slot_once() -> None:
@@ -8335,7 +8430,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
         if slot_released:
             return
         slot_released = True
-        trae_client.release_web_slot(account_id)
+        trae_client.release_web_slot_owned(account_id, slot_lease_token)
 
     client = None
     session_id = ""
@@ -8500,9 +8595,12 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
             query_chars_before_bound,
             query_chars_after_bound,
         )
-    await trae_client.acquire_web_slot(
+    slot_lease_token = await trae_client.acquire_web_slot(
         account_id,
         timeout=float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")),
+        reservation_id=str(
+            remote_options.get("_account_slot_reservation_id") or ""
+        ),
     )
     try:
         client = httpx.AsyncClient(timeout=None)
@@ -8646,6 +8744,7 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                         )
                         await close_remote_session()
                         slot_reacquired = False
+                        retry_slot_lease_token = ""
                         retry_client = None
                         retry_session_id = ""
                         retry_message_id = ""
@@ -8670,7 +8769,10 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                         await retry_client.aclose()
                                 finally:
                                     if slot_reacquired:
-                                        trae_client.release_web_slot(retry_account_id)
+                                        trae_client.release_web_slot_owned(
+                                            retry_account_id,
+                                            retry_slot_lease_token,
+                                        )
 
                         try:
                             retry_options = dict(remote_options)
@@ -8693,56 +8795,54 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 quota_exhausted
                                 or not (can_work_fallback and work_fallback_used)
                             ):
+                                _cancel_unclaimed_account_slot(retry_options)
                                 next_snapshot = _next_retry_account_snapshot(
                                     {_retry_account_key(options, 0)}, 1
                                 )
                                 if next_snapshot is not None:
                                     next_account_id, record = next_snapshot
                                     retry_account_id = next_account_id
-                                    retry_token = (
-                                        str(record.get("token") or "") or retry_token
-                                    )
-                                    retry_billing_id = (
-                                        _account_id_from_token(retry_token)
-                                        or next_account_id
-                                    )
-                                    retry_options = dict(retry_options)
-                                    retry_options["_account_id"] = next_account_id
-                                    retry_options["_billing_id"] = retry_billing_id
-                                    retry_options["_auth_token"] = retry_token
-                                    retry_options["_auth_user_id"] = retry_billing_id
-                                    retry_provider = (
-                                        record.get("provider_specific")
-                                        or record.get("providerSpecificData")
-                                        or {}
-                                    )
-                                    if isinstance(retry_provider, Mapping):
-                                        retry_options["provider_specific"] = dict(
-                                            retry_provider
-                                        )
-                                    retry_tracker = _USAGE_TRACKER.get()
-                                    if retry_tracker is not None:
-                                        await retry_tracker.rebind(retry_options)
-                                    _rebind_chat_session_account(
-                                        str(
-                                            retry_options.get("session_id")
-                                            or retry_options.get("sessionId")
-                                            or ""
-                                        ),
-                                        next_account_id,
-                                        retry_billing_id,
+                                    (
+                                        retry_options,
                                         retry_token,
+                                        retry_billing_id,
                                         retry_provider,
+                                    ) = _retry_options_for_account(
+                                        retry_options, next_account_id, record
                                     )
+                                    try:
+                                        retry_tracker = _USAGE_TRACKER.get()
+                                        if retry_tracker is not None:
+                                            await retry_tracker.rebind(retry_options)
+                                        _rebind_chat_session_account(
+                                            str(
+                                                retry_options.get("session_id")
+                                                or retry_options.get("sessionId")
+                                                or ""
+                                            ),
+                                            next_account_id,
+                                            retry_billing_id,
+                                            retry_token,
+                                            retry_provider,
+                                        )
+                                    except BaseException:
+                                        _cancel_unclaimed_account_slot(retry_options)
+                                        raise
                                 elif quota_exhausted:
                                     # Do not reacquire the exhausted account
                                     # and replay the turn. The caller receives
                                     # the original quota error instead.
                                     raise
-                            await trae_client.acquire_web_slot(
+                            retry_slot_lease_token = await trae_client.acquire_web_slot(
                                 retry_account_id,
                                 timeout=float(
                                     os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60")
+                                ),
+                                reservation_id=str(
+                                    retry_options.get(
+                                        "_account_slot_reservation_id"
+                                    )
+                                    or ""
                                 ),
                             )
                             slot_reacquired = True
@@ -8790,9 +8890,12 @@ async def run_remote_session(messages, model, stream: bool, options: Optional[di
                                 yield chunk
                             stream_status = "completed"
                         finally:
-                            await _await_session_cleanup(
-                                asyncio.create_task(cleanup_retry_session())
-                            )
+                            try:
+                                await _await_session_cleanup(
+                                    asyncio.create_task(cleanup_retry_session())
+                                )
+                            finally:
+                                _cancel_unclaimed_account_slot(retry_options)
                 except asyncio.CancelledError:
                     stream_status = "client_cancelled"
                     raise
@@ -9141,15 +9244,73 @@ async def run_traework_native_chat(
     to load a Windows PE DLL.
     """
 
+    options = dict(options or {})
     translation_options = _tool_translation_options(options, messages)
     upstream_metadata: dict[str, Any] = {}
-    native_resp = await traework_native_bridge.send_native_chat_request(
-        messages,
-        model,
-        stream=stream,
-        options=options,
+    requested_slot_account = str(options.get("_account_id") or "").strip()
+    slot_account_id = auth.resolve_model_account_id(requested_slot_account)
+    if not slot_account_id:
+        slot_account_id = requested_slot_account
+    if not slot_account_id and options.get("_auth_token"):
+        slot_account_id = "token:" + hashlib.sha256(
+            str(options.get("_auth_token")).encode("utf-8")
+        ).hexdigest()
+    slot_acquired = False
+    slot_released = False
+    slot_lease_token = ""
+    slot_release_lock = threading.Lock()
+
+    def release_slot_once() -> None:
+        nonlocal slot_released
+        with slot_release_lock:
+            if slot_released:
+                return
+            slot_released = True
+        if slot_acquired:
+            trae_client.release_web_slot_owned(
+                slot_account_id, slot_lease_token
+            )
+
+    if slot_account_id:
+        try:
+            slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
+        except (TypeError, ValueError):
+            slot_timeout = 60.0
+        slot_lease_token = await trae_client.acquire_web_slot(
+            slot_account_id,
+            timeout=max(0.0, slot_timeout),
+            reservation_id=str(
+                options.get("_account_slot_reservation_id") or ""
+            ),
+        )
+        slot_acquired = True
+    try:
+        native_resp = await traework_native_bridge.send_native_chat_request(
+            messages,
+            model,
+            stream=stream,
+            options=options,
+        )
+    except BaseException:
+        release_slot_once()
+        raise
+    close_native_response = _chat_response_closer(
+        native_resp, upstream_metadata
     )
-    close_response = _chat_response_closer(native_resp, upstream_metadata)
+    close_task = None
+
+    async def close_response() -> None:
+        nonlocal close_task
+        if close_task is None:
+            async def cleanup() -> None:
+                try:
+                    await close_native_response()
+                finally:
+                    release_slot_once()
+
+            close_task = asyncio.create_task(cleanup())
+        await _await_session_cleanup(close_task)
+
     if stream:
         async def gen():
             try:
@@ -9436,8 +9597,63 @@ def _polling_retry_limit(options: Optional[Mapping[str, Any]]) -> int:
 def _next_retry_account_snapshot(
     attempted_accounts: set[str], max_rotations: int
 ) -> tuple[str, dict] | None:
-    """Rotate to an account that has not already received this request."""
+    """Atomically reserve an untried account for one retry attempt.
 
+    Credit-priority selection normally keeps returning the richest account
+    while it has capacity.  That is correct for new traffic but not for an
+    account-scoped retry: once that account failed, selecting it again would
+    prevent lower-credit accounts from ever being tried.  Translate every
+    attempted billing identity back to all matching store rows, exclude them,
+    and let the auth scheduler choose and reserve the best remaining slot.
+    """
+
+    if max_rotations <= 0:
+        return None
+    excluded_account_ids: set[str] = set()
+    stored_accounts = auth.get_accounts_raw()
+    # ``list_accounts`` is the public account inventory used by the retry
+    # budget and by a few integrations that provide credentials dynamically.
+    # Use the atomic reservation ledger only when that inventory is backed by
+    # the same persisted rows.  If an integration exposes a temporary/mock
+    # inventory while the process still has unrelated persisted rows, forcing
+    # the ledger path would silently ignore the advertised accounts and make a
+    # retry look exhausted.  In the normal deployment the ids are identical
+    # (apart from filtered invalid rows), so this remains the atomic path.
+    listed_accounts = auth.list_accounts()
+    listed_ids = {
+        str(item.get("id") or "")
+        for item in listed_accounts
+        if isinstance(item, Mapping) and str(item.get("id") or "")
+    }
+    stored_ids = {str(account_id or "") for account_id, _ in stored_accounts}
+    inventory_matches_store = listed_ids == stored_ids
+    for rotation_index, (account_id, record) in enumerate(stored_accounts):
+        safe_record = dict(record) if isinstance(record, Mapping) else {}
+        candidate_key = _retry_account_key(
+            {
+                "_account_id": str(account_id or ""),
+                "_auth_token": str(safe_record.get("token") or ""),
+            },
+            rotation_index,
+        )
+        if (
+            candidate_key in attempted_accounts
+            or str(account_id or "") in attempted_accounts
+        ):
+            excluded_account_ids.add(str(account_id or ""))
+
+    if stored_accounts and inventory_matches_store:
+        account_id, record = auth.reserve_model_account(
+            require_polling=True,
+            excluded_account_ids=excluded_account_ids,
+        )
+        if not account_id:
+            return None
+        return str(account_id), dict(record)
+
+    # Legacy/single-token integrations and tests may expose polling accounts
+    # through the compatibility getters without persisting them in auth.
+    # Retain that path only when the atomic store is genuinely empty.
     for rotation_index in range(max(1, max_rotations)):
         auth.next_polling_account()
         account_id, record = auth.get_active_account_snapshot()
@@ -9452,6 +9668,39 @@ def _next_retry_account_snapshot(
         if account_key not in attempted_accounts:
             return str(account_id or ""), safe_record
     return None
+
+
+def _retry_options_for_account(
+    options: Optional[Mapping[str, Any]], account_id: str, record: Mapping[str, Any]
+) -> tuple[dict, str, str, Mapping[str, Any]]:
+    """Bind a reserved retry slot and its immutable credential snapshot."""
+
+    rebound = dict(options or {})
+    for key in (
+        "_account_slot_reserved",
+        "_account_slot_reservation_account",
+        "_account_slot_reservation_id",
+    ):
+        rebound.pop(key, None)
+    token = str(record.get("token") or "")
+    billing_id = _account_id_from_token(token) or account_id
+    provider_specific = (
+        record.get("provider_specific")
+        or record.get("providerSpecificData")
+        or {}
+    )
+    rebound["_account_id"] = account_id
+    rebound["_billing_id"] = billing_id
+    rebound["_auth_token"] = token
+    rebound["_auth_user_id"] = billing_id
+    if isinstance(provider_specific, Mapping):
+        rebound["provider_specific"] = dict(provider_specific)
+    reservation_id = str(record.get("_slot_reservation_id") or "")
+    if reservation_id:
+        rebound["_account_slot_reserved"] = True
+        rebound["_account_slot_reservation_account"] = account_id
+        rebound["_account_slot_reservation_id"] = reservation_id
+    return rebound, token, billing_id, provider_specific
 
 
 async def _run_web_with_retry(
@@ -9472,14 +9721,18 @@ async def _run_web_with_retry(
             if account_key in attempted_accounts:
                 break
             attempted_accounts.add(account_key)
+            attempt_options = options
             try:
-                return await run_web_session(messages, model, stream, options)
+                return await run_web_session(
+                    messages, model, stream, attempt_options
+                )
             except RuntimeError as e:
                 err = str(e)
                 if "solo_agent_parallel_limit" in err or "429" in err:
                     if attempt_index + 1 >= attempts:
                         break
                     logger.warning("web 429 parallel limit, rotating account: %s", err)
+                    _cancel_unclaimed_account_slot(options)
                     next_snapshot = _next_retry_account_snapshot(
                         attempted_accounts, attempts
                     )
@@ -9488,31 +9741,35 @@ async def _run_web_with_retry(
                     # Rebind options from the newly rotated account so the
                     # retry uses the correct token and billing identity.
                     account_id, record = next_snapshot
-                    token = str(record.get("token") or "")
-                    billing_id = _account_id_from_token(token) or account_id
-                    provider_specific = (
-                        record.get("provider_specific")
-                        or record.get("providerSpecificData")
-                        or {}
-                    )
-                    options = dict(options or {})
-                    options["_account_id"] = account_id
-                    options["_billing_id"] = billing_id
-                    options["_auth_token"] = token
-                    options["_auth_user_id"] = billing_id
-                    if isinstance(provider_specific, Mapping):
-                        options["provider_specific"] = dict(provider_specific)
-                    if tracker is not None:
-                        await tracker.rebind(options)
-                    _rebind_chat_session_account(
-                        str(options.get("session_id") or options.get("sessionId") or ""),
-                        account_id,
-                        billing_id,
+                    (
+                        options,
                         token,
+                        billing_id,
                         provider_specific,
+                    ) = _retry_options_for_account(
+                        options, account_id, record
                     )
+                    try:
+                        if tracker is not None:
+                            await tracker.rebind(options)
+                        _rebind_chat_session_account(
+                            str(
+                                options.get("session_id")
+                                or options.get("sessionId")
+                                or ""
+                            ),
+                            account_id,
+                            billing_id,
+                            token,
+                            provider_specific,
+                        )
+                    except BaseException:
+                        _cancel_unclaimed_account_slot(options)
+                        raise
                     continue
                 raise
+            finally:
+                _cancel_unclaimed_account_slot(attempt_options)
         raise RuntimeError("All web accounts busy: Trae parallel limit reached")
     return await run_web_session(messages, model, stream, options)
 
@@ -9559,39 +9816,36 @@ async def _run_remote_stream_with_retry(
 
     async def rotate_account(reason: str, attempt_index: int) -> bool:
         nonlocal current_options
+        _cancel_unclaimed_account_slot(current_options)
         next_snapshot = _next_retry_account_snapshot(
             attempted_accounts, max(1, attempts)
         )
         if next_snapshot is None:
             return False
         account_id, record = next_snapshot
-        token = str(record.get("token") or "")
-        billing_id = _account_id_from_token(token) or account_id
-        provider_specific = (
-            record.get("provider_specific")
-            or record.get("providerSpecificData")
-            or {}
-        )
-        current_options = dict(current_options)
-        current_options["_account_id"] = account_id
-        current_options["_billing_id"] = billing_id
-        current_options["_auth_token"] = token
-        current_options["_auth_user_id"] = billing_id
-        if isinstance(provider_specific, Mapping):
-            current_options["provider_specific"] = dict(provider_specific)
-        if tracker is not None:
-            await tracker.rebind(current_options)
-        _rebind_chat_session_account(
-            str(
-                current_options.get("session_id")
-                or current_options.get("sessionId")
-                or ""
-            ),
-            account_id,
-            billing_id,
+        (
+            current_options,
             token,
+            billing_id,
             provider_specific,
-        )
+        ) = _retry_options_for_account(current_options, account_id, record)
+        try:
+            if tracker is not None:
+                await tracker.rebind(current_options)
+            _rebind_chat_session_account(
+                str(
+                    current_options.get("session_id")
+                    or current_options.get("sessionId")
+                    or ""
+                ),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+        except BaseException:
+            _cancel_unclaimed_account_slot(current_options)
+            raise
         logger.warning(
             "remote stream %s; rotating account attempt=%d/%d account=%s",
             reason,
@@ -9654,6 +9908,8 @@ async def _run_remote_stream_with_retry(
                 or not await rotate_account(reason, initial_attempt_index)
             ):
                 raise
+        finally:
+            _cancel_unclaimed_account_slot(initial_options)
     if initial_response is None:
         raise RuntimeError("remote stream retry ended without a response")
 
@@ -9763,8 +10019,11 @@ async def _run_remote_stream_with_retry(
                 # A failed nested stream normally runs its own generator
                 # cleanup.  Explicitly closing the wrapper prevents a
                 # transport-specific iterator from retaining the slot.
-                if response is not None:
-                    await close_response(response)
+                try:
+                    if response is not None:
+                        await close_response(response)
+                finally:
+                    _cancel_unclaimed_account_slot(local_options)
 
     async def close_unconsumed_initial_response() -> None:
         nonlocal initial_response_closed
@@ -9801,35 +10060,38 @@ async def _run_remote_with_retry(
         async def rotate_remote_account(reason: str) -> bool:
             nonlocal options
             logger.warning("remote %s, rotating account", reason)
+            _cancel_unclaimed_account_slot(options)
             next_snapshot = _next_retry_account_snapshot(
                 attempted_accounts, attempts
             )
             if next_snapshot is None:
                 return False
             account_id, record = next_snapshot
-            token = str(record.get("token") or "")
-            billing_id = _account_id_from_token(token) or account_id
-            provider_specific = (
-                record.get("provider_specific")
-                or record.get("providerSpecificData")
-                or {}
-            )
-            options = dict(options or {})
-            options["_account_id"] = account_id
-            options["_billing_id"] = billing_id
-            options["_auth_token"] = token
-            options["_auth_user_id"] = billing_id
-            if isinstance(provider_specific, Mapping):
-                options["provider_specific"] = dict(provider_specific)
-            if tracker is not None:
-                await tracker.rebind(options)
-            _rebind_chat_session_account(
-                str(options.get("session_id") or options.get("sessionId") or ""),
-                account_id,
-                billing_id,
+            (
+                options,
                 token,
+                billing_id,
                 provider_specific,
+            ) = _retry_options_for_account(
+                options, account_id, record
             )
+            try:
+                if tracker is not None:
+                    await tracker.rebind(options)
+                _rebind_chat_session_account(
+                    str(
+                        options.get("session_id")
+                        or options.get("sessionId")
+                        or ""
+                    ),
+                    account_id,
+                    billing_id,
+                    token,
+                    provider_specific,
+                )
+            except BaseException:
+                _cancel_unclaimed_account_slot(options)
+                raise
             return True
 
         for attempt_index in range(attempts):
@@ -9837,8 +10099,11 @@ async def _run_remote_with_retry(
             if account_key in attempted_accounts:
                 break
             attempted_accounts.add(account_key)
+            attempt_options = options
             try:
-                return await run_remote_session(messages, model, stream, options)
+                return await run_remote_session(
+                    messages, model, stream, attempt_options
+                )
             except RemoteQueryTooLarge:
                 # This is a deterministic request-size failure. Preserve it
                 # for the dispatcher so it can return 413 without replaying
@@ -9887,6 +10152,8 @@ async def _run_remote_with_retry(
                         raise
                     break
                 continue
+            finally:
+                _cancel_unclaimed_account_slot(attempt_options)
         raise RuntimeError("All remote accounts busy: Trae parallel limit reached")
     return await run_remote_session(messages, model, stream, options)
 
@@ -9963,34 +10230,39 @@ async def _run_ide_stream_with_retry(
     attempted_accounts: set[str] = set()
 
     async def rotate_account() -> bool:
+        nonlocal options
+        _cancel_unclaimed_account_slot(options)
         next_snapshot = _next_retry_account_snapshot(
             attempted_accounts, attempts
         )
         if next_snapshot is None:
             return False
         account_id, record = next_snapshot
-        token = str(record.get("token") or "")
-        billing_id = _account_id_from_token(token) or account_id
-        provider_specific = (
-            record.get("provider_specific")
-            or record.get("providerSpecificData")
-            or {}
-        )
-        options["_account_id"] = account_id
-        options["_billing_id"] = billing_id
-        options["_auth_token"] = token
-        options["_auth_user_id"] = billing_id
-        if isinstance(provider_specific, Mapping):
-            options["provider_specific"] = dict(provider_specific)
-        if tracker is not None:
-            await tracker.rebind(options)
-        _rebind_chat_session_account(
-            str(options.get("session_id") or options.get("sessionId") or ""),
-            account_id,
-            billing_id,
+        (
+            options,
             token,
+            billing_id,
             provider_specific,
+        ) = _retry_options_for_account(
+            options, account_id, record
         )
+        try:
+            if tracker is not None:
+                await tracker.rebind(options)
+            _rebind_chat_session_account(
+                str(
+                    options.get("session_id")
+                    or options.get("sessionId")
+                    or ""
+                ),
+                account_id,
+                billing_id,
+                token,
+                provider_specific,
+            )
+        except BaseException:
+            _cancel_unclaimed_account_slot(options)
+            raise
         logger.warning(
             "native IDE/SOLO stream rate limit, retrying on account=%s",
             account_id,
@@ -10053,7 +10325,11 @@ async def _run_ide_stream_with_retry(
         if account_key in attempted_accounts:
             raise RuntimeError("native IDE/SOLO account already attempted")
         attempted_accounts.add(account_key)
-        return await run_ide_chat(messages, model, True, options)
+        attempt_options = dict(options)
+        try:
+            return await run_ide_chat(messages, model, True, attempt_options)
+        finally:
+            _cancel_unclaimed_account_slot(attempt_options)
 
     current = None
     attempt_index = 0
@@ -10144,8 +10420,9 @@ async def _run_ide_with_retry(
         if account_key in attempted_accounts:
             break
         attempted_accounts.add(account_key)
+        attempt_options = options
         try:
-            return await run_ide_chat(messages, model, stream, options)
+            return await run_ide_chat(messages, model, stream, attempt_options)
         except Exception as exc:
             if (
                 not _is_native_rate_limit_error(exc)
@@ -10158,32 +10435,37 @@ async def _run_ide_with_retry(
             if next_snapshot is None:
                 raise
             account_id, record = next_snapshot
-            token = str(record.get("token") or "")
-            billing_id = _account_id_from_token(token) or account_id
-            provider_specific = (
-                record.get("provider_specific")
-                or record.get("providerSpecificData")
-                or {}
-            )
-            options["_account_id"] = account_id
-            options["_billing_id"] = billing_id
-            options["_auth_token"] = token
-            options["_auth_user_id"] = billing_id
-            if isinstance(provider_specific, Mapping):
-                options["provider_specific"] = dict(provider_specific)
-            if tracker is not None:
-                await tracker.rebind(options)
-            _rebind_chat_session_account(
-                str(options.get("session_id") or options.get("sessionId") or ""),
-                account_id,
-                billing_id,
+            (
+                options,
                 token,
+                billing_id,
                 provider_specific,
+            ) = _retry_options_for_account(
+                options, account_id, record
             )
+            try:
+                if tracker is not None:
+                    await tracker.rebind(options)
+                _rebind_chat_session_account(
+                    str(
+                        options.get("session_id")
+                        or options.get("sessionId")
+                        or ""
+                    ),
+                    account_id,
+                    billing_id,
+                    token,
+                    provider_specific,
+                )
+            except BaseException:
+                _cancel_unclaimed_account_slot(options)
+                raise
             logger.warning(
                 "native IDE/SOLO rate limit, retrying on account=%s",
                 account_id,
             )
+        finally:
+            _cancel_unclaimed_account_slot(attempt_options)
     raise RuntimeError("native IDE/SOLO rate-limit retry ended unexpectedly")
 
 
@@ -11171,15 +11453,20 @@ def _task_catalog_model_names(
         ttl = float(getattr(trae_client, "_WEB_MODEL_CACHE_TTL", 300) or 300)
         now = time.time()
         for agent_type in agent_types:
-            cached = cache.get(f"{account_key}:{agent_type}") if isinstance(cache, Mapping) else None
-            if (
-                isinstance(cached, tuple)
-                and len(cached) > 1
-                and now - float(cached[0]) <= ttl
-                and isinstance(cached[1], Mapping)
-            ):
-                add(cached[1])
-                break
+            if not isinstance(cache, Mapping):
+                continue
+            prefix = f"{account_key}:{agent_type}:"
+            for cache_key, cached in cache.items():
+                if str(cache_key) != prefix[:-1] and not str(cache_key).startswith(prefix):
+                    continue
+                if (
+                    isinstance(cached, tuple)
+                    and len(cached) > 1
+                    and now - float(cached[0]) <= ttl
+                    and isinstance(cached[1], Mapping)
+                ):
+                    add(cached[1])
+                    break
     return names
 
 
@@ -11306,7 +11593,103 @@ def _apply_task_model_routing(
     return effective, options
 
 
-def _multimodal_fallback_model(model: str) -> str:
+def _multimodal_catalog_match(
+    configs: Mapping[str, Any], model: Any
+) -> tuple[str, Optional[Mapping[str, Any]]]:
+    requested = str(model or "").strip().casefold()
+    if not requested:
+        return "", None
+    for name, config in configs.items():
+        if not isinstance(config, Mapping):
+            continue
+        values = trae_client._model_descriptor_values(name, config)
+        if any(value.casefold() == requested for value in values):
+            return str(name), config
+    return "", None
+
+
+def _multimodal_catalog_scope(
+    options: Optional[Mapping[str, Any]],
+) -> tuple[str, str]:
+    options = options or {}
+    endpoint = _task_model_endpoint(options)
+    explicit_function = str(
+        options.get("_traecode_raw_chat_function")
+        or options.get("raw_chat_function")
+        or ""
+    ).strip().lower()
+    if explicit_function:
+        return "", explicit_function
+    requested_agent = str(
+        options.get("_remote_agent_type")
+        or options.get("remote_agent_type")
+        or ""
+    ).strip().lower()
+    if endpoint == "work" or requested_agent in {
+        "solo_work_remote",
+        "solo_work_lite",
+        "work",
+    }:
+        return "solo_work_remote", "solo_work_remote"
+    if endpoint in {"remote", "web"} or requested_agent:
+        agent = (
+            "solo_agent_remote"
+            if requested_agent not in {"solo_work_remote", "solo_work_lite", "work"}
+            else "solo_work_remote"
+        )
+        return agent, agent
+    if endpoint == "solo":
+        return "", "solo_agent"
+    if endpoint in {"ide", "raw"}:
+        return "", "chat_v3"
+    return "", ""
+
+
+async def _load_multimodal_catalog(
+    messages: Optional[list[dict]], options: dict
+) -> None:
+    """Attach current-account/function model evidence to one request."""
+
+    if not images.messages_have_images(messages):
+        return
+    requested_model = str(options.get("_requested_model") or "").strip()
+    explicit_request = requested_model and not _task_model_is_automatic(requested_model)
+    explicit_switch = str(
+        os.environ.get("TRAE_MULTIMODAL_AUTO_SWITCH_EXPLICIT", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if explicit_request and not explicit_switch:
+        return
+    token = str(options.get("_auth_token") or "").strip()
+    user_id = str(
+        options.get("_auth_user_id")
+        or options.get("_billing_id")
+        or options.get("_account_id")
+        or ""
+    ).strip()
+    if not token:
+        return
+    provider = options.get("provider_specific")
+    if provider is None:
+        provider = options.get("providerSpecificData")
+    agent_type, raw_function = _multimodal_catalog_scope(options)
+    try:
+        configs = await trae_client.get_scoped_model_configs(
+            token_override=token,
+            user_id_override=user_id,
+            provider_specific=(dict(provider) if isinstance(provider, Mapping) else None),
+            agent_type=agent_type,
+            raw_chat_function=raw_function,
+        )
+    except Exception as exc:
+        logger.info("multimodal catalog lookup failed: %s", exc)
+        return
+    if configs:
+        options["_trae_model_capability_catalog"] = configs
+
+
+def _multimodal_fallback_model(
+    model: str, options: Optional[Mapping[str, Any]] = None
+) -> str:
     """Pick a vision-capable model for an image-bearing request.
 
     Trae's text-only configs cannot read an attached image; forwarding the
@@ -11316,29 +11699,30 @@ def _multimodal_fallback_model(model: str) -> str:
     """
 
     requested = str(model or "").strip()
-    if is_multimodal_model(requested):
+    catalog = (options or {}).get("_trae_model_capability_catalog")
+    if not isinstance(catalog, Mapping):
         return ""
-    # Models the active account actually advertises as multimodal win over the
-    # static preference order, so an account without a given model still gets
-    # a working switch instead of a 404 on the substituted name.
-    available: set[str] = set()
-    for cached in list(trae_client._WEB_MODEL_CACHE.values()):
-        configs = cached[1] if isinstance(cached, tuple) and len(cached) > 1 else {}
-        if not isinstance(configs, Mapping):
-            continue
-        for name, config in configs.items():
-            if isinstance(config, Mapping) and config.get("multimodal"):
-                available.add(str(name).strip().lower())
+    _current_name, current = _multimodal_catalog_match(catalog, requested)
+    if descriptor_multimodal(current) is True:
+        return ""
+    available: dict[str, str] = {}
+    for name, config in catalog.items():
+        if isinstance(config, Mapping) and descriptor_multimodal(config) is True:
+            available[str(name).strip().casefold()] = str(name).strip()
     candidates: list[str] = []
     override = configured_multimodal_model()
     if override:
-        candidates.append(override)
-    if available:
-        candidates.extend(
-            name for name in MULTIMODAL_FALLBACK_ORDER if name.lower() in available
-        )
-    if not candidates:
-        candidates.extend(MULTIMODAL_FALLBACK_ORDER)
+        override_name, override_config = _multimodal_catalog_match(catalog, override)
+        if override_name and descriptor_multimodal(override_config) is True:
+            candidates.append(override_name)
+    candidates.extend(
+        available[name.casefold()]
+        for name in MULTIMODAL_FALLBACK_ORDER
+        if name.casefold() in available
+    )
+    candidates.extend(
+        name for _key, name in sorted(available.items()) if name not in candidates
+    )
     for candidate in candidates:
         name = str(candidate or "").strip()
         if name and name.lower() != requested.lower():
@@ -11353,8 +11737,11 @@ def _apply_multimodal_switch(
 
     if not images.messages_have_images(messages):
         return model
-    if is_multimodal_model(model):
-        return model
+    catalog = options.get("_trae_model_capability_catalog") if isinstance(options, Mapping) else None
+    if isinstance(catalog, Mapping):
+        _name, descriptor = _multimodal_catalog_match(catalog, model)
+        if descriptor_multimodal(descriptor) is True:
+            return model
     # An explicitly selected model is part of the API contract.  Re-pointing
     # it to a vision model silently changes both the provider fingerprint and
     # the billable model (for example glm-5.2 -> kimi-k2.6).  Automatic model
@@ -11387,7 +11774,7 @@ def _apply_multimodal_switch(
         "off",
     }:
         return model
-    fallback = _multimodal_fallback_model(model)
+    fallback = _multimodal_fallback_model(model, options)
     if not fallback:
         logger.warning(
             "image request kept on text-only model=%s (no multimodal model available)",
@@ -11499,6 +11886,9 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
         active_tracker.options = options
     # A text-only config cannot read an attached image, so an image request is
     # re-pointed at a multimodal model before any routing decision is made.
+    # Load evidence for this bound account/function first; the switch helper
+    # intentionally refuses to use static model-name capability tables.
+    await _load_multimodal_catalog(messages, options)
     model = _apply_multimodal_switch(messages, model, options)
     trace = options.get("_upstream_trace")
     if active_tracker is not None:
@@ -11574,6 +11964,27 @@ async def _dispatch_chat(messages, model, stream: bool, options: Optional[dict] 
     # Keep raw/direct as explicit diagnostics instead of advertising a fallback
     # that cannot catch errors raised later by a StreamingResponse iterator.
     if options.get("_traework_custom_model"):
+        # Trae 3.4.4 Work/Code clients share the raw-v2 endpoint and declare
+        # the native function in the body/header. Route that explicit chain
+        # through the TraeCode adapter so its extended DTO, client headers,
+        # and JWT identity binding are preserved. Older custom-model calls do
+        # not set this marker and retain the Remote compatibility default.
+        if options.get("_traecode_raw_chat_function"):
+            if isinstance(trace, dict):
+                trace.update(
+                    product="trae",
+                    requested_mode="traecode",
+                    requested_endpoint="/api/ide/v2/llm_raw_chat",
+                    actual_mode="ide",
+                    actual_endpoint="/api/ide/v2/llm_raw_chat",
+                )
+            logger.info(
+                "dispatch TraeCode raw-v2 ingress id=%s model=%s function=%s",
+                str(options.get("_relay_request_id") or ""),
+                model,
+                str(options.get("_traecode_raw_chat_function") or ""),
+            )
+            return await run_ide_chat(messages, model, stream, options)
         custom_mode = str(
             options.get("_traework_upstream_mode")
             or os.environ.get("TRAEWORK_CUSTOM_UPSTREAM_MODE", "remote")
@@ -14892,23 +15303,7 @@ async def api_set_max_mode(request: Request):
 
 
 def _max_context_of(config: Mapping[str, Any]) -> int:
-    size = config.get("context_window_size")
-    if isinstance(size, Mapping):
-        raw = size.get("max")
-        if isinstance(raw, list):
-            raw = raw[0] if raw else None
-        if raw:
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                pass
-    tokens = config.get("context_window_tokens")
-    if isinstance(tokens, Mapping) and tokens.get("max"):
-        try:
-            return int(tokens.get("max"))
-        except (TypeError, ValueError):
-            pass
-    return 0
+    return descriptor_max_context(config) or 0
 
 
 @app.get("/api/max-mode/models")
@@ -14934,7 +15329,7 @@ async def api_max_mode_models():
             "max_context": _max_context_of(cfg),
         }
         for name, cfg in configs.items()
-        if isinstance(cfg, Mapping) and cfg.get("max_mode")
+        if isinstance(cfg, Mapping) and descriptor_supports_max_mode(cfg)
     ]
     if not configs:
         return JSONResponse(

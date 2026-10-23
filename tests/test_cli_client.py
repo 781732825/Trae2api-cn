@@ -197,6 +197,18 @@ class ExtractionTests(unittest.TestCase):
             delta[0]["function"]["arguments"], '{"filePath":"README.md"}'
         )
 
+    def test_normalize_tool_call_accepts_trae_tool_call_name_alias(self):
+        call = cli_client.normalize_tool_call(
+            {
+                "toolCallId": "call_alias",
+                "toolCallName": "Read",
+                "parameters": {"path": "a.txt"},
+            }
+        )
+        self.assertIsNotNone(call)
+        self.assertEqual(call["function"]["name"], "Read")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"path": "a.txt"})
+
     def test_extract_native_replay_with_same_real_id_keeps_one_call(self):
         result = {
             "tool_calls": [

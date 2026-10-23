@@ -205,7 +205,12 @@ class ImageNormalizationTests(unittest.TestCase):
                     }
                 ],
                 "glm-5.3",
-                {},
+                {
+                    "_trae_model_capability_catalog": {
+                        "kimi-k3": {"multimodal": True},
+                        "glm-5.3": {"multimodal": False},
+                    }
+                },
             )
         self.assertEqual(switched, "kimi-k3")
 

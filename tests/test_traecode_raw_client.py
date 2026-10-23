@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import threading
@@ -11,6 +12,14 @@ from src import raw_client, sse
 
 
 REAL_HTTPX_CLIENT = httpx.Client
+
+
+def _jwt(payload):
+    def segment(value):
+        raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f'{segment({"alg": "none", "typ": "JWT"})}.{segment(payload)}.signature'
 
 
 class TraeCodeRawBodyTests(unittest.TestCase):
@@ -134,7 +143,7 @@ class TraeCodeRawBodyTests(unittest.TestCase):
         )
         self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
 
-    def test_requested_effort_is_not_sent_in_raw_body(self):
+    def test_requested_effort_is_sent_in_expanded_raw_v2_body(self):
         body = raw_client.build_traecode_chat_body(
             [{"role": "user", "content": "think"}],
             "deepseek-v4.1-flash",
@@ -145,7 +154,67 @@ class TraeCodeRawBodyTests(unittest.TestCase):
             session_id="effort-session",
         )
 
-        self.assertNotIn("reasoning_effort", body)
+        self.assertEqual(body["reasoning_effort"], "ultra")
+
+    def test_expanded_raw_v2_fields_are_whitelisted_and_deep_copied(self):
+        metadata = {"nested": {"source": "test"}}
+        request_envelope = {"client_info": {"version": "3.4.4"}}
+        options = {
+            "message": {"role": "user", "content": "hello"},
+            "isCustomModel": False,
+            "provider": "volcengine",
+            "Request": request_envelope,
+            "encryptedModelParams": {"ciphertext": "encrypted"},
+            "userInput": "hello",
+            "request_type": "chat",
+            "metadata": metadata,
+            "queueId": "queue-1",
+            "request_seq": 0,
+            "modeType": "ide",
+            "chat_mode": "chat",
+            "accessType": "default",
+            "image_config": {"detail": "auto"},
+            "estimatePromptTokens": False,
+            "slash_command": {"name": "review"},
+            "messageOrigin": "input-box",
+            "reasoning_effort": "high",
+            "retryTimes": 0,
+            "queue_retry": False,
+            "videoConfig": {"fps": 1},
+            "connect_check_param": {"timeout": 3},
+            "userSelectedModelName": "GLM-5.2",
+            "reasoning_effort_level": "high",
+            "estimatedTokenUsage": {"prompt": 42},
+            "custom_model_uniq_id": "custom-1",
+            "providerContext": {"region": "cn"},
+            "biz_context": {"scene": "code"},
+            "extraInfo": {"feature": "raw-v2"},
+            "use_fast_request": False,
+            "internal_scheduler_state": {"must_not": "leak"},
+        }
+
+        body = raw_client.build_traecode_chat_body(
+            [{"role": "user", "content": "hello"}],
+            "glm-5.2",
+            options=options,
+            session_id="expanded-session",
+        )
+
+        self.assertFalse(body["is_custom_model"])
+        self.assertEqual(body["request_seq"], 0)
+        self.assertFalse(body["estimate_prompt_tokens"])
+        self.assertFalse(body["queue_retry"])
+        self.assertFalse(body["use_fast_request"])
+        self.assertEqual(body["Request"], request_envelope)
+        self.assertEqual(body["metadata"], metadata)
+        self.assertEqual(body["reasoning_effort_level"], "high")
+        self.assertEqual(body["custom_model_uniq_id"], "custom-1")
+        self.assertNotIn("internal_scheduler_state", body)
+
+        metadata["nested"]["source"] = "mutated"
+        request_envelope["client_info"]["version"] = "mutated"
+        self.assertEqual(body["metadata"]["nested"]["source"], "test")
+        self.assertEqual(body["Request"]["client_info"]["version"], "3.4.4")
 
     def test_explicit_config_source_is_preserved(self):
         body = raw_client.build_traecode_chat_body(
@@ -201,6 +270,101 @@ class TraeCodeRawBodyTests(unittest.TestCase):
 
         normalized = {key.lower(): value for key, value in headers.items()}
         self.assertEqual(normalized["x-uid"], "jwt-billing-user")
+
+    def test_traecode_headers_prefer_identity_from_parseable_jwt(self):
+        token = _jwt({"sub": "jwt-user", "data": {"id": "nested-user"}})
+        with (
+            patch.object(raw_client.auth, "get_user_id", return_value="global-user"),
+            patch("src.trae_client.build_headers", return_value={}) as build_headers,
+        ):
+            headers = raw_client.build_traecode_headers(
+                "https://gateway.example",
+                token,
+                raw_client.resolve_traecode_model("glm-5.2"),
+                "request-id",
+                {"_auth_user_id": "stale-bound-user"},
+            )
+
+        normalized = {key.lower(): value for key, value in headers.items()}
+        self.assertEqual(normalized["x-uid"], "nested-user")
+        self.assertEqual(
+            build_headers.call_args.kwargs["user_id_override"], "nested-user"
+        )
+
+    def test_traecode_headers_include_encoded_client_identity_context(self):
+        options = {
+            "client_context": {
+                "machine_id": "machine / one",
+                "device_model": "ROG Strix (2026)",
+            },
+            "provider_specific": {
+                "common_params": json.dumps(
+                    {
+                        "cpu": "Intel Core/Ultra",
+                        "device_id": "设备 1",
+                        "os_name": "Windows Desktop",
+                        "os_version": "Windows 11/24H2",
+                    }
+                ),
+                "webId": "web-123",
+                "authorizedServices": ["chat", "builder"],
+                "ppeEnvName": "boe-test",
+            },
+        }
+        with patch("src.trae_client.build_headers", return_value={}):
+            headers = raw_client.build_traecode_headers(
+                "https://gateway.example",
+                "opaque-token",
+                raw_client.resolve_traecode_model("glm-5.2"),
+                "request-id",
+                options,
+            )
+
+        normalized = {key.lower(): value for key, value in headers.items()}
+        self.assertEqual(normalized["x-device-cpu"], "Intel%20Core%2FUltra")
+        self.assertEqual(normalized["x-device-id"], "%E8%AE%BE%E5%A4%87%201")
+        self.assertEqual(normalized["x-machine-id"], "machine%20%2F%20one")
+        self.assertEqual(normalized["x-device-brand"], "ROG%20Strix%20(2026)")
+        self.assertEqual(normalized["x-device-type"], "Windows%20Desktop")
+        self.assertEqual(normalized["x-os-version"], "Windows%2011%2F24H2")
+        self.assertEqual(normalized["x-web-id"], "web-123")
+        self.assertEqual(normalized["x-tt-env"], "boe-test")
+        self.assertEqual(normalized["x-use-ppe"], "1")
+        self.assertEqual(normalized["x-trae-authorized-services"], "chat,builder")
+        self.assertEqual(normalized["x-plugin-channel"], "desktop")
+
+    def test_traecode_default_client_version_matches_344_report(self):
+        self.assertEqual(raw_client.TRAECODE_IDE_VERSION, "3.4.4")
+        self.assertEqual(raw_client.TRAECODE_IDE_VERSION_CODE, "20260212")
+
+    def test_traecode_custom_headers_cannot_override_bound_identity_or_function(self):
+        token = _jwt({"data": {"id": "bound-user"}})
+        with patch("src.trae_client.build_headers", return_value={}):
+            headers = raw_client.build_traecode_headers(
+                "https://gateway.example",
+                token,
+                raw_client.resolve_traecode_model("glm-5.2"),
+                "request-id",
+                {
+                    "headers": {
+                        "Authorization": "Cloud-IDE-JWT attacker",
+                        "x-ide-token": "attacker",
+                        "X-Uid": "attacker",
+                        "X-App-Id": "attacker-app",
+                        "X-Ide-Function": "solo_work_remote",
+                        "X-Diagnostic-Tag": "allowed",
+                    }
+                },
+                raw_chat_function="chat_v3",
+            )
+
+        normalized = {key.lower(): value for key, value in headers.items()}
+        self.assertEqual(normalized["authorization"], f"Cloud-IDE-JWT {token}")
+        self.assertEqual(normalized["x-ide-token"], token)
+        self.assertEqual(normalized["x-uid"], "bound-user")
+        self.assertEqual(normalized["x-app-id"], raw_client.TRAECODE_APP_ID)
+        self.assertEqual(normalized["x-ide-function"], "chat_v3")
+        self.assertEqual(normalized["x-diagnostic-tag"], "allowed")
 
 
 class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
@@ -660,6 +824,7 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved.raw_model_name, "glm-5__dev")
         self.assertEqual(resolved.display_name, "GLM-5.2")
         lookup.assert_awaited_once()
+        self.assertEqual(lookup.await_args.kwargs["raw_chat_function"], "chat_v3")
 
     async def test_native_function_selects_max_provider_model_id(self):
         with patch(
@@ -685,6 +850,9 @@ class TraeCodeRawTransportTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved.raw_model_name, "glm-5.2__max")
         self.assertEqual(lookup.await_args.kwargs["max_mode"], True)
+        self.assertEqual(
+            lookup.await_args.kwargs["raw_chat_function"], "solo_agent"
+        )
 
     async def test_v2_raw_chat_retries_known_gateway_after_http_rejection(self):
         requests = []

@@ -22,18 +22,18 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from . import auth, trae_client
+from .model_limits import (
+    descriptor_context_limits,
+    descriptor_max_context,
+    descriptor_supports_max_mode,
+)
 from .sse import (
     EmptyUpstreamResponse,
     _is_account_quota_error,
     _map_usage,
     _upstream_error_details,
 )
-from .reasoning_effort import (
-    apply_reasoning_effort,
-    clamp_level,
-    requested_level as requested_effort_level,
-    supported_levels,
-)
+from .reasoning_effort import apply_reasoning_effort
 
 
 logger = logging.getLogger(__name__)
@@ -45,12 +45,6 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 )
-
-DEFAULT_MAX_CONTEXT_TOKENS = 1_000_000
-DEFAULT_MAX_PROMPT_TOKENS = 936_000
-DEFAULT_MAX_OUTPUT_TOKENS = 64_000
-DEFAULT_MAX_MODE_TYPE = 1
-
 
 def _json_safe(value: Any) -> Any:
     """Return a value that can be encoded by the JSON request boundary.
@@ -241,6 +235,97 @@ def _psd_value(psd: Mapping[str, Any], key: str, default: Any = "") -> Any:
     return value if value not in (None, "") else default
 
 
+def _first_metadata_value(
+    sources: tuple[Mapping[str, Any], ...], *keys: str
+) -> Any:
+    """Return the first explicitly populated account metadata value."""
+
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _work_account_identity(
+    psd: Mapping[str, Any],
+    options: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    """Resolve Work identity from the credential bound to this request.
+
+    Billing refresh persists the authoritative pay identity both on the account
+    record and in its provider-specific snapshot.  Prefer request-bound values,
+    then consult only the explicitly bound account.  Never fall back to the
+    process-wide active account because account polling can change it while a
+    different request is still constructing its remote session.
+    """
+
+    account_id = str(
+        options.get("_account_id")
+        or options.get("_billing_id")
+        or options.get("_auth_user_id")
+        or ""
+    ).strip()
+    record: Mapping[str, Any] = {}
+    if account_id:
+        canonical = auth.resolve_model_account_id(account_id) or account_id
+        candidate = auth.get_account_record(canonical)
+        if isinstance(candidate, Mapping):
+            record = candidate
+
+    record_provider = record.get("provider_specific")
+    if not isinstance(record_provider, Mapping):
+        record_provider = record.get("providerSpecificData")
+    if not isinstance(record_provider, Mapping):
+        record_provider = {}
+    checkin = record.get("checkin")
+    if not isinstance(checkin, Mapping):
+        checkin = {}
+    credits = checkin.get("account_credits")
+    if not isinstance(credits, Mapping):
+        credits = {}
+
+    # Client-provided pay identity fields are advisory and can be stale or
+    # forged.  Once a request is bound to a persisted account, the refreshed
+    # account/provider/check-in snapshot is authoritative; only use inbound
+    # metadata as a compatibility fallback when no bound record exists.
+    if record:
+        sources = (record, record_provider, credits, options, psd)
+    else:
+        sources = (options, psd, record, record_provider, credits)
+    raw_identity = _first_metadata_value(
+        sources,
+        "user_pay_identity",
+        "userPayIdentity",
+        "pay_identity",
+        "payIdentity",
+        "identity",
+    )
+    identity_text = _first_metadata_value(
+        sources,
+        "user_pay_identity_str",
+        "userPayIdentityText",
+        "pay_identity_str",
+        "payIdentityText",
+        "account_tier",
+        "accountTier",
+        "identity_str",
+    )
+    legacy_identity = _first_metadata_value(
+        sources, "user_identity", "userIdentity"
+    )
+
+    identity_text = str(identity_text or legacy_identity or "Free").strip() or "Free"
+    # The current client reports Free as pay identity 0.  Paid identities use
+    # the numeric/string value returned by the entitlement endpoint (for
+    # example 4 / Pro+); do not collapse them back to the Free default.
+    if raw_identity is None:
+        raw_identity = "0" if identity_text.casefold() == "free" else identity_text
+    user_identity = identity_text
+    return str(raw_identity), identity_text, user_identity
+
+
 def _work_client_type_enabled(
     options: Optional[Mapping[str, Any]] = None,
 ) -> bool:
@@ -387,13 +472,16 @@ def common_params(
     local_device_id = "aha-" + hashlib.sha256(
         f"local-{account_id}-{device_id}".encode("utf-8")
     ).hexdigest()[:32]
+    pay_identity, pay_identity_text, user_identity = _work_account_identity(
+        psd, options
+    )
     params: dict[str, Any] = {
         "language": "en-us" if intl else "zh-cn",
         "app_language": _psd_value(psd, "appLanguage", default_language),
         "quality": "stable",
         "app_version": psd.get("appVersion") or "1.0.0.1229",
         "web_id": _psd_value(psd, "webId"),
-        "user_identity": _psd_value(psd, "userIdentity", "Free"),
+        "user_identity": user_identity,
         "is_freshman": "0",
         "biz_user_id": _psd_value(psd, "bizUserId"),
         "user_unique_id": _psd_value(psd, "userUniqueId"),
@@ -433,8 +521,8 @@ def common_params(
                 "cpu_speed": 0,
                 "memory": 0,
                 "chat_mode": 1,
-                "identity": "0",
-                "identity_str": "Free",
+                "identity": pay_identity,
+                "identity_str": pay_identity_text,
                 "product_code": "SOLO_Lite",
                 "message_source": "manual",
             }
@@ -562,6 +650,7 @@ async def _resolve_model_config(
     provider_data: Mapping[str, Any],
     agent_type: str,
     force_agent_type: bool = False,
+    raw_chat_function: str = "",
 ) -> Optional[dict[str, Any]]:
     """Resolve one model against the executor tier without breaking old hooks."""
 
@@ -574,6 +663,8 @@ async def _resolve_model_config(
     tier_aware = force_agent_type or _callable_accepts_keyword(resolver, "agent_type")
     if tier_aware:
         kwargs["agent_type"] = agent_type
+    if raw_chat_function and _callable_accepts_keyword(resolver, "raw_chat_function"):
+        kwargs["raw_chat_function"] = raw_chat_function
     try:
         return await resolver(model_name, **kwargs)
     except TypeError as exc:
@@ -586,53 +677,6 @@ async def _resolve_model_config(
         kwargs.pop("agent_type", None)
         logger.info("remote model resolver does not support agent_type; using legacy lookup")
         return await resolver(model_name, **kwargs)
-
-
-async def _work_tier_reasoning_effort(
-    custom_model: Any,
-    model_name: str,
-    options: Optional[Mapping[str, Any]],
-    *,
-    token: str,
-    provider_data: Mapping[str, Any],
-) -> tuple[Any, str]:
-    """Clamp a Work-tier request against the Agent-tier effort options."""
-
-    if not isinstance(custom_model, Mapping):
-        return custom_model, ""
-    user_id = str(
-        (options or {}).get("_auth_user_id")
-        or (options or {}).get("_billing_id")
-        or (options or {}).get("_account_id")
-        or ""
-    ).strip()
-    try:
-        agent_model = await _resolve_model_config(
-            model_name,
-            token=token,
-            user_id=user_id,
-            provider_data=provider_data,
-            agent_type="solo_agent_remote",
-            force_agent_type=True,
-        )
-    except Exception as exc:  # lookup failure must not break the chat
-        logger.info("work effort lookup failed model=%s err=%s", model_name, exc)
-        return custom_model, ""
-    level = clamp_level(
-        requested_effort_level(options), supported_levels(agent_model)
-    )
-    if not level:
-        return custom_model, ""
-    updated = dict(custom_model)
-    updated["reasoning_effort_config"] = dict(
-        (agent_model or {}).get("reasoning_effort_config") or {}
-    )
-    if "reasoning_effort_level" in updated:
-        updated["reasoning_effort_level"] = level
-        updated.pop("reasoning_effort", None)
-    else:
-        updated["reasoning_effort"] = level
-    return updated, level
 
 
 def _model_family(value: Any) -> str:
@@ -733,83 +777,13 @@ def _max_mode_requested(
         if value not in configured:
             return False
     # Never fabricate max limits for a model the account config does not mark.
-    return bool(custom_model and custom_model.get("max_mode"))
+    return descriptor_supports_max_mode(custom_model)
 
 
 def _max_mode_custom_model(custom_model: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a max-enriched custom_model mirroring the desktop config.
+    """Copy the account/function descriptor without inventing limits."""
 
-    The remote models endpoint returns a slim object (max_mode flag plus
-    context_window_tokens) that omits the fields the upstream uses to accept a
-    max session.  Fill them from the account values or the documented defaults
-    so the server validates the same 1M profile the local client sends.
-    """
-
-    cws = custom_model.get("context_window_size") or {}
-    raw_max = cws.get("max") or []
-    if isinstance(raw_max, int):
-        raw_max = [raw_max]
-    raw_features = custom_model.get("features") or {}
-    if isinstance(raw_features, str):
-        try:
-            raw_features = json.loads(raw_features)
-        except (TypeError, ValueError):
-            raw_features = {}
-    feature_cw = (raw_features or {}).get("context_windows") or {}
-    feature_data = feature_cw.get("data") or {}
-    tokens = custom_model.get("context_window_tokens") or {}
-    try:
-        max_context = int((raw_max or [feature_data.get("max_context") or tokens.get("max") or DEFAULT_MAX_CONTEXT_TOKENS])[0])
-    except (TypeError, ValueError):
-        max_context = DEFAULT_MAX_CONTEXT_TOKENS
-    try:
-        dev_context = int(
-            cws.get("default")
-            or feature_data.get("dev_context")
-            or tokens.get("dev")
-            or 200_000
-        )
-    except (TypeError, ValueError):
-        dev_context = 200_000
-    try:
-        prompt_max = int(custom_model.get("prompt_max_tokens") or DEFAULT_MAX_PROMPT_TOKENS)
-    except (TypeError, ValueError):
-        prompt_max = DEFAULT_MAX_PROMPT_TOKENS
-    try:
-        output_max = int(custom_model.get("max_tokens") or DEFAULT_MAX_OUTPUT_TOKENS)
-    except (TypeError, ValueError):
-        output_max = DEFAULT_MAX_OUTPUT_TOKENS
-    try:
-        max_turn = int(
-            custom_model.get("max_turn")
-            or (custom_model.get("max_turns") or {}).get("default")
-            or feature_data.get("max_turns")
-            or 500
-        )
-    except (TypeError, ValueError):
-        max_turn = 500
-
-    enriched = dict(custom_model)
-    enriched["max_mode"] = True
-    enriched["context_window_size"] = {"default": dev_context, "max": [max_context]}
-    enriched["context_window_tokens"] = {"dev": dev_context, "max": max_context}
-    enriched["prompt_max_tokens"] = prompt_max
-    enriched["max_tokens"] = output_max
-    enriched["max_turn"] = max_turn
-    enriched["max_turns"] = {"default": max_turn, "max": max_turn}
-    features = dict(raw_features)
-    cw = dict(feature_cw)
-    cw["enable"] = True
-    cw["data"] = {
-        "dev_context": dev_context,
-        "max_context": max_context,
-        "max_context_list": [max_context],
-        "dev_turns": max_turn,
-        "max_turns": max_turn,
-    }
-    features["context_windows"] = cw
-    enriched["features"] = features
-    return enriched
+    return dict(custom_model)
 
 
 def _max_mode_fields(
@@ -818,42 +792,35 @@ def _max_mode_fields(
 ) -> dict[str, Any]:
     """Return the wire fields that pin a remote session to max mode."""
 
-    cws = custom_model.get("context_window_size") or {}
-    raw_max = cws.get("max") or []
-    if isinstance(raw_max, int):
-        raw_max = [raw_max]
-    try:
-        max_context = int((raw_max or [DEFAULT_MAX_CONTEXT_TOKENS])[0])
-    except (TypeError, ValueError):
-        max_context = DEFAULT_MAX_CONTEXT_TOKENS
-    try:
-        prompt_max = int(
-            custom_model.get("prompt_max_tokens") or DEFAULT_MAX_PROMPT_TOKENS
-        )
-    except (TypeError, ValueError):
-        prompt_max = DEFAULT_MAX_PROMPT_TOKENS
-    try:
-        output_max = int(custom_model.get("max_tokens") or DEFAULT_MAX_OUTPUT_TOKENS)
-    except (TypeError, ValueError):
-        output_max = DEFAULT_MAX_OUTPUT_TOKENS
-    try:
-        mode_type = int(
-            os.environ.get("TRAE_REMOTE_MAX_MODE_TYPE", "") or DEFAULT_MAX_MODE_TYPE
-        )
-    except (TypeError, ValueError):
-        mode_type = DEFAULT_MAX_MODE_TYPE
-    return {
+    limits = descriptor_context_limits(custom_model)
+    fields: dict[str, Any] = {
         "model_auto_selection": {
             "strategy": "max",
             "fallback_to_advance_model": None,
             "entitlement_id": None,
         },
         "model_selection_strategy": "max",
-        "mode_type": mode_type,
-        "context_window_size": max_context,
-        "prompt_max_tokens": prompt_max,
-        "max_tokens": output_max,
     }
+    max_context = descriptor_max_context(custom_model)
+    if max_context is not None:
+        fields["context_window_size"] = max_context
+    for key in ("prompt_max_tokens", "max_tokens"):
+        try:
+            value = int(limits.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            fields[key] = value
+    mode_value = (options or {}).get("mode_type")
+    if mode_value in (None, ""):
+        mode_value = os.environ.get("TRAE_REMOTE_MAX_MODE_TYPE", "")
+    try:
+        mode_type = int(mode_value)
+    except (TypeError, ValueError):
+        mode_type = 0
+    if mode_type > 0:
+        fields["mode_type"] = mode_type
+    return fields
 
 
 async def create_session(
@@ -900,6 +867,11 @@ async def create_session(
                     for key in ("_remote_agent_type", "remote_agent_type")
                 )
             ),
+            raw_chat_function=str(
+                (options or {}).get("raw_chat_function")
+                or (options or {}).get("_trae_raw_chat_function")
+                or agent_type
+            ).strip(),
         )
         if not custom_model:
             raise RuntimeError(
@@ -960,28 +932,19 @@ async def create_session(
         effort_model, effort_level = apply_reasoning_effort(
             initial_message["custom_model"], options
         )
-        if (
-            not effort_level
-            and requested_effort_level(options)
-            and agent_type != "solo_agent_remote"
-        ):
-            # Work-tier model entries omit ``reasoning_effort_config``; the
-            # same model's Agent-tier entry advertises the supported levels.
-            effort_model, effort_level = await _work_tier_reasoning_effort(
-                effort_model,
-                model_name,
-                options,
-                token=token,
-                provider_data=provider_data,
-            )
         initial_message["custom_model"] = effort_model
+        trace = (options or {}).get("_upstream_trace")
         if effort_level:
             logger.info(
                 "remote reasoning effort model=%s level=%s", model_name, effort_level
             )
-            trace = (options or {}).get("_upstream_trace")
             if isinstance(trace, dict):
                 trace["reasoning_effort_applied"] = effort_level
+        elif isinstance(trace, dict):
+            # A fallback can change tiers while retaining the same trace.
+            # The final descriptor is authoritative, so do not leave an Agent
+            # effort marker on a Work request that exposes no effort config.
+            trace.pop("reasoning_effort_applied", None)
     if mode == "work":
         initial_message["__hit_shared_artifact_and_workroom"] = True
         initial_message["__hit_my_space"] = True

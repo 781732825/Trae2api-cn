@@ -102,7 +102,45 @@ class ModelListTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("glm-5.3", ids)
             self.assertIn("DeepSeek-V4-Pro", ids)
             self.assertNotIn("work", ids)
+            self.assertTrue(
+                all("capabilities_by_scope" not in item for item in items)
+            )
             self.assertEqual(trae_client._MODEL_LIST_CACHE, {})
+
+    async def test_capabilities_remain_separate_by_scope_and_copy_to_alias(self):
+        async def fetch(**kwargs):
+            return {
+                "GLM-5.3": {
+                    "name": "GLM-5.3",
+                    "_trae_endpoints": ["remote", "work"],
+                    "_trae_capabilities_by_scope": {
+                        "solo_agent_remote": {
+                            "multimodal": False,
+                            "reasoning_effort": ["light", "high", "extra_high"],
+                            "max_mode": True,
+                            "max_context": 1_000_000,
+                        },
+                        "solo_work_remote": {
+                            "multimodal": False,
+                            "max_mode": False,
+                        },
+                    },
+                }
+            }
+
+        p1, p2, p3, p4, p5 = self._patches(fetch)
+        with p1, p2, p3, p4, p5:
+            items = await trae_client.get_models(force=True)
+
+        exact = next(item for item in items if item["id"] == "GLM-5.3")
+        alias = next(item for item in items if item["id"] == "glm-5.3")
+        scopes = exact["capabilities_by_scope"]
+        self.assertTrue(scopes["solo_agent_remote"]["max_mode"])
+        self.assertEqual(scopes["solo_agent_remote"]["max_context"], 1_000_000)
+        self.assertFalse(scopes["solo_work_remote"]["max_mode"])
+        self.assertNotIn("max_context", scopes["solo_work_remote"])
+        self.assertNotIn("reasoning_effort", scopes["solo_work_remote"])
+        self.assertEqual(alias["capabilities_by_scope"], scopes)
 
     async def test_native_solo_only_model_is_merged_into_public_list(self):
         async def fetch(**kwargs):

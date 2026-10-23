@@ -571,6 +571,7 @@ async def translate_chat_stream(
             "id": call_id,
             "name": name,
             "arguments": "",
+            "arguments_emitted": False,
         }
         tools.append(state)
         tools_by_id[call_id] = state
@@ -593,29 +594,48 @@ async def translate_chat_stream(
         return events, state
 
     def append_tool_arguments(state: dict[str, Any], value: str) -> str:
-        """Return the new wire delta while retaining the complete JSON text."""
+        """Accumulate delta or snapshot frames without emitting invalid JSON.
+
+        DeepSeek-compatible streams can mix true deltas with cumulative
+        snapshots, including snapshots whose whitespace differs from earlier
+        fragments.  Anthropic clients concatenate every ``partial_json``
+        verbatim, so a replacement snapshot cannot safely be emitted after a
+        partial prefix.  Buffer until the tool block finishes, normalize here,
+        then emit one validated JSON object from ``tool_input_error``.
+        """
 
         if not value:
             return ""
         previous = str(state.get("arguments") or "")
-        # The Chat Completions layer already resolves native snapshots and
-        # replays. Its arguments field is a true delta; prefix heuristics here
-        # would silently drop valid repeated braces inside a JSON string.
-        # Remote/Web adapters can still expose a cumulative snapshot, however.
-        # Recognize only the unambiguous prefix/replay forms so a snapshot is
-        # not concatenated into an invalid ``{...}{...}`` tool input.
+        def parsed_object(text: str) -> Optional[Mapping[str, Any]]:
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                return None
+            return parsed if isinstance(parsed, Mapping) else None
+
+        # Once a complete object is present, later frames for the same call
+        # are provider replays/snapshots. Appending any of them would turn a
+        # valid object into an invalid JSON stream.
+        if parsed_object(previous) is not None:
+            return ""
         if previous and value.startswith(previous) and len(value) > len(previous):
             state["arguments"] = value
-            return value[len(previous):]
-        if previous and previous.startswith(value):
-            try:
-                json.loads(value)
-            except (TypeError, ValueError):
-                pass
-            else:
-                return ""
+            return ""
+        if parsed_object(value) is not None:
+            state["arguments"] = value
+            return ""
+        # A root-object fragment longer than the retained prefix is a partial
+        # cumulative snapshot even when whitespace prevents startswith().
+        if (
+            previous.lstrip().startswith("{")
+            and value.lstrip().startswith("{")
+            and len(value) >= len(previous)
+        ):
+            state["arguments"] = value
+            return ""
         state["arguments"] = previous + value
-        return value
+        return ""
 
     def tool_input_error() -> tuple[str, list[tuple[int, str]]]:
         repaired_deltas: list[tuple[int, str]] = []
@@ -626,9 +646,6 @@ async def translate_chat_stream(
             repaired = _repair_json_arguments(arguments)
             if repaired != arguments:
                 state["arguments"] = repaired
-                repaired_deltas.append(
-                    (int(state["block_index"]), repaired[len(arguments) :])
-                )
                 arguments = repaired
             try:
                 parsed = json.loads(arguments)
@@ -643,6 +660,9 @@ async def translate_chat_stream(
                     f"Tool input for {state['name']} must be a JSON object",
                     repaired_deltas,
                 )
+            if arguments and not state.get("arguments_emitted"):
+                repaired_deltas.append((int(state["block_index"]), arguments))
+                state["arguments_emitted"] = True
         return "", repaired_deltas
 
     def close_blocks() -> list[str]:

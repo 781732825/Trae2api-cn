@@ -409,6 +409,18 @@ class DailyStatsTests(unittest.TestCase):
             self.assertIsNone(record["tool_called"])
             self.assertIsNone(record["context_window_tokens"])
 
+    def test_applied_max_without_descriptor_window_stays_unknown(self):
+        requested, actual, window, applied = main_module._context_mode_metadata(
+            {
+                "trae_max_mode": True,
+                "_upstream_trace": {"max_mode_applied": True},
+            }
+        )
+        self.assertEqual(requested, "max_1m")
+        self.assertEqual(actual, "max_1m")
+        self.assertIsNone(window)
+        self.assertIs(applied, True)
+
     def test_remote_fallback_keeps_shared_trace_for_actual_context_metadata(self):
         with _UsageSandbox():
             options = {"trae_max_mode": True}

@@ -846,6 +846,8 @@ class ToolCallAccumulator:
     def __init__(self, max_calls: Optional[int] = None):
         self._calls: dict[str, dict] = {}
         self._order: list[str] = []
+        self._correlation_keys: dict[str, str] = {}
+        self._public_keys: dict[str, str] = {}
         # Upstream indexes correlate fragments. Public indexes identify
         # distinct OpenAI tool calls and must be unique even when an upstream
         # reuses index 0 for several completed calls.
@@ -857,10 +859,128 @@ class ToolCallAccumulator:
     def has_calls(self) -> bool:
         return bool(self._calls)
 
+    @staticmethod
+    def _has_context(call: Mapping[str, Any]) -> bool:
+        return bool(
+            call.get("_event_session_id")
+            or call.get("_plan_item_id")
+            or call.get("_correlation_key")
+        )
+
+    @classmethod
+    def _same_context(cls, left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        # Follow-up native fragments often omit the parent session/plan
+        # fields. Treat the missing side as a wildcard; an explicit context
+        # on both sides still has to match exactly.
+        if not cls._has_context(left) or not cls._has_context(right):
+            left_id = str(left.get("_upstream_tool_call_id") or left.get("id") or "")
+            right_id = str(right.get("_upstream_tool_call_id") or right.get("id") or "")
+            if left_id and right_id and left_id != right_id:
+                return False
+            left_name = str((left.get("function") or {}).get("name") or "")
+            right_name = str((right.get("function") or {}).get("name") or "")
+            return not (left_name and right_name and left_name != right_name)
+        for field in ("_event_session_id", "_plan_item_id"):
+            left_value = str(left.get(field) or "")
+            right_value = str(right.get(field) or "")
+            if left_value or right_value:
+                if not left_value or not right_value or left_value != right_value:
+                    return False
+        left_id = str(left.get("_upstream_tool_call_id") or "")
+        right_id = str(right.get("_upstream_tool_call_id") or "")
+        if left_id and right_id and left_id != right_id:
+            return False
+        left_name = str((left.get("function") or {}).get("name") or "")
+        right_name = str((right.get("function") or {}).get("name") or "")
+        return not (left_name and right_name and left_name != right_name)
+
+    def _new_storage_key(self, call: Mapping[str, Any]) -> str:
+        correlation = str(call.get("_correlation_key") or "")
+        base = f"correlation:{correlation}" if correlation else str(call.get("id") or "call")
+        key = base
+        suffix = 2
+        while key in self._calls:
+            key = f"{base}#{suffix}"
+            suffix += 1
+        return key
+
+    def _unique_public_id(self, requested: str) -> str:
+        base = requested or "call"
+        if base not in self._public_keys:
+            return base
+        suffix = 2
+        candidate = f"{base}_{suffix}"
+        while candidate in self._public_keys:
+            suffix += 1
+            candidate = f"{base}_{suffix}"
+        return candidate
+
     def _existing_key(self, call: dict) -> Optional[str]:
+        correlation = str(call.get("_correlation_key") or "")
+        if correlation:
+            correlated_key = self._correlation_keys.get(correlation)
+            if correlated_key in self._calls:
+                return correlated_key
         key = call.get("id")
         if key in self._calls:
-            return key
+            existing = self._calls.get(key) or {}
+            if self._same_context(existing, call):
+                return key
+        if key in self._public_keys:
+            public_key = self._public_keys[str(key)]
+            existing = self._calls.get(public_key) or {}
+            if self._same_context(existing, call):
+                return public_key
+        if self._has_context(call):
+            contextual = [
+                existing_key
+                for existing_key in reversed(self._order)
+                if self._same_context(self._calls[existing_key], call)
+            ]
+            upstream_id = str(call.get("_upstream_tool_call_id") or "")
+            if upstream_id:
+                contextual = [
+                    existing_key
+                    for existing_key in contextual
+                    if str(
+                        self._calls[existing_key].get("_upstream_tool_call_id")
+                        or ""
+                    )
+                    == upstream_id
+                ]
+            requested_index = call.get("index")
+            if len(contextual) > 1 and isinstance(requested_index, int):
+                contextual = [
+                    existing_key
+                    for existing_key in contextual
+                    if self._source_indexes[existing_key] == requested_index
+                ]
+            return contextual[0] if len(contextual) == 1 else None
+        if call.get("_explicit_id") is not True:
+            # An id-less continuation with no parent metadata can still be
+            # attached when its source index/name identifies one open call.
+            requested_index = call.get("index")
+            function_name = str((call.get("function") or {}).get("name") or "")
+            candidates = [
+                existing_key
+                for existing_key in reversed(self._order)
+                if (
+                    not isinstance(requested_index, int)
+                    or self._source_indexes[existing_key] == requested_index
+                )
+                and (
+                    not function_name
+                    or str(
+                        (self._calls[existing_key].get("function") or {}).get("name")
+                        or ""
+                    )
+                    == function_name
+                )
+            ]
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                if self._closed_state(self._calls[candidate], call) != "distinct":
+                    return candidate
         if call.get("_explicit_id") is True:
             return None
         function = call.get("function") or {}
@@ -874,13 +994,19 @@ class ToolCallAccumulator:
         if call.get("_synthetic_id") or not function.get("name"):
             if isinstance(requested_index, int):
                 for existing_key in reversed(self._order):
+                    if self._has_context(self._calls[existing_key]):
+                        continue
                     existing_index = self._source_indexes[existing_key]
                     if existing_index != requested_index:
                         continue
                     existing_name = (self._calls[existing_key].get("function") or {}).get(
                         "name"
                     )
-                    if not function.get("name") or function.get("name") == existing_name:
+                    if (
+                        (not function.get("name") or function.get("name") == existing_name)
+                        and self._closed_state(self._calls[existing_key], call)
+                        != "distinct"
+                    ):
                         return existing_key
             # No usable index: nameless delta fragments are ordered, so merge
             # into the latest open delta call (upstream order == merge order).
@@ -925,7 +1051,7 @@ class ToolCallAccumulator:
             or same_index
         ):
             return "conflict"
-        return ""
+        return "distinct"
 
     def prepare(self, calls: Any) -> list[dict]:
         if not isinstance(calls, list):
@@ -954,8 +1080,16 @@ class ToolCallAccumulator:
                 existing_function = existing.get("function") if existing else None
                 if not function.get("name") and isinstance(existing_function, dict):
                     function["name"] = existing_function["name"]
-                call["id"] = existing_key
+                call["id"] = existing["id"]
                 call["_synthetic_id"] = existing.get("_synthetic_id") is True
+                if call.get("_explicit_id") is not True:
+                    upstream_id = str(
+                        existing.get("_upstream_tool_call_id")
+                        or existing.get("id")
+                        or ""
+                    )
+                    if upstream_id:
+                        call["_upstream_tool_call_id"] = upstream_id
             prepared.append(call)
         return prepared
 
@@ -969,7 +1103,7 @@ class ToolCallAccumulator:
                 continue
             function = call["function"]
             call_id = call["id"]
-            key = self._existing_key(call) or call_id
+            key = self._existing_key(call) or self._new_storage_key(call)
             if key not in self._calls and not function.get("name"):
                 # 匹配不到任何已有调用的无 name 帧：只有以 { [ 开头才是新调用
                 # 起点；孤立的 } ] 空串是上游并发流的遗留闭合帧，直接丢弃。
@@ -983,8 +1117,8 @@ class ToolCallAccumulator:
                     continue
             existing = self._calls.get(key)
             if existing is not None:
-                call_id = key
-                call["id"] = key
+                call_id = existing["id"]
+                call["id"] = call_id
             if not function.get("name"):
                 existing_function = existing.get("function") if existing else None
                 if not isinstance(existing_function, dict) or not existing_function.get(
@@ -1026,6 +1160,8 @@ class ToolCallAccumulator:
                     continue
                 for existing_key in self._order:
                     existing = self._calls[existing_key]
+                    if not self._same_context(existing, call):
+                        continue
                     if not existing.get("_synthetic_id"):
                         continue
                     existing_function = existing.get("function") or {}
@@ -1054,6 +1190,8 @@ class ToolCallAccumulator:
             if key not in self._calls:
                 if self._max_calls is not None and len(self._order) >= self._max_calls:
                     continue
+                call_id = self._unique_public_id(str(call.get("id") or "call"))
+                call["id"] = call_id
                 source_index = (
                     requested_index
                     if isinstance(requested_index, int)
@@ -1062,6 +1200,10 @@ class ToolCallAccumulator:
                 index = len(self._order)
                 self._calls[key] = call
                 self._order.append(key)
+                correlation = str(call.get("_correlation_key") or "")
+                if correlation:
+                    self._correlation_keys[correlation] = key
+                self._public_keys[call_id] = key
                 self._source_indexes[key] = source_index
                 self._indexes[key] = index
                 deltas.append({
@@ -1112,8 +1254,9 @@ class ToolCallAccumulator:
                             )
                             continue
                         new_key = call_id + ":" + str(len(self._order))
+                        public_id = self._unique_public_id(new_key)
                         self._calls[new_key] = {
-                            "id": new_key,
+                            "id": public_id,
                             "type": "function",
                             "function": {
                                 "name": current_name or previous["name"],
@@ -1122,6 +1265,9 @@ class ToolCallAccumulator:
                             "_synthetic_id": True,
                             "_arguments_mode": "delta",
                             "_source_index": call.get("_source_index", 0),
+                            "_event_session_id": call.get("_event_session_id", ""),
+                            "_plan_item_id": call.get("_plan_item_id", ""),
+                            "_correlation_key": call.get("_correlation_key", ""),
                         }
                         self._order.append(new_key)
                         self._source_indexes[new_key] = (
@@ -1130,10 +1276,14 @@ class ToolCallAccumulator:
                             else len(self._order) - 1
                         )
                         self._indexes[new_key] = len(self._order) - 1
+                        correlation = str(call.get("_correlation_key") or "")
+                        if correlation:
+                            self._correlation_keys[correlation] = new_key
+                        self._public_keys[public_id] = new_key
                         deltas.append(
                             {
                                 "index": self._indexes[new_key],
-                                "id": new_key,
+                                "id": public_id,
                                 "type": "function",
                                 "function": {
                                     "name": current_name or previous["name"],
@@ -1176,19 +1326,27 @@ class ToolCallAccumulator:
         """Replace the aggregated calls (used after repair/split)."""
         self._calls = {}
         self._order = []
+        self._correlation_keys = {}
+        self._public_keys = {}
         self._source_indexes = {}
         self._indexes = {}
         for idx, c in enumerate(calls):
-            cid = str(c.get("id") or f"call_repair_{idx}")
-            self._calls[cid] = c
-            self._order.append(cid)
+            cid = self._unique_public_id(str(c.get("id") or f"call_repair_{idx}"))
+            c["id"] = cid
+            key = self._new_storage_key(c)
+            self._calls[key] = c
+            self._order.append(key)
+            correlation = str(c.get("_correlation_key") or "")
+            if correlation:
+                self._correlation_keys[correlation] = key
+            self._public_keys[cid] = key
             source_index = c.get("index")
             if not isinstance(source_index, int):
                 source_index = c.get("_source_index")
             if not isinstance(source_index, int):
                 source_index = idx
-            self._source_indexes[cid] = source_index
-            self._indexes[cid] = idx
+            self._source_indexes[key] = source_index
+            self._indexes[key] = idx
 
 
 def _repair_json_arguments(arguments: str) -> str:
@@ -1346,15 +1504,99 @@ def _ensure_native_tool_arguments(
     return kept
 
 
+def _payload_context(data: Mapping[str, Any]) -> tuple[str, str]:
+    """Extract the remote event/plan identity used for tool correlation."""
+
+    session_id = ""
+    for key in (
+        "eventSessionId",
+        "event_session_id",
+        "sessionId",
+        "session_id",
+    ):
+        value = data.get(key)
+        if value not in (None, ""):
+            session_id = str(value)
+            break
+    plan_id = ""
+    for key in ("planItemId", "plan_item_id", "planId", "plan_id"):
+        value = data.get(key)
+        if value not in (None, ""):
+            plan_id = str(value)
+            break
+    # Some Web responses put the plan identity only in ``id``. Restrict this
+    # fallback to plan-shaped/tool payloads so ordinary OpenAI completion ids
+    # do not accidentally become correlation namespaces.
+    if not plan_id and (
+        "tool_call_info" in data
+        or "toolCallInfo" in data
+        or "thought" in data
+        or "plan_item" in data
+        or "planItem" in data
+    ):
+        value = data.get("id")
+        if value not in (None, ""):
+            plan_id = str(value)
+    return session_id, plan_id
+
+
+def _annotate_tool_call_context(
+    call: Mapping[str, Any], session_id: str, plan_id: str
+) -> dict:
+    annotated = dict(call)
+    if session_id:
+        annotated.setdefault("_event_session_id", session_id)
+    if plan_id:
+        annotated.setdefault("_plan_item_id", plan_id)
+    function = annotated.get("function")
+    function = function if isinstance(function, Mapping) else {}
+    upstream_id = str(
+        annotated.get("_upstream_tool_call_id")
+        or annotated.get("toolCallId")
+        or annotated.get("tool_call_id")
+        or annotated.get("id")
+        or ""
+    )
+    name = str(function.get("name") or annotated.get("name") or "")
+    if session_id or plan_id:
+        annotated["_correlation_key"] = json.dumps(
+            [session_id, plan_id, upstream_id, name],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    return annotated
+
+
 def _calls_from_payload(data: Any) -> list[dict]:
     if not isinstance(data, dict):
         return []
-    calls = _extract_tool_calls(data)
+    session_id, plan_id = _payload_context(data)
+    calls = [
+        _annotate_tool_call_context(call, session_id, plan_id)
+        for call in _extract_tool_calls(data)
+    ]
     tool_info = data.get("tool_call_info")
+    if not isinstance(tool_info, dict):
+        tool_info = data.get("toolCallInfo")
     if isinstance(tool_info, dict):
         item = dict(tool_info)
-        item.setdefault("id", tool_info.get("tool_call_id") or data.get("id"))
+        item.setdefault(
+            "id",
+            tool_info.get("tool_call_id")
+            or tool_info.get("toolCallId")
+            or data.get("id"),
+        )
+        item.setdefault(
+            "name",
+            tool_info.get("toolCallName")
+            or tool_info.get("tool_call_name")
+            or tool_info.get("name"),
+        )
+        item["_event_session_id"] = session_id
+        item["_plan_item_id"] = plan_id
         call = _normalize_tool_call(item, index=len(calls))
+        if call:
+            call = _annotate_tool_call_context(call, session_id, plan_id)
         # ``extract_tool_calls`` now understands top-level ``tool_call_info``
         # natively.  Keep this compatibility fallback for older/partial
         # payloads, but do not append the same call a second time when the
@@ -1365,6 +1607,10 @@ def _calls_from_payload(data: Any) -> list[dict]:
             call
             and any(
                 str(existing.get("id") or "") == str(call.get("id") or "")
+                and (
+                    not call.get("_correlation_key")
+                    or existing.get("_correlation_key") == call.get("_correlation_key")
+                )
                 or (
                     call_signature
                     and call_signature == _tool_call_signature(existing)
@@ -1438,12 +1684,13 @@ def _filter_tool_calls(
         if selected and name != selected:
             continue
         call_id = str(call.get("id") or "")
+        identity = str(call.get("_correlation_key") or call_id)
         is_delta = call.get("_arguments_mode") == "delta"
         if not is_delta:
-            if call_id and call_id in seen:
+            if identity and identity in seen:
                 continue
-            if call_id:
-                seen.add(call_id)
+            if identity:
+                seen.add(identity)
         filtered.append(call)
         if parallel_tool_calls is False:
             break
@@ -2419,6 +2666,16 @@ def _web_finish_summary(data: dict) -> str:
     return ""
 
 
+def _web_plan_state_key(data: Mapping[str, Any], fallback_index: int) -> str:
+    session_id, plan_id = _payload_context(data)
+    if not plan_id:
+        value = data.get("id")
+        plan_id = str(value) if value not in (None, "") else f"plan-{fallback_index}"
+    return json.dumps(
+        [session_id, plan_id], ensure_ascii=False, separators=(",", ":")
+    )
+
+
 def _web_message_text(data: dict) -> str:
     """Extract visible assistant text from remote message/content events."""
     if not isinstance(data, dict):
@@ -2517,7 +2774,7 @@ async def translate_web_events(
             continue
         if event == "plan_item":
             emitted_tool = False
-            pid = str(data.get("id") or f"plan-{len(reasoning_order)}")
+            pid = _web_plan_state_key(data, len(reasoning_order))
             plan_reasoning = _web_plan_reasoning(data)
             if not _web_plan_has_split_reasoning(data) and plan_reasoning:
                 legacy_plan_reasoning = True
@@ -2559,7 +2816,11 @@ async def translate_web_events(
             for chunk in plan_chunks:
                 emitted_tool = True
                 yield chunk
-            if emitted_tool and allowed_tools is not None:
+            if (
+                emitted_tool
+                and allowed_tools is not None
+                and parallel_tool_calls is False
+            ):
                 break
             if content_delta:
                 plan_streamed_text += content_delta
@@ -3378,7 +3639,7 @@ async def collect_nonstream_web(
             usage = _map_usage(data.get("usage") or data)
             continue
         if event == "plan_item":
-            pid = str(data.get("id") or f"plan-{len(reasoning_order)}")
+            pid = _web_plan_state_key(data, len(reasoning_order))
             reasoning_state = reasoning_states.setdefault(
                 pid, ProtocolTextAccumulator()
             )
@@ -3406,7 +3667,11 @@ async def collect_nonstream_web(
                 completed_tool_signatures,
             )
             tool_calls.add(calls)
-            if calls and allowed_tools is not None:
+            if (
+                calls
+                and allowed_tools is not None
+                and parallel_tool_calls is False
+            ):
                 break
             summary = _web_finish_summary(data)
             if summary:
@@ -3435,7 +3700,11 @@ async def collect_nonstream_web(
                     completed_tool_signatures,
                 )
                 tool_calls.add(filtered_calls)
-                if filtered_calls and allowed_tools is not None:
+                if (
+                    filtered_calls
+                    and allowed_tools is not None
+                    and parallel_tool_calls is False
+                ):
                     break
         if event == "done":
             final_reason = _payload_finish_reason(data) or final_reason

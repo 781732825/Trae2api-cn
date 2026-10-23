@@ -9,6 +9,93 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from src import raw_client, trae_client
+from src.model_limits import descriptor_multimodal
+
+
+class ModelDescriptorCapabilityTests(unittest.TestCase):
+    def test_missing_capability_fields_remain_unknown(self):
+        capabilities = trae_client._descriptor_capabilities({"name": "unknown"})
+
+        self.assertEqual(capabilities, {})
+
+    def test_explicitly_unsupported_capabilities_remain_false(self):
+        capabilities = trae_client._descriptor_capabilities(
+            {
+                "name": "text-only",
+                "multimodal": False,
+                "max_mode": False,
+                "reasoning_effort_config": {"support_thinking": False},
+            }
+        )
+
+        self.assertEqual(
+            capabilities,
+            {
+                "multimodal": False,
+                "reasoning_effort": [],
+                "max_mode": False,
+            },
+        )
+
+    def test_incomplete_positive_capabilities_remain_unknown(self):
+        capabilities = trae_client._descriptor_capabilities(
+            {
+                "name": "incomplete",
+                "max_mode": True,
+                "reasoning_effort_config": {"support_thinking": True},
+            }
+        )
+
+        self.assertEqual(capabilities, {})
+
+    def test_complete_positive_capabilities_are_exposed(self):
+        capabilities = trae_client._descriptor_capabilities(
+            {
+                "name": "complete",
+                "max_mode": True,
+                "context_window_size": {"max": 1_000_000},
+                "prompt_max_tokens": 936_000,
+                "max_tokens": 64_000,
+                "reasoning_effort_config": {
+                    "support_thinking": True,
+                    "options": ["light", "high", "extra_high"],
+                },
+            }
+        )
+
+        self.assertEqual(
+            capabilities,
+            {
+                "reasoning_effort": ["light", "high", "extra_high"],
+                "max_mode": True,
+                "max_context": 1_000_000,
+            },
+        )
+
+    def test_multimodal_uses_nested_feature_when_top_level_is_absent(self):
+        config = trae_client._build_web_model_config(
+            {"name": "vision", "features": '{"multimodal":{"enable":true}}'}
+        )
+        self.assertIs(descriptor_multimodal(config), True)
+        self.assertIs(config["multimodal"], True)
+
+    def test_support_read_image_is_capability_evidence(self):
+        config = trae_client._build_web_model_config(
+            {"name": "vision", "support_read_image": True}
+        )
+        self.assertIs(descriptor_multimodal(config), True)
+
+    def test_explicit_top_level_false_wins_over_nested_true(self):
+        config = trae_client._build_web_model_config(
+            {
+                "name": "text",
+                "multimodal": False,
+                "support_read_image": True,
+                "features": {"multimodal": {"enable": True}},
+            }
+        )
+        self.assertIs(descriptor_multimodal(config), False)
+        self.assertIs(config["multimodal"], False)
 
 
 class ModelRequestParallelLimitTests(unittest.TestCase):
@@ -422,6 +509,7 @@ class WebModelCacheTests(unittest.IsolatedAsyncioTestCase):
             token_override=token_b,
             user_id_override="account-b",
             provider_specific=provider_specific,
+            raw_chat_function="solo_agent_remote",
         )
         common = json.loads(
             fake_client.request["json"]["initial_message"]["common_params"]
@@ -1489,6 +1577,9 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
                                 "models": [
                                     {
                                         "name": "glm-5.3",
+                                        "multimodal": False,
+                                        "max_mode": False,
+                                        "prompt_max_tokens": 168000,
                                         "max_tokens": 32000,
                                         "context_window_size": {"default": 200000},
                                     }
@@ -1499,10 +1590,17 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
                                 "models": [
                                     {
                                         "name": "glm-5.3",
+                                        "multimodal": True,
+                                        "max_mode": True,
+                                        "prompt_max_tokens": 936000,
                                         "max_tokens": 64000,
                                         "context_window_size": {
                                             "default": 200000,
                                             "max": 1000000,
+                                        },
+                                        "reasoning_effort_config": {
+                                            "support_thinking": True,
+                                            "options": ["light", "high", "extra_high"],
                                         },
                                     }
                                 ],
@@ -1527,6 +1625,16 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
         cfg = configs["glm-5.3"]
         self.assertEqual(cfg["max_tokens"], 64000)
         self.assertEqual(cfg["context_window_size"]["max"], 1000000)
+        scopes = cfg["_trae_capabilities_by_scope"]
+        self.assertTrue(scopes["solo_agent_remote"]["multimodal"])
+        self.assertTrue(scopes["solo_agent_remote"]["max_mode"])
+        self.assertEqual(
+            scopes["solo_agent_remote"]["reasoning_effort"],
+            ["light", "high", "extra_high"],
+        )
+        self.assertFalse(scopes["solo_work_remote"]["multimodal"])
+        self.assertFalse(scopes["solo_work_remote"]["max_mode"])
+        self.assertNotIn("reasoning_effort", scopes["solo_work_remote"])
 
     async def test_fallback_keeps_work_group_when_agent_absent(self):
         class FakeResponse:
@@ -1559,6 +1667,56 @@ class WebModelGroupPreferenceTests(unittest.IsolatedAsyncioTestCase):
             configs = await trae_client._fetch_web_model_configs(token_override="token-x")
 
         self.assertEqual(configs["glm-5.3"]["max_tokens"], 32000)
+
+    async def test_raw_function_filter_does_not_borrow_sibling_descriptor(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "list": [
+                            {
+                                "function": "solo_agent_remote",
+                                "models": [
+                                    {
+                                        "name": "chat-model",
+                                        "raw_chat_function": "chat_v3",
+                                        "multimodal": True,
+                                    },
+                                    {
+                                        "name": "agent-model",
+                                        "raw_chat_function": "solo_agent",
+                                        "multimodal": False,
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, _url):
+                return FakeResponse()
+
+        with patch.object(trae_client.httpx, "AsyncClient", return_value=FakeClient()):
+            configs = await trae_client._fetch_web_model_configs(
+                token_override="token-x",
+                raw_chat_function="chat_v3",
+            )
+
+        self.assertEqual(set(configs), {"chat-model"})
+        self.assertEqual(
+            set(configs["chat-model"]["_trae_capabilities_by_scope"]),
+            {"chat_v3"},
+        )
 
 
 class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
@@ -1619,7 +1777,8 @@ class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             configs = await trae_client._fetch_solo_model_configs(
-                token_override="token-x"
+                token_override="token-x",
+                raw_chat_function="chat_v3",
             )
 
         self.assertIn("glm-5.3-flash", configs)
@@ -1637,11 +1796,20 @@ class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
             calls["url"],
             "https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param",
         )
-        self.assertEqual(calls["body"]["function"], "solo_work_lite")
+        self.assertEqual(calls["body"]["function"], "chat_v3")
         self.assertLessEqual(calls["timeout"], 20)
 
     async def test_native_catalog_resolves_dev_and_max_provider_ids(self):
-        async def fake_fetch(*, token_override="", provider_specific=None, user_id_override=""):
+        seen_functions = []
+
+        async def fake_fetch(
+            *,
+            token_override="",
+            provider_specific=None,
+            user_id_override="",
+            raw_chat_function="",
+        ):
+            seen_functions.append(raw_chat_function)
             return {
                 "glm-5.2": {
                     "config_name": "glm-5.2",
@@ -1670,11 +1838,43 @@ class SoloModelListTests(unittest.IsolatedAsyncioTestCase):
                 token_override="token-x",
                 user_id_override="user-x",
                 max_mode=True,
+                raw_chat_function="chat_v3",
             )
 
         self.assertEqual(dev["config_name"], "glm-5.2")
         self.assertEqual(dev["raw_model_name"], "glm-5.2__dev")
         self.assertEqual(max_cfg["raw_model_name"], "glm-5.2__max")
+        self.assertEqual(seen_functions, ["solo_work_lite", "chat_v3"])
+
+    async def test_model_cache_is_partitioned_by_tier_and_raw_function(self):
+        fetch = AsyncMock(
+            side_effect=[
+                {"same-model": {"config_name": "same-model", "multimodal": True}},
+                {"same-model": {"config_name": "same-model", "multimodal": False}},
+            ]
+        )
+        with (
+            patch.object(trae_client, "_WEB_MODEL_CACHE", {}),
+            patch.object(trae_client, "_fetch_web_model_configs", new=fetch),
+        ):
+            agent = await trae_client._get_web_custom_model(
+                "same-model",
+                token_override="token",
+                user_id_override="account",
+                agent_type="solo_agent_remote",
+                raw_chat_function="solo_agent_remote",
+            )
+            work = await trae_client._get_web_custom_model(
+                "same-model",
+                token_override="token",
+                user_id_override="account",
+                agent_type="solo_work_remote",
+                raw_chat_function="solo_work_remote",
+            )
+
+        self.assertTrue(agent["multimodal"])
+        self.assertFalse(work["multimodal"])
+        self.assertEqual(fetch.await_count, 2)
 
 
 if __name__ == "__main__":

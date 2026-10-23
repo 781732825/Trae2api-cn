@@ -1202,7 +1202,11 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         explicit_id = explicit_id is True
     name = (
         _string_or_empty(function.get("name"))
+        or _string_or_empty(function.get("toolCallName"))
+        or _string_or_empty(function.get("tool_call_name"))
         or _string_or_empty(raw.get("name"))
+        or _string_or_empty(raw.get("toolCallName"))
+        or _string_or_empty(raw.get("tool_call_name"))
         or _string_or_empty(raw.get("tool_name"))
         or _string_or_empty(raw.get("server_name"))
         or _string_or_empty(fallback_name)
@@ -1232,9 +1236,14 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
             key: value
             for key, value in raw.items()
             if key not in {
-                "id", "type", "name", "tool_name", "server_name", "index",
+                "id", "type", "name", "tool_name", "toolCallName",
+                "tool_call_name", "server_name", "index",
                 "function", "function_call", "functionCall",
                 "tool_call_id", "toolCallId",
+                "eventSessionId", "event_session_id", "sessionId",
+                "session_id", "planItemId", "plan_item_id",
+                "_event_session_id", "_plan_item_id",
+                "_correlation_key", "_upstream_tool_call_id",
             }
         }
     arguments_text = _stringify_tool_arguments(arguments)
@@ -1255,6 +1264,42 @@ def normalize_tool_call(raw: Any, index: int = 0, fallback_name: str = "") -> Op
         "_explicit_index": raw.get("_explicit_index") is True
         or isinstance(raw.get("index"), int),
     }
+    event_session_id = (
+        _string_or_empty(raw.get("_event_session_id"))
+        or _string_or_empty(raw.get("eventSessionId"))
+        or _string_or_empty(raw.get("event_session_id"))
+        or _string_or_empty(raw.get("sessionId"))
+        or _string_or_empty(raw.get("session_id"))
+        or _string_or_empty(function.get("eventSessionId"))
+        or _string_or_empty(function.get("event_session_id"))
+        or _string_or_empty(function.get("sessionId"))
+        or _string_or_empty(function.get("session_id"))
+    )
+    plan_item_id = (
+        _string_or_empty(raw.get("_plan_item_id"))
+        or _string_or_empty(raw.get("planItemId"))
+        or _string_or_empty(raw.get("plan_item_id"))
+        or _string_or_empty(function.get("planItemId"))
+        or _string_or_empty(function.get("plan_item_id"))
+    )
+    upstream_tool_call_id = (
+        _string_or_empty(raw.get("_upstream_tool_call_id")) or raw_id
+    )
+    if event_session_id:
+        result["_event_session_id"] = event_session_id
+    if plan_item_id:
+        result["_plan_item_id"] = plan_item_id
+    if upstream_tool_call_id:
+        result["_upstream_tool_call_id"] = upstream_tool_call_id
+    correlation_key = _string_or_empty(raw.get("_correlation_key"))
+    if not correlation_key and (event_session_id or plan_item_id):
+        correlation_key = json.dumps(
+            [event_session_id, plan_item_id, upstream_tool_call_id, name],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    if correlation_key:
+        result["_correlation_key"] = correlation_key
     arguments_mode = raw.get("_arguments_mode")
     if arguments_mode in {"delta", "snapshot"}:
         result["_arguments_mode"] = arguments_mode
@@ -1325,8 +1370,9 @@ def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
     snapshots: dict[str, int] = {}
     for call in calls:
         call_id = str(call.get("id") or "")
+        identity = str(call.get("_correlation_key") or call_id)
         signature = complete_tool_call_signature(call)
-        previous = completed.get(call_id) if call_id else None
+        previous = completed.get(identity) if identity else None
         if previous is not None and signature:
             if signature != complete_tool_call_signature(previous):
                 logger.warning(
@@ -1337,8 +1383,8 @@ def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
         # can be legitimate nested JSON, so leave assembly to the accumulator.
         if call.get("_arguments_mode") == "delta":
             kept.append(call)
-        elif call_id and call_id in snapshots:
-            previous_index = snapshots[call_id]
+        elif identity and identity in snapshots:
+            previous_index = snapshots[identity]
             previous_call = kept[previous_index]
             previous_args = str((previous_call.get("function") or {}).get("arguments") or "")
             current_args = str((call.get("function") or {}).get("arguments") or "")
@@ -1347,11 +1393,11 @@ def deduplicate_tool_calls(calls: list[dict]) -> list[dict]:
             ):
                 kept[previous_index] = call
         else:
-            if call_id:
-                snapshots[call_id] = len(kept)
+            if identity:
+                snapshots[identity] = len(kept)
             kept.append(call)
-        if call_id and signature:
-            completed[call_id] = call
+        if identity and signature:
+            completed[identity] = call
     return kept
 
 
@@ -2100,8 +2146,35 @@ def _iter_native_tool_calls(result: dict) -> list[dict]:
             if candidates:
                 break
 
+    event_session_id = ""
+    for key in ("eventSessionId", "event_session_id", "sessionId", "session_id"):
+        value = result.get(key)
+        if value not in (None, ""):
+            event_session_id = str(value)
+            break
+    plan_item_id = ""
+    for key in ("planItemId", "plan_item_id", "planId", "plan_id"):
+        value = result.get(key)
+        if value not in (None, ""):
+            plan_item_id = str(value)
+            break
+    if not plan_item_id and (
+        "tool_call_info" in result
+        or "toolCallInfo" in result
+        or "thought" in result
+    ):
+        value = result.get("id")
+        if value not in (None, ""):
+            plan_item_id = str(value)
+
     calls: list[dict] = []
     for index, candidate in enumerate(candidates):
+        if isinstance(candidate, Mapping) and (event_session_id or plan_item_id):
+            candidate = dict(candidate)
+            if event_session_id:
+                candidate.setdefault("_event_session_id", event_session_id)
+            if plan_item_id:
+                candidate.setdefault("_plan_item_id", plan_item_id)
         call = normalize_tool_call(candidate, index=index)
         if call:
             calls.append(call)

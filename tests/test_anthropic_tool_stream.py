@@ -51,14 +51,15 @@ def _payload(event: str) -> dict:
     )
 
 
-async def _messages_events(payloads: list[dict]) -> list[dict]:
+async def _messages_events(payloads: list[dict], allowed_tools=None) -> list[dict]:
+    allowed_tools = allowed_tools or TOOLS
     async def native_stream():
         try:
             async for chunk in sse.translate_ide_stream(
                 _LineResponse(payloads),
                 "deepseek-v4.1-flash",
                 True,
-                allowed_tools=TOOLS,
+                allowed_tools=allowed_tools,
             ):
                 yield chunk
         except sse.InvalidNativeToolArguments as exc:
@@ -136,6 +137,52 @@ def _closed_tool_inputs(events: list[dict]) -> dict[str, dict]:
 
 
 class AnthropicNativeToolStreamContractTests(unittest.TestCase):
+    def test_deepseek_messages_keeps_interleaved_session_tool_json_separate(self):
+        payloads = [
+            {
+                "eventSessionId": "session-a",
+                "planItemId": "plan-a",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Read",
+                    "parameters": '{"path":"a.txt"',
+                },
+            },
+            {
+                "eventSessionId": "session-b",
+                "planItemId": "plan-b",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Write",
+                    "parameters": '{"path":"b.txt"}',
+                },
+            },
+            {
+                "eventSessionId": "session-a",
+                "planItemId": "plan-a",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Read",
+                    "parameters": "}",
+                },
+            },
+            {"finish_reason": "tool_calls"},
+        ]
+        tools = [
+            {"type": "function", "function": {"name": "Read"}},
+            {"type": "function", "function": {"name": "Write"}},
+        ]
+
+        events = asyncio.run(_messages_events(payloads, allowed_tools=tools))
+        inputs = _closed_tool_inputs(events)
+
+        self.assertEqual(
+            sorted(inputs.values(), key=lambda value: value["path"]),
+            [{"path": "a.txt"}, {"path": "b.txt"}],
+        )
+        self.assertEqual(len(inputs), 2)
+        self.assertEqual(events[-1]["type"], "message_stop")
+
     def test_repaired_native_arguments_are_repaired_on_messages_wire(self):
         payloads = [_native_call("call_repaired", '{"path":"README.md"')]
         completion = asyncio.run(
@@ -469,6 +516,45 @@ class AnthropicTranslatorToolStreamTests(unittest.TestCase):
 
         self.assertEqual(
             _closed_tool_inputs(events), {"call_snapshot": {"path": "README.md"}}
+        )
+
+    def test_whitespace_changed_cumulative_snapshot_is_replaced(self):
+        async def stream():
+            yield _openai_chunk(
+                [
+                    {
+                        "index": 0,
+                        "id": "call_snapshot_ws",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"',
+                        },
+                    }
+                ]
+            )
+            # The second frame is a cumulative snapshot with formatting that
+            # does not share the first frame's literal prefix.
+            yield _openai_chunk(
+                [
+                    {
+                        "index": 0,
+                        "function": {
+                            "arguments": '{ "path" : "README.md" }',
+                        },
+                    }
+                ]
+            )
+            yield _openai_chunk(finish_reason="tool_calls")
+            yield "data: [DONE]\n\n"
+
+        events = asyncio.run(
+            _collect_payloads(
+                anthropic_api.translate_chat_stream(stream(), "deepseek")
+            )
+        )
+        self.assertEqual(
+            _closed_tool_inputs(events),
+            {"call_snapshot_ws": {"path": "README.md"}},
         )
 
     def test_truncated_json_is_closed_before_messages_block_stop(self):

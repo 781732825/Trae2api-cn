@@ -123,6 +123,91 @@ class _Client:
 
 
 class RemoteClientTests(unittest.TestCase):
+    def test_work_common_params_uses_bound_paid_account_identity(self):
+        params = json.loads(
+            trae_remote_client.common_params(
+                {
+                    "userIdentity": "Free",
+                    "userPayIdentity": 4,
+                    "userPayIdentityText": "Pro+",
+                },
+                "work",
+                options={"_account_id": "paid-account"},
+            )
+        )
+
+        self.assertEqual(params["identity"], "4")
+        self.assertEqual(params["identity_str"], "Pro+")
+        self.assertEqual(params["user_identity"], "Pro+")
+
+    def test_work_common_params_reads_only_the_bound_account_record(self):
+        records = {
+            "paid-account": {
+                "pay_identity": 1,
+                "pay_identity_str": "Pro",
+                "provider_specific": {},
+            },
+            "other-account": {
+                "pay_identity": 4,
+                "pay_identity_str": "Pro+",
+                "provider_specific": {},
+            },
+        }
+        with (
+            patch.object(
+                trae_remote_client.auth,
+                "resolve_model_account_id",
+                side_effect=lambda account_id: account_id,
+            ),
+            patch.object(
+                trae_remote_client.auth,
+                "get_account_record",
+                side_effect=lambda account_id: records.get(account_id, {}),
+            ),
+        ):
+            params = json.loads(
+                trae_remote_client.common_params(
+                    {},
+                    "work",
+                    options={"_account_id": "paid-account"},
+                )
+            )
+
+        self.assertEqual(params["identity"], "1")
+        self.assertEqual(params["identity_str"], "Pro")
+        self.assertEqual(params["user_identity"], "Pro")
+
+    def test_work_common_params_does_not_trust_spoofed_request_identity(self):
+        with (
+            patch.object(
+                trae_remote_client.auth,
+                "resolve_model_account_id",
+                side_effect=lambda account_id: account_id,
+            ),
+            patch.object(
+                trae_remote_client.auth,
+                "get_account_record",
+                return_value={
+                    "pay_identity": 1,
+                    "pay_identity_str": "Pro",
+                    "provider_specific": {},
+                },
+            ),
+        ):
+            params = json.loads(
+                trae_remote_client.common_params(
+                    {
+                        "userPayIdentity": 99,
+                        "userPayIdentityText": "Enterprise",
+                    },
+                    "work",
+                    options={"_account_id": "paid-account"},
+                )
+            )
+
+        self.assertEqual(params["identity"], "1")
+        self.assertEqual(params["identity_str"], "Pro")
+
     def test_create_session_matches_remote_executor_shape(self):
         async def run():
             client = _Client()
@@ -489,7 +574,7 @@ class RemoteClientTests(unittest.TestCase):
             ),
         )
 
-    def test_max_mode_enriches_slim_account_config(self):
+    def test_max_mode_does_not_enrich_incomplete_account_config(self):
         async def run():
             client = _Client()
             slim = {
@@ -529,20 +614,16 @@ class RemoteClientTests(unittest.TestCase):
         (_url, request) = asyncio.run(run())
         initial = request["json"]["initial_message"]
         cm = initial["custom_model"]
-        self.assertEqual(initial["context_window_size"], 1000000)
-        self.assertEqual(initial["prompt_max_tokens"], 936000)
-        self.assertEqual(initial["max_tokens"], 64000)
-        self.assertEqual(
-            cm["context_window_size"], {"default": 200000, "max": [1000000]}
-        )
+        self.assertEqual(initial["model_selection_strategy"], "manual")
+        self.assertNotIn("context_window_size", initial)
+        self.assertNotIn("prompt_max_tokens", initial)
+        self.assertNotIn("max_tokens", initial)
+        self.assertNotIn("context_window_size", cm)
         self.assertEqual(cm["context_window_tokens"], {"dev": 200000, "max": 1000000})
-        self.assertEqual(cm["prompt_max_tokens"], 936000)
-        self.assertEqual(cm["max_tokens"], 64000)
-        self.assertEqual(cm["max_turn"], 500)
-        self.assertTrue(cm["features"]["context_windows"]["enable"])
-        self.assertEqual(
-            cm["features"]["context_windows"]["data"]["max_context"], 1000000
-        )
+        self.assertNotIn("prompt_max_tokens", cm)
+        self.assertNotIn("max_tokens", cm)
+        self.assertNotIn("max_turn", cm)
+        self.assertNotIn("features", cm)
 
     def test_max_mode_stays_off_when_account_config_lacks_max_mode(self):
         async def run():
@@ -2734,7 +2815,7 @@ class RemoteReasoningEffortTests(unittest.TestCase):
         model = request["json"]["initial_message"]["custom_model"]
         self.assertEqual(model["reasoning_effort"], "light")
 
-    def test_work_tier_borrows_agent_tier_effort_config(self):
+    def test_work_tier_does_not_borrow_agent_tier_effort_config(self):
         work_model = {
             "name": "glm-5.3",
             "config_name": "glm-5.3",
@@ -2778,5 +2859,6 @@ class RemoteReasoningEffortTests(unittest.TestCase):
         (_url, request), trace = asyncio.run(run())
         message = request["json"]["initial_message"]
         self.assertEqual(message["agent_type"], "solo_work_remote")
-        self.assertEqual(message["custom_model"]["reasoning_effort"], "extra_high")
-        self.assertEqual(trace["reasoning_effort_applied"], "extra_high")
+        self.assertNotIn("reasoning_effort", message["custom_model"])
+        self.assertNotIn("reasoning_effort_level", message["custom_model"])
+        self.assertNotIn("reasoning_effort_applied", trace)

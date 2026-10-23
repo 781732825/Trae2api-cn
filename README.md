@@ -78,7 +78,7 @@ helper 使用 `pip install -r requirements-native.txt`。Linux relay 镜像只�
 
 每个 `v*.*.*` 标签会由 GitHub Actions 自动完成测试、源码包发布和
 GHCR 镜像构建。也可以在仓库的 **Actions → Release and container image →
-Run workflow** 手动执行，默认会构建 `v1.0.9`。部署机器不需要安装 Python、
+Run workflow** 手动执行，默认会构建 `v1.0.10`。部署机器不需要安装 Python、
 Node 或本项目源码，只需要 Docker、Docker Compose 和一个 `.env` 文件：
 
 ```bash
@@ -89,7 +89,7 @@ docker compose -f docker-compose.image.yml up -d
 
 镜像以公开 GHCR 包发布，支持 `linux/amd64` 和 `linux/arm64`，无需登录即可
 拉取。需要固定版本时，把 `docker-compose.image.yml` 中的 `:latest` 改为发布页的
-版本标签，例如 `:1.0.9`。更新已有部署时执行
+版本标签，例如 `:1.0.10`。更新已有部署时执行
 `docker compose -f docker-compose.image.yml pull`，再执行
 `docker compose -f docker-compose.image.yml up -d`。
 
@@ -172,7 +172,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `UPSTREAM_MODE` | `remote` | 上游模式：`remote` 为 Trae Remote Agent；`work`/`work-agent` 为 TraeWork Work-tier Remote；`solo`/`ide` 为 TraeCode raw；另有 `cli` / `web`；`raw` 仅供内部诊断 |
 | `TRAE_WEB_SLOT_TIMEOUT` | `60` | 等待账号并发槽位的超时（秒）；所有账号槽位占满时请求排队等待 |
 | `TRAE_VERBOSE_REASONING` | 空 | 设为 `1` 时输出完整思考链；默认只保留压缩后的关键结论 |
-| `TRAE_MAX_COMPLETION_TOKENS` | `64000` | 单次输出 token 上限；Agent 模型最高 64K |
+| `TRAE_MAX_COMPLETION_TOKENS` | `64000` | OpenAI/Anthropic 入站输出预算的 relay 硬上限；不按模型名推断模型能力。上游仍可能按当前账号/tier/function 的 descriptor 施加更低限制；Raw v2 不转发该生成参数 |
 | `TRAEWORK_CUSTOM_UPSTREAM_MODE` | `remote` | TraeWork custom-model/raw 入站使用的上游；默认走已验证的 remote 会话，`raw` 仅保留作原生协议诊断 |
 | `TRAE_CHECKIN_DEVICE_ID` | 空 | 可选的 TraeWork 原生 `guaranteedDeviceId`；配置后签到优先使用真实客户端设备身份 |
 | `TRAE_CHECKIN_DEVICE_IDS_JSON` | 空 | 可选的账号到 TraeWork 设备 ID 的 JSON 映射，优先级高于全局设备 ID |
@@ -191,7 +191,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_AUTO_ROUTE` | `0` | 自动路由默认值，控制台「自动路由」开关保存后以控制台为准；开启后带图片、`tools` / `tool_choice` 或工具历史的请求走 IDE Agent，纯文字聊天走 Remote；失败可回落 Remote，压缩后仍超过 Remote query 上限的图片请求不回落 |
 | `TRAE_AUTO_CHECKIN` | `0` | 定时自动签到默认值，控制台「自动签到」开关保存后以控制台为准 |
 | `TRAE_AUTO_CHECKIN_TIME` | `08:30` | 每日自动签到时间（`HH:MM`，北京时间）；relay 晚于该时间启动时当天会补签一次 |
-| `TRAE_REMOTE_MAX_MODE` | `0` | 默认值，控制台「1M 上下文」开关保存后以控制台为准（写入 `data/accounts.json`，重启后保留）；remote 会话启用 1M Max 模式；对账号配置 `max_mode=true` 的模型注入 `strategy=max` 与 1M/936K/64K 参数，并使用独立的 max 会话 ID |
+| `TRAE_REMOTE_MAX_MODE` | `0` | 默认值，控制台「1M 上下文」开关保存后以控制台为准（写入 `data/accounts.json`，重启后保留）；仅当当前账号与 raw function 的模型 descriptor 明确声明 `max_mode` 及上下文/输出上限时启用 Max，不合成 1M/936K/64K 参数 |
 | `TRAE_REMOTE_MAX_MODELS` | 空 | Max 模型白名单，逗号分隔；留空表示所有 `max_mode=true` 模型生效 |
 | `TRAE_REMOTE_MAX_MODE_TYPE` | `1` | 服务端 `get_model_selection_modes` 的模式枚举；`1` 已实测生效 |
 | `TRAE_REMOTE_AGENT_FIRST` | `1` | remote 是否默认锁定 Agent 执行器；关闭后普通请求直接使用 Work |
@@ -206,7 +206,7 @@ Actions 发布的镜像会把提交 SHA 写入 `RELAY_BUILD_REVISION` 镜像 lab
 | `TRAE_WEB_BASE_URL` | `https://trae-api-cn.mchost.guru/api/remote/v1` | remote 上游端点；`remote` 模式按 9router 的 `chat_sessions` + `events` 协议转发 |
 | `TRAE_CODE_BASE_URL` | `https://trae-api-cn.mchost.guru` | TraeCode IDE / Solo 模型网关主机地址；仅填写主机名，relay 自动追加 `/api/ide/v2/llm_raw_chat`。默认失败会在 TraeCode v1 与已知调度主机间重试；显式自定义主机不会被覆盖。旧变量 `TRAE_MODEL_API_HOST` 仍作为兼容别名 |
 | `TRAE_WORK_BASE_URL` | 空 | 旧版 TraeWork raw 诊断链路的可选网关；正常 `work` 请求使用 `TRAE_WEB_BASE_URL` 的 Remote `chat_sessions` |
-| `TRAE_MODEL_REQUEST_PARALLEL_LIMIT` | `4` | 统一的模型请求与原生工具流并发容量（限制为 1-64）；Web/Remote 按账号限流，Raw/IDE 按模型绑定会话限流。旧变量 `TRAE_WEB_PARALLEL_LIMIT` 仅在新变量未设置时作为兼容别名 |
+| `TRAE_MODEL_REQUEST_PARALLEL_LIMIT` | 空 | 可选的进程级模型请求与原生工具流硬上限（限制为 1-64）；留空时 Web/Remote/Raw/IDE 按账号 entitlement 的 `solo_agent_parallel_limit` 调度，免费或未知账号保守使用 2 槽。旧变量 `TRAE_WEB_PARALLEL_LIMIT` 仅在新变量未设置时作为兼容别名；未登记单 token 链路仍使用兼容默认 4 |
 | `TRAE_WEB_IDLE_TIMEOUT` | `60` | 空闲会话回收超时（秒） |
 | `TRAE_REMOTE_FIRST_EVENT_TIMEOUT_SECONDS` | `120` | remote 会话创建成功但没有首个 SSE 事件时的重试等待；首事件前 EOF/读超时同样按可重试空响应处理，`0` 表示关闭独立首事件期限 |
 | `TRAE_MODEL_LIST_CACHE_TTL` | `300` | `/v1/models` 上游模型列表缓存秒数。列表合并 Remote 的 Agent / Work / Design 目录与 Solo 原生 `get_detail_param` 目录，保留上游精确大小写并为混合大小写配置提供小写别名，条目带 `endpoint`/`endpoints` 并按端点排序；控制类内部模型会隐藏，保留 `auto`；上游拉取失败时回落内置列表 |
@@ -418,7 +418,7 @@ export ANTHROPIC_MODEL=glm-5.3
 
 ## 图片输入
 
-- **图片输入**：`image_url`（OpenAI）与 `image`（Anthropic，base64 或 URL）都会转成 Trae 渲染层媒体块随请求发送。若所选模型不支持视觉，relay 会按账号实际可用的多模态模型自动切换，并在请求追踪中记录 `multimodal_switch`。用 `TRAE_MULTIMODAL_AUTO_SWITCH=0` 关闭，或用 `TRAE_MULTIMODAL_MODEL` 指定目标模型。远程图片 URL 会原样转发给上游，relay 不会代下载；需要确定性输入时请使用 base64 data URL。
+- **图片输入**：`image_url`（OpenAI）与 `image`（Anthropic，base64 或 URL）都会转成 Trae 渲染层媒体块随请求发送。模型是否支持视觉只取当前账号、tier 和 raw function 返回的 descriptor；不会按官方模型名猜测。若 descriptor 明确标记视觉能力，relay 会保留该模型；自动模型可在同一 live catalog 中切换到另一个明确支持视觉的条目，并在请求追踪中记录 `multimodal_switch`。用 `TRAE_MULTIMODAL_AUTO_SWITCH=0` 关闭，或用 `TRAE_MULTIMODAL_MODEL` 指定目标模型。远程图片 URL 会原样转发给上游，relay 不会代下载；需要确定性输入时请使用 base64 data URL。
 - **排队位置**：Trae raw 上游的排队事件按原始兼容协议作为 assistant 状态文本转发，并同时记录到请求元数据；不会额外生成 synthetic SSE keepalive。
 
 ## 网页管理界面
@@ -439,7 +439,7 @@ export ANTHROPIC_MODEL=glm-5.3
 - **端点选择**：不想手动切换时打开「自动路由」；需要工具调用时优先用 IDE Agent 或 Remote。IDE Raw 已从正式控制台和打包预设中移除，个人账号不要选择 `UPSTREAM_MODE=raw`。切换端点或开关后无需重启，立即生效。
 - **截断处理**：relay 不会自动续写或隐式重放模型请求；收到 `finish_reason=length` 或上游提前断流时，由调用端决定是否发起下一轮，避免重复消费和工具回合错乱。
 - **上下文长度**：remote 扁平化 query 约 500K 字符时上游会静默断流，relay 默认在 480K 字符处裁剪最早的历史。长会话建议客户端自行压缩上下文。
-- **并发**：`TRAE_MODEL_REQUEST_PARALLEL_LIMIT` 默认 4（旧 `TRAE_WEB_PARALLEL_LIMIT` 仍可兼容）；Web/Remote 按账号分配槽位，Raw/IDE 的模型绑定会话和原生工具流使用同一容量。原生请求从打开连接到响应关闭始终占用槽位，取消等待或清理迟到响应不会提前释放或重复释放。多个 bot 同时请求时开启多账号轮询，请求会分散到不同账号；Web/Remote 槽位全满时排队，超过 `TRAE_WEB_SLOT_TIMEOUT` 返回错误。该值只控制 relay 本地容量，上游仍可能按账号实施更低限制并返回 4011/429，此时应增加可轮询账号或下调容量。
+- **并发**：账号记录会保存 entitlement 返回的 `user_pay_identity`、`user_pay_identity_str` 和 `quota.solo_agent_parallel_limit`；免费或未知账号默认 2 槽，付费账号使用服务返回的实际额度。所有账号的 Web、Remote、Raw、IDE 和原生工具流共用账号池；可选 `TRAE_MODEL_REQUEST_PARALLEL_LIMIT` 只作为进程级硬上限。积分优先模式按剩余积分及可用槽位分配新请求，续接会话固定原账号；每个请求使用唯一槽位 lease，关闭、取消和重试只释放自己的槽位。上游仍可能实施更低限制并返回 4011/429，此时会在首个模型事件前轮换到未尝试账号。
 - **签到 9074**：9074 是上游风控码。relay 会自动轮换签到设备 ID 并指数退避重试，无需手动反复点击；若长期失败，可在 `TRAE_CHECKIN_DEVICE_IDS_JSON` 中填入真实客户端的设备 ID。
 - **自动签到**：定时签到按顺序逐个账号执行，已签到和无凭证的账号会跳过，账号之间沿用 `TRAE_CHECKIN_INTERVAL_SECONDS` 间隔，遇到 9074 的账号交给后台退避重试。时间以北京时间计算，每天只触发一次定时任务；「立即执行」不会占用当天的定时任务。
 - **用量统计**：缓存 tokens 仅在上游返回时统计，旧记录按 0 计；日期按北京时间划分，最多保留 400 天。

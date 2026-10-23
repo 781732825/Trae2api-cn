@@ -24,6 +24,7 @@ import string
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -38,7 +39,14 @@ from .cli_client import (
     sanitize_assistant_history_messages,
     tool_result_is_failed,
 )
-from .model_limits import clamp_max_completion_tokens
+from .model_limits import (
+    clamp_max_completion_tokens,
+    descriptor_max_context,
+    descriptor_multimodal,
+    descriptor_reasoning_config,
+    descriptor_supports_max_mode,
+)
+from .reasoning_effort import supported_levels
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +185,84 @@ _DEVICE_BRANDS = ["92L3", "91C9", "814S", "8P15V", "35G4", "65G4", "55G4"]
 _WEB_SLOTS: dict[str, asyncio.Semaphore] = {}
 _WEB_LEASES: dict[str, dict] = {}
 _WEB_MODEL_CACHE: dict[str, tuple[float, dict[str, dict]]] = {}
+# Accounts present in the auth store use the entitlement-backed reservation
+# ledger.  Unknown ids retain the legacy semaphore path for compatibility with
+# single-token deployments and older integrations.
+_ACCOUNT_SLOT_RESERVATIONS: dict[str, int] = {}
+_ACCOUNT_SLOT_RESERVATIONS_LOCK = threading.Lock()
+# A count keyed only by account cannot identify which transport owns a slot.
+# Keep an opaque request lease for every entitlement-backed acquisition.  The
+# context variable lets teardown code preserve the historical one-argument
+# ``release_web_slot(account_id)`` call shape while still passing ownership to
+# the real release implementation (and to old mocks in the test suite).
+_ACCOUNT_SLOT_LEASE_OWNERS: dict[str, tuple[str, int | None]] = {}
+_ACCOUNT_SLOT_RELEASE_TOKEN: ContextVar[str] = ContextVar(
+    "trae_account_slot_release_token", default=""
+)
+
+
+def _uses_entitlement_slot(account_id: str) -> bool:
+    """Return true only for an account persisted in the auth store.
+
+    Some integrations monkeypatch ``get_account_record`` to provide a bound
+    credential without registering it in the account store.  Those legacy
+    calls must continue using the local semaphore fallback.
+    """
+    account_id = str(account_id or "")
+    if not account_id:
+        return False
+    try:
+        return bool(auth.resolve_model_account_id(account_id))
+    except Exception:
+        return False
+
+
+def _entitlement_slot_key(account_id: str) -> str:
+    return auth.resolve_model_account_id(account_id) or str(account_id or "")
+
+
+def _current_task_id() -> int | None:
+    """Return the current asyncio task identity, if called from an event loop."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return id(task) if task is not None else None
+
+
+def _owned_slot_token(account_id: str) -> str:
+    """Find a slot acquired by this task when legacy teardown omits its token."""
+    task_id = _current_task_id()
+    if task_id is None:
+        return ""
+    with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+        matches = [
+            token
+            for token, (owner, owner_task_id) in _ACCOUNT_SLOT_LEASE_OWNERS.items()
+            if owner == account_id and owner_task_id == task_id
+        ]
+    # A task should release its own leases explicitly when it owns more than
+    # one; do not guess in that case.
+    return matches[0] if len(matches) == 1 else ""
+
+
+def release_web_slot_owned(account_id: str = "", lease_token: str = "") -> None:
+    """Release a slot while retaining the legacy one-argument call contract.
+
+    ``release_web_slot`` is patched by several integrations and older tests.
+    Passing the token through a context variable means those patches continue
+    to observe one positional argument, while the concrete implementation can
+    enforce request ownership.
+    """
+    lease_token = str(lease_token or "")
+    if not lease_token:
+        release_web_slot(account_id)
+        return
+    marker = _ACCOUNT_SLOT_RELEASE_TOKEN.set(lease_token)
+    try:
+        release_web_slot(account_id)
+    finally:
+        _ACCOUNT_SLOT_RELEASE_TOKEN.reset(marker)
 
 
 def _configured_model_request_parallel_limit(
@@ -229,6 +315,23 @@ def _web_model_cache_key(token: str = "", user_id_override: str = "") -> str:
         return "token:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     return str(auth.get_user_id() or "default")
+
+
+def _model_catalog_cache_key(
+    token: str = "",
+    user_id_override: str = "",
+    *,
+    agent_type: str = "",
+    raw_chat_function: str = "",
+) -> str:
+    """Scope live model metadata to one account and executor function."""
+
+    account = _web_model_cache_key(token, user_id_override)
+    tier = str(agent_type or "default").strip().lower() or "default"
+    function = (
+        str(raw_chat_function or "default").strip().lower() or "default"
+    )
+    return f"{account}:{tier}:{function}"
 
 
 def _tool_protocol_requested(
@@ -840,18 +943,90 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
     This is needed because req_source=2 returns ALL packs (same as req_source=0),
     not just work-specific packs.
     """
+    # ``solo_agent_parallel_limit`` is an account entitlement, not a relay
+    # default.  Keep parsing it alongside credits so the account scheduler can
+    # use the same snapshot that the desktop client uses.  Older responses may
+    # put the quota below ``product_extra.subscription_extra``.
+    data = data if isinstance(data, dict) else {}
     packs = data.get("user_entitlement_pack_list") or []
     total_limit = Decimal(0)
     used = Decimal(0)
     unlimited = False
+    parallel_limits: list[int] = []
+    entitlement_packs: list[dict[str, Any]] = []
+
+    def _number(value: Any) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            value = int(Decimal(str(value).strip()))
+        except (InvalidOperation, ValueError, TypeError, AttributeError):
+            return None
+        return value if value >= 1 else None
+
+    def _inactive(status: Any) -> bool:
+        # Keep unknown status values: some API versions use numeric enums that
+        # are not present in the desktop bundle.  Only clearly terminal states
+        # are excluded from the active entitlement calculation.
+        text = str(status or "").strip().lower()
+        # Canceled (3) can retain benefits until the paid period ends.
+        return text in {"expired", "terminated", "inactive", "4", "5"}
+
+    def _pay_identity() -> tuple[Any, str]:
+        raw_identity = data.get("user_pay_identity")
+        if raw_identity is None:
+            raw_identity = data.get("userPayIdentity")
+        text_identity = data.get("user_pay_identity_str")
+        if text_identity is None:
+            text_identity = data.get("userPayIdentityText")
+        # A few gateway revisions wrap the commercial status.
+        status = data.get("pay_status") or data.get("payStatus") or data.get("commercial_pay_status")
+        if isinstance(status, dict):
+            if raw_identity is None:
+                raw_identity = status.get("user_pay_identity", status.get("userPayIdentity"))
+            if text_identity is None:
+                text_identity = status.get("user_pay_identity_str", status.get("userPayIdentityText"))
+        return raw_identity, str(text_identity or "").strip()
+
+    pay_identity, pay_identity_text = _pay_identity()
     for pack in packs:
+        if not isinstance(pack, dict):
+            continue
         bi = pack.get("entitlement_base_info") or {}
+        if not isinstance(bi, dict):
+            bi = {}
         ae = bi.get("available_endpoint", -1)
         # If filtering by endpoint, skip packs that don't match
         if available_endpoint_filter is not None and ae != available_endpoint_filter:
             continue
         usage = pack.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
         quota = bi.get("quota") or {}
+        if not isinstance(quota, dict):
+            quota = {}
+        if not quota:
+            extra = bi.get("product_extra") or {}
+            if isinstance(extra, dict):
+                subscription = extra.get("subscription_extra") or {}
+                if isinstance(subscription, dict):
+                    quota = subscription.get("quota") or {}
+                    if not isinstance(quota, dict):
+                        quota = {}
+        if not _inactive(pack.get("status")):
+            parallel = _number(quota.get("solo_agent_parallel_limit"))
+            if parallel is not None:
+                parallel_limits.append(parallel)
+            entitlement_packs.append(
+                {
+                    "entitlement_id": bi.get("entitlement_id"),
+                    "product_id": bi.get("product_id"),
+                    "product_type": bi.get("product_type"),
+                    "source_id": pack.get("source_id"),
+                    "status": pack.get("status"),
+                    "solo_agent_parallel_limit": parallel,
+                }
+            )
         limit = _credit_decimal(quota.get("credits_limit"))
         if limit is None:
             continue  # skip feature-only packs (product_type=0)
@@ -863,6 +1038,10 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
         if amount >= 0:
             used += amount
     remaining = None if unlimited else max(total_limit - used, Decimal(0))
+    # The service can expose several active packs (for example a base plan and
+    # an add-on).  The effective concurrent-session entitlement is the largest
+    # active value; there is no reliable plan-name -> fixed-number table.
+    parallel_limit = max(parallel_limits) if parallel_limits else None
     return {
         "total_limit": -1 if unlimited else _json_credit_number(total_limit),
         "used": _json_credit_number(used),
@@ -870,6 +1049,15 @@ def parse_account_credits(data: dict, available_endpoint_filter: int = None) -> 
         "unlimited": unlimited,
         "is_credits_billing": bool(data.get("is_credits_billing")),
         "packs": len(packs),
+        "user_pay_identity": pay_identity,
+        "user_pay_identity_str": pay_identity_text,
+        "pay_identity": pay_identity,
+        "pay_identity_str": pay_identity_text,
+        "account_tier": pay_identity_text or (str(pay_identity) if pay_identity is not None else ""),
+        "solo_agent_parallel_limit": parallel_limit,
+        "model_parallel_limit": parallel_limit,
+        "entitlement_packs": entitlement_packs,
+        "entitlement_updated_at": time.time(),
     }
 
 
@@ -1370,18 +1558,109 @@ def _web_slot(account_id: str = "") -> asyncio.Semaphore:
 
 
 def web_slot_available(account_id: str = "") -> bool:
+    account_id = str(account_id or "")
+    if _uses_entitlement_slot(account_id):
+        account_id = _entitlement_slot_key(account_id)
+        snapshot = auth.account_capacity_snapshot(account_id)
+        return snapshot.get("available", 0) > 0
     return not _web_slot(account_id).locked()
 
 
-async def acquire_web_slot(account_id: str = "", timeout: float = 60.0) -> None:
+async def acquire_web_slot(
+    account_id: str = "",
+    timeout: float = 60.0,
+    reservation_id: str = "",
+) -> str:
+    """Acquire capacity and return an opaque lease token for teardown.
+
+    Persisted accounts require the returned token when releasing the slot.
+    Legacy semaphore-backed identities return an empty token.
+    """
+    account_id = str(account_id or "")
+    if _uses_entitlement_slot(account_id):
+        account_id = _entitlement_slot_key(account_id)
+        # ``auth.reserve_model_account`` may have selected and reserved this
+        # account before the transport was built.  Transfer that reservation
+        # instead of incrementing the live count a second time.
+        # A reservation id is part of the request lease.  Never consume an
+        # arbitrary reservation when a direct/legacy caller omitted it: doing
+        # so could transfer another in-flight request's slot to this one.
+        if reservation_id and auth.consume_account_slot_reservation(
+            account_id, reservation_id
+        ):
+            lease_token = str(reservation_id)
+            with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+                _ACCOUNT_SLOT_RESERVATIONS[account_id] = (
+                    _ACCOUNT_SLOT_RESERVATIONS.get(account_id, 0) + 1
+                )
+                _ACCOUNT_SLOT_LEASE_OWNERS[lease_token] = (
+                    account_id,
+                    _current_task_id(),
+                )
+            return lease_token
+        # A retry may have rebound the request to a different account before
+        # the first transport consumed its scheduler reservation.  Remove that
+        # exact old reservation before allocating a fresh slot; otherwise the
+        # old account remains permanently occupied.
+        if reservation_id:
+            auth.cancel_account_slot_reservation("", reservation_id)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if auth.try_reserve_account_slot(account_id):
+                lease_token = uuid.uuid4().hex
+                with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+                    _ACCOUNT_SLOT_RESERVATIONS[account_id] = (
+                        _ACCOUNT_SLOT_RESERVATIONS.get(account_id, 0) + 1
+                    )
+                    _ACCOUNT_SLOT_LEASE_OWNERS[lease_token] = (
+                        account_id,
+                        _current_task_id(),
+                    )
+                return lease_token
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Trae account session slot busy: parallel limit reached")
+            await asyncio.sleep(min(0.025, remaining))
+    if reservation_id:
+        # Unknown-account compatibility paths cannot transfer an entitlement
+        # reservation, but they still must not leak one supplied by a bound
+        # request.
+        auth.cancel_account_slot_reservation("", reservation_id)
     sem = _web_slot(account_id)
     try:
         await asyncio.wait_for(sem.acquire(), timeout=timeout)
     except asyncio.TimeoutError:
         raise RuntimeError("Trae web session slot busy: parallel limit reached")
+    return ""
 
 
-def release_web_slot(account_id: str = "") -> None:
+def release_web_slot(account_id: str = "", lease_token: str = "") -> None:
+    account_id = str(account_id or "")
+    entitlement_slot = _uses_entitlement_slot(account_id)
+    if entitlement_slot:
+        account_id = _entitlement_slot_key(account_id)
+        lease_token = str(
+            lease_token
+            or _ACCOUNT_SLOT_RELEASE_TOKEN.get()
+            or _owned_slot_token(account_id)
+            or ""
+        )
+        owned_account_slot = False
+        with _ACCOUNT_SLOT_RESERVATIONS_LOCK:
+            owner = _ACCOUNT_SLOT_LEASE_OWNERS.get(lease_token)
+            if owner is not None and owner[0] == account_id:
+                owned_account_slot = True
+                _ACCOUNT_SLOT_LEASE_OWNERS.pop(lease_token, None)
+                count = _ACCOUNT_SLOT_RESERVATIONS.get(account_id, 0)
+                if count == 1:
+                    _ACCOUNT_SLOT_RESERVATIONS.pop(account_id, None)
+                elif count > 1:
+                    _ACCOUNT_SLOT_RESERVATIONS[account_id] = count - 1
+        if owned_account_slot:
+            auth.release_account_slot(account_id)
+        # A known account must never fall through to a legacy semaphore or
+        # release a different request's aggregate counter.
+        return
     _web_slot(account_id).release()
 
 
@@ -1392,6 +1671,7 @@ def register_web_lease(
     client: httpx.AsyncClient,
     token: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
+    slot_lease_token: str = "",
 ) -> None:
     _WEB_LEASES[session_id] = {
         "account_id": account_id,
@@ -1400,6 +1680,7 @@ def register_web_lease(
         "client": client,
         "token": token,
         "provider_specific": dict(provider_specific or {}),
+        "slot_lease_token": str(slot_lease_token or ""),
         "last_activity": time.monotonic(),
     }
 
@@ -1474,7 +1755,9 @@ async def reap_idle_web_sessions() -> int:
                     except Exception:
                         pass
             finally:
-                release_web_slot(lease["account_id"])
+                release_web_slot_owned(
+                    lease["account_id"], lease.get("slot_lease_token") or ""
+                )
 
     count = 0
     for lease in idle_web_leases():
@@ -1513,7 +1796,7 @@ async def reap_idle_web_sessions() -> int:
 
 
 
-def _build_web_model_config(raw: dict) -> dict:
+def _build_web_model_config(raw: dict, raw_chat_function: str = "") -> dict:
     """Keep the model object the web frontend would send as custom_model."""
     cfg = dict(raw)
     features = cfg.get("features")
@@ -1522,6 +1805,14 @@ def _build_web_model_config(raw: dict) -> dict:
             cfg["features"] = json.loads(features)
         except Exception:
             cfg["features"] = {}
+    reasoning_config = cfg.get("reasoning_effort_config")
+    if isinstance(reasoning_config, str):
+        try:
+            parsed_reasoning = json.loads(reasoning_config)
+        except (TypeError, ValueError):
+            parsed_reasoning = None
+        if isinstance(parsed_reasoning, Mapping):
+            cfg["reasoning_effort_config"] = dict(parsed_reasoning)
     # Some catalog revisions use ``name`` for the display label while
     # carrying the exact wire identifier in ``config_name`` or
     # ``model_name``.  Preserve the raw fields, but always materialize the
@@ -1548,7 +1839,17 @@ def _build_web_model_config(raw: dict) -> dict:
     )
     cfg["config_source"] = cfg.get("config_source") or 1
     cfg["provider"] = cfg.get("provider") or ""
-    cfg["multimodal"] = bool(cfg.get("multimodal"))
+    # Capability flags are evidence from the live catalog, not defaults.  In
+    # particular, ``multimodal: null`` and a missing field must remain
+    # unknown; coercing either to False loses the distinction between a
+    # text-only model and a catalog revision that did not expose the flag.
+    if raw_chat_function and not cfg.get("raw_chat_function"):
+        cfg["raw_chat_function"] = str(raw_chat_function)
+    multimodal = descriptor_multimodal(cfg)
+    if multimodal is not None:
+        cfg["multimodal"] = multimodal
+    elif "multimodal" in cfg and cfg.get("multimodal") is None:
+        cfg.pop("multimodal", None)
     cfg["ak"] = cfg.get("ak") or ""
     cfg["sk"] = cfg.get("sk") or ""
     cfg["base_url"] = cfg.get("base_url") or ""
@@ -1557,10 +1858,36 @@ def _build_web_model_config(raw: dict) -> dict:
     return cfg
 
 
+def _descriptor_capabilities(descriptor: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only capabilities proven by this exact Trae descriptor."""
+
+    capabilities: dict[str, Any] = {}
+    multimodal = descriptor_multimodal(descriptor)
+    if multimodal is not None:
+        capabilities["multimodal"] = multimodal
+
+    reasoning = descriptor_reasoning_config(descriptor)
+    if reasoning is not None:
+        support_thinking = reasoning.get("support_thinking")
+        if support_thinking is False:
+            capabilities["reasoning_effort"] = []
+        elif support_thinking is True and "options" in reasoning:
+            capabilities["reasoning_effort"] = supported_levels(descriptor)
+
+    max_mode = descriptor.get("max_mode")
+    if max_mode is False:
+        capabilities["max_mode"] = False
+    elif max_mode is True and descriptor_supports_max_mode(descriptor):
+        capabilities["max_mode"] = True
+        capabilities["max_context"] = descriptor_max_context(descriptor)
+    return capabilities
+
+
 async def _fetch_web_model_configs(
     token_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
+    raw_chat_function: str = "",
 ) -> dict[str, dict]:
     """Fetch the same model list used by the Trae web client."""
     base = remote_base_url()
@@ -1603,9 +1930,32 @@ async def _fetch_web_model_configs(
         if not isinstance(group, Mapping):
             return
         endpoint = _catalog_endpoint(_group_function(group))
+        group_function = _group_function(group)
         for raw in group.get("models", []):
             if not isinstance(raw, Mapping):
                 continue
+            entry_function = str(
+                raw.get("raw_chat_function")
+                or raw.get("rawChatFunction")
+                or group.get("raw_chat_function")
+                or requested_function
+                or group_function
+                or ""
+            ).strip()
+            if requested_function:
+                raw_function_value = str(
+                    raw.get("raw_chat_function")
+                    or raw.get("rawChatFunction")
+                    or group.get("raw_chat_function")
+                    or ""
+                ).strip().lower()
+                if raw_function_value:
+                    if raw_function_value != requested_function:
+                        continue
+                elif group_function != requested_function:
+                    # A descriptor with no function evidence cannot be
+                    # borrowed for a different requested function.
+                    continue
             # ``name`` is the config id in current responses, but older
             # payloads used it for a display label and supplied the exact
             # request id in ``config_name``.  Index by the canonical config
@@ -1622,8 +1972,18 @@ async def _fetch_web_model_configs(
             ).strip()
             if not name:
                 continue
+            config = _build_web_model_config(raw, entry_function)
+            config["_trae_agent_type"] = group_function
+            # Prefer the descriptor's exact raw function.  A single product
+            # group can carry multiple functions (for example chat_v3 and
+            # solo_agent); collapsing them to the group would leak one
+            # function's capabilities into the other.
+            scope = entry_function or group_function
+            if scope:
+                config["_trae_capabilities_by_scope"] = {
+                    scope: _descriptor_capabilities(config)
+                }
             if name not in out:
-                config = _build_web_model_config(raw)
                 config["_trae_endpoints"] = [endpoint]
                 out[name] = config
                 continue
@@ -1631,6 +1991,17 @@ async def _fetch_web_model_configs(
             # the preferred config payload selected above, but retain every
             # endpoint where the account advertises it for /v1/models.
             current = out[name]
+            # Preserve the first descriptor's capability values, but retain
+            # the exact function/tier that produced it for diagnostics and
+            # downstream request binding.
+            current.setdefault("raw_chat_function", entry_function)
+            current.setdefault("_trae_agent_type", group_function)
+            current_scopes = current.setdefault("_trae_capabilities_by_scope", {})
+            incoming_scopes = config.get("_trae_capabilities_by_scope")
+            if isinstance(current_scopes, dict) and isinstance(incoming_scopes, Mapping):
+                for scope_name, capabilities in incoming_scopes.items():
+                    if isinstance(capabilities, Mapping):
+                        current_scopes[str(scope_name)] = dict(capabilities)
             endpoints = current.get("_trae_endpoints")
             if not isinstance(endpoints, list):
                 endpoints = []
@@ -1646,6 +2017,7 @@ async def _fetch_web_model_configs(
 
     groups = data.get("data", {}).get("list", [])
     requested = str(agent_type or "").strip().lower()
+    requested_function = str(raw_chat_function or "").strip().lower()
     # Keep each agent tier separate.  Agent carries the 1M profile while Work
     # remains the 200K fallback; selecting by tier must not reuse the Agent
     # config from the account cache.
@@ -1670,11 +2042,31 @@ async def _fetch_web_model_configs(
         agent_remote = [g for g in groups if _group_function(g) == "solo_agent_remote"]
         agent_lite = [g for g in groups if _group_function(g) == "solo_agent_lite"]
         preferred = agent_remote + agent_lite
+    # A raw function can be more specific than the product tier (for example
+    # ``chat_v3`` and ``solo_agent`` can both be advertised by Agent).  Keep
+    # only groups carrying that exact function when the caller supplied one;
+    # never borrow a same-name model from another function.
+    if requested_function:
+        function_groups = [
+            g for g in preferred
+            if _group_function(g) == requested_function
+            or str(g.get("raw_chat_function") or "").strip().lower() == requested_function
+        ]
+        if function_groups:
+            preferred = function_groups
+        elif requested:
+            # The endpoint may return one tier group whose individual model
+            # entries carry raw_chat_function.  Ingest it and filter entries
+            # below rather than silently selecting an unrelated function.
+            pass
+        # With no explicit tier, the preferred Agent groups may likewise
+        # contain per-model raw function labels.  Keep them for _ingest_models
+        # to filter instead of returning an unscoped model.
     for group in preferred:
         _ingest_models(group)
     # For the default Agent lookup, preserve the historical fallback to Work;
     # an explicit Work lookup must stay in the Work tier.
-    if not requested:
+    if not requested and not requested_function:
         for group in groups:
             _ingest_models(group)
     return out
@@ -1684,6 +2076,7 @@ async def _fetch_solo_model_configs(
     token_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     user_id_override: str = "",
+    raw_chat_function: str = "solo_work_lite",
 ) -> dict[str, dict]:
     """Fetch the native Solo catalog from ``get_detail_param``.
 
@@ -1698,8 +2091,11 @@ async def _fetch_solo_model_configs(
         return {}
     base = _model_gateway_base()
     url = f"{base}/api/ide/v1/get_detail_param"
+    requested_function = (
+        str(raw_chat_function or "solo_work_lite").strip() or "solo_work_lite"
+    )
     body = {
-        "function": "solo_work_lite",
+        "function": requested_function,
         "config_names": None,
         "need_prompt": False,
         "current_config_info": None,
@@ -1787,6 +2183,9 @@ async def _fetch_solo_model_configs(
         normalized = dict(raw)
         normalized["name"] = config_name
         normalized["config_name"] = config_name
+        normalized["raw_chat_function"] = str(
+            normalized.get("raw_chat_function") or requested_function
+        )
         # ``model_name`` is the upstream provider id, not always the config
         # name.  The native gateway returns the exact id in
         # ``model_detail_list`` (for example ``glm-5__dev`` or
@@ -1817,10 +2216,16 @@ async def _fetch_solo_model_configs(
             or display_config.get("display_name")
             or config_name
         )
-        normalized["max_mode"] = bool(
-            normalized.get("max_mode") or display_config.get("max_mode")
-        )
-        config = _build_web_model_config(normalized)
+        if normalized.get("max_mode") is None:
+            if display_config.get("max_mode") is not None:
+                normalized["max_mode"] = display_config.get("max_mode")
+            else:
+                normalized.pop("max_mode", None)
+        config = _build_web_model_config(normalized, requested_function)
+        config["_trae_raw_chat_function"] = requested_function
+        config["_trae_capabilities_by_scope"] = {
+            requested_function: _descriptor_capabilities(config)
+        }
         # Native TraeCode's catalog is shared by the public IDE and Solo
         # endpoint presets.  Keep both identities on the entry so discovery
         # can group the model without duplicating the upstream config.
@@ -1899,25 +2304,37 @@ async def resolve_traecode_model_config(
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     max_mode: bool = False,
+    raw_chat_function: str = "solo_work_lite",
 ) -> Optional[dict[str, Any]]:
     """Resolve a TraeCode config and its exact function-ready model id.
 
     The native IDE/Solo endpoint rejects TraeWork ids such as ``glm-5__v2``.
     Its own catalog is authoritative and returns the provider id in
     ``model_detail_list``.  This helper deliberately leaves the selected
-    function out of the catalog request because the endpoint's
-    ``solo_work_lite`` metadata response contains the shared model entries for
-    both ``chat_v3`` and ``solo_agent``.
+    The catalog is function-scoped: the same public model can expose different
+    image, reasoning, and context capabilities in ``chat_v3``, ``solo_agent``
+    and Work.  Query the exact function selected for this request.
     """
 
     token = str(token_override or auth.get_token() or "").strip()
     if not token:
         return None
-    configs = await _fetch_solo_model_configs(
-        token_override=token,
-        provider_specific=provider_specific,
-        user_id_override=str(user_id_override or ""),
-    )
+    solo_kwargs: dict[str, Any] = {
+        "token_override": token,
+        "provider_specific": provider_specific,
+        "user_id_override": str(user_id_override or ""),
+        "raw_chat_function": raw_chat_function,
+    }
+    try:
+        configs = await _fetch_solo_model_configs(**solo_kwargs)
+    except TypeError as exc:
+        # Keep compatibility with integrations that monkeypatch the old
+        # three-argument probe while the production resolver uses the scoped
+        # function parameter.
+        if "raw_chat_function" not in str(exc):
+            raise
+        solo_kwargs.pop("raw_chat_function", None)
+        configs = await _fetch_solo_model_configs(**solo_kwargs)
     config = _traecode_model_match(configs, model_name)
     if not config:
         return None
@@ -1945,6 +2362,9 @@ async def resolve_traecode_model_config(
         config.get("display_name")
         or config.get("display_model_name")
         or config_name
+    )
+    result["raw_chat_function"] = str(
+        result.get("raw_chat_function") or raw_chat_function or ""
     )
     return result
 
@@ -1995,6 +2415,7 @@ async def _get_web_custom_model(
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
+    raw_chat_function: str = "",
 ) -> Optional[dict]:
     """Return custom_model for a manual web model selection.
 
@@ -2006,7 +2427,12 @@ async def _get_web_custom_model(
     if not model_name:
         return None
     token = token_override or auth.get_token()
-    account_key = _web_model_cache_key(token, user_id_override) + ":" + str(agent_type or "default")
+    account_key = _model_catalog_cache_key(
+        token,
+        user_id_override,
+        agent_type=agent_type,
+        raw_chat_function=raw_chat_function,
+    )
     now = time.time()
     cached = _WEB_MODEL_CACHE.get(account_key)
     if not cached or now - cached[0] > _WEB_MODEL_CACHE_TTL:
@@ -2015,6 +2441,8 @@ async def _get_web_custom_model(
             fetch_kwargs["provider_specific"] = provider_specific
         if agent_type:
             fetch_kwargs["agent_type"] = agent_type
+        if raw_chat_function:
+            fetch_kwargs["raw_chat_function"] = raw_chat_function
         configs = await _fetch_web_model_configs(token, **fetch_kwargs)
         # Only pay the extra native-Solo lookup when the requested config is
         # absent from Remote. This keeps normal model resolution on the fast
@@ -2025,7 +2453,14 @@ async def _get_web_custom_model(
             for name, candidate in configs.items()
         )
         if not found and not agent_type:
-            solo_configs = await _fetch_solo_model_configs(token, **fetch_kwargs)
+            solo_kwargs: dict[str, Any] = {}
+            if provider_specific is not None:
+                solo_kwargs["provider_specific"] = provider_specific
+            if user_id_override:
+                solo_kwargs["user_id_override"] = user_id_override
+            if raw_chat_function:
+                solo_kwargs["raw_chat_function"] = raw_chat_function
+            solo_configs = await _fetch_solo_model_configs(token, **solo_kwargs)
             if isinstance(solo_configs, Mapping):
                 for name, config in solo_configs.items():
                     configs.setdefault(name, config)
@@ -2068,7 +2503,6 @@ async def _get_web_custom_model(
             "display_name": model_name,
             "config_source": 3,
             "provider": "custom_openai_compatible",
-            "multimodal": lowered.startswith("mimo"),
             "is_preset": False,
             "use_remote_service": True,
             "ak": "", "sk": "", "base_url": "", "region": None, "auth_type": 0,
@@ -2084,6 +2518,7 @@ async def resolve_model_config(
     user_id_override: str = "",
     provider_specific: Optional[Mapping[str, Any]] = None,
     agent_type: str = "",
+    raw_chat_function: str = "",
 ) -> Optional[dict]:
     """Resolve a public/display model label to Trae's exact config object."""
 
@@ -2095,7 +2530,62 @@ async def resolve_model_config(
         kwargs["provider_specific"] = provider_specific
     if agent_type:
         kwargs["agent_type"] = agent_type
+    if raw_chat_function:
+        kwargs["raw_chat_function"] = raw_chat_function
     return await _get_web_custom_model(model_name, **kwargs)
+
+
+async def get_scoped_model_configs(
+    *,
+    token_override: str = "",
+    user_id_override: str = "",
+    provider_specific: Optional[Mapping[str, Any]] = None,
+    agent_type: str = "",
+    raw_chat_function: str = "",
+) -> dict[str, dict]:
+    """Return the live catalog for one account and executor function.
+
+    This is intentionally narrower than :func:`get_models`: callers making a
+    capability decision must not use the merged public model list as evidence
+    for a different account, tier, or raw function.
+    """
+
+    token = str(token_override or auth.get_token() or "").strip()
+    if not token:
+        return {}
+    cache_key = _model_catalog_cache_key(
+        token,
+        user_id_override,
+        agent_type=agent_type,
+        raw_chat_function=raw_chat_function,
+    )
+    now = time.time()
+    cached = _WEB_MODEL_CACHE.get(cache_key)
+    if cached and now - cached[0] <= _WEB_MODEL_CACHE_TTL:
+        return cached[1]
+
+    web_kwargs: dict[str, Any] = {
+        "token_override": token,
+        "agent_type": agent_type,
+        "raw_chat_function": raw_chat_function,
+    }
+    if provider_specific is not None:
+        web_kwargs["provider_specific"] = provider_specific
+    configs = await _fetch_web_model_configs(**web_kwargs)
+    if not configs and not agent_type:
+        solo_kwargs: dict[str, Any] = {
+            "token_override": token,
+            "user_id_override": user_id_override,
+            "raw_chat_function": raw_chat_function or "solo_work_lite",
+        }
+        if provider_specific is not None:
+            solo_kwargs["provider_specific"] = provider_specific
+        configs = await _fetch_solo_model_configs(**solo_kwargs)
+    if configs:
+        _WEB_MODEL_CACHE[cache_key] = (now, configs)
+    else:
+        _WEB_MODEL_CACHE.pop(cache_key, None)
+    return configs
 
 
 async def create_web_session(
@@ -2152,6 +2642,13 @@ async def create_web_session(
         }
         if agent_type != "solo_agent_remote" or requested_agent_type:
             lookup_kwargs["agent_type"] = agent_type
+        raw_function = str(
+            options.get("raw_chat_function")
+            or options.get("_traecode_raw_chat_function")
+            or agent_type
+        ).strip()
+        if raw_function:
+            lookup_kwargs["raw_chat_function"] = raw_function
         custom_model = await _get_web_custom_model(model_name, **lookup_kwargs)
         if custom_model:
             initial_message["custom_model"] = custom_model
@@ -2756,7 +3253,11 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
         slot_timeout = float(os.environ.get("TRAE_WEB_SLOT_TIMEOUT", "60"))
     except (TypeError, ValueError):
         slot_timeout = 60.0
-    await acquire_web_slot(slot_account_id, timeout=max(0.0, slot_timeout))
+    slot_lease_token = await acquire_web_slot(
+        slot_account_id,
+        timeout=max(0.0, slot_timeout),
+        reservation_id=str(options.get("_account_slot_reservation_id") or ""),
+    )
     slot_released = False
     slot_handed_off = False
     slot_release_lock = threading.Lock()
@@ -2767,7 +3268,7 @@ async def send_chat_request(messages: list[dict], model: str, stream: bool, opti
             if slot_released:
                 return
             slot_released = True
-        release_web_slot(slot_account_id)
+        release_web_slot_owned(slot_account_id, slot_lease_token)
 
     # When a synchronous send runs in a worker thread, cancellation cannot
     # stop that thread. Keep the slot occupied until the worker has returned
@@ -3051,6 +3552,7 @@ def _model_item(
     endpoint: str = "fallback",
     endpoints: Optional[list[str]] = None,
     alias_for: str = "",
+    capabilities_by_scope: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """Build an OpenAI model object with relay discovery metadata.
 
@@ -3082,6 +3584,12 @@ def _model_item(
     }
     if alias_for:
         item["alias_for"] = alias_for
+    if isinstance(capabilities_by_scope, Mapping) and capabilities_by_scope:
+        item["capabilities_by_scope"] = {
+            str(scope): dict(capabilities)
+            for scope, capabilities in capabilities_by_scope.items()
+            if isinstance(capabilities, Mapping)
+        }
     return item
 
 
@@ -3131,6 +3639,7 @@ def _merge_model_item(
     *,
     endpoints: list[str],
     alias_for: str = "",
+    capabilities_by_scope: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Insert/merge one exact or alias id while retaining endpoint metadata."""
 
@@ -3144,6 +3653,7 @@ def _merge_model_item(
             endpoint=endpoints[0] if endpoints else "remote",
             endpoints=endpoints,
             alias_for=alias_for,
+            capabilities_by_scope=capabilities_by_scope,
         )
         return
     merged = list(current.get("endpoints") or [])
@@ -3158,6 +3668,12 @@ def _merge_model_item(
     current["endpoint_groups"] = groups
     if alias_for and not current.get("alias_for"):
         current["alias_for"] = alias_for
+    if isinstance(capabilities_by_scope, Mapping) and capabilities_by_scope:
+        existing = current.setdefault("capabilities_by_scope", {})
+        if isinstance(existing, dict):
+            for scope, capabilities in capabilities_by_scope.items():
+                if isinstance(capabilities, Mapping):
+                    existing[str(scope)] = dict(capabilities)
 
 
 async def get_models(force: bool = False) -> list[dict]:
@@ -3229,7 +3745,16 @@ async def get_models(force: bool = False) -> list[dict]:
             if exact.lower() in _HIDDEN_INTERNAL_MODEL_IDS:
                 continue
             endpoints = catalog_endpoints or _catalog_endpoints(config)
-            _merge_model_item(items_by_id, exact, created, endpoints=endpoints)
+            capabilities_by_scope = config.get("_trae_capabilities_by_scope")
+            if not isinstance(capabilities_by_scope, Mapping):
+                capabilities_by_scope = None
+            _merge_model_item(
+                items_by_id,
+                exact,
+                created,
+                endpoints=endpoints,
+                capabilities_by_scope=capabilities_by_scope,
+            )
             lowered = exact.lower()
             if lowered != exact:
                 _UPSTREAM_MODEL_CASE[lowered] = exact
@@ -3239,6 +3764,7 @@ async def get_models(force: bool = False) -> list[dict]:
                     created,
                     endpoints=endpoints,
                     alias_for=exact,
+                    capabilities_by_scope=capabilities_by_scope,
                 )
     if not items_by_id:
         # Not cached, so the next request retries the upstream list.

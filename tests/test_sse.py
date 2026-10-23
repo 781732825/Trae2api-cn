@@ -1958,6 +1958,98 @@ class WebEventTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "download")
 
+    def test_interleaved_plan_sessions_keep_reused_tool_ids_isolated(self):
+        async def events():
+            # Both remote sessions reuse call-1/index 0. The first call is
+            # split around the complete second call to reproduce the upstream
+            # interleaving that previously produced invalid JSON.
+            yield "plan_item", {
+                "eventSessionId": "session-a",
+                "planItemId": "plan-a",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Read",
+                    "parameters": '{"path":"a.txt"',
+                },
+            }
+            yield "plan_item", {
+                "eventSessionId": "session-b",
+                "planItemId": "plan-b",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Write",
+                    "parameters": '{"path":"b.txt"}',
+                },
+            }
+            yield "plan_item", {
+                "eventSessionId": "session-a",
+                "planItemId": "plan-a",
+                "tool_call_info": {
+                    "toolCallId": "call-1",
+                    "toolCallName": "Read",
+                    "parameters": "}",
+                },
+            }
+            yield "done", {}
+
+        tools = [
+            {"type": "function", "function": {"name": "Read"}},
+            {"type": "function", "function": {"name": "Write"}},
+        ]
+        chunks = asyncio.run(
+            _collect(
+                sse.translate_web_events(
+                    events(),
+                    "deepseek-v4.1-flash",
+                    allowed_tools=tools,
+                    parallel_tool_calls=True,
+                )
+            )
+        )
+        parsed, done = _parse_chunks(chunks)
+        self.assertTrue(done)
+        calls = [
+            call
+            for event in parsed
+            for choice in event.get("choices", [])
+            for call in choice.get("delta", {}).get("tool_calls", [])
+        ]
+        names = {
+            call["index"]: call["function"]["name"]
+            for call in calls
+            if call.get("function", {}).get("name")
+        }
+        ids = {call["id"] for call in calls if call.get("id")}
+        fragments = {index: [] for index in names}
+        for call in calls:
+            arguments = call.get("function", {}).get("arguments", "")
+            if arguments:
+                fragments[call["index"]].append(arguments)
+        self.assertEqual(list(names.values()), ["Read", "Write"])
+        self.assertEqual(len(ids), 2)
+        by_name = {
+            names[index]: json.loads("".join(parts))
+            for index, parts in fragments.items()
+        }
+        self.assertEqual(by_name, {"Read": {"path": "a.txt"}, "Write": {"path": "b.txt"}})
+
+        result = asyncio.run(
+            sse.collect_nonstream_web(
+                events(),
+                "deepseek-v4.1-flash",
+                allowed_tools=tools,
+                parallel_tool_calls=True,
+            )
+        )
+        result_calls = result["choices"][0]["message"]["tool_calls"]
+        self.assertEqual(
+            {
+                call["function"]["name"]: json.loads(call["function"]["arguments"])
+                for call in result_calls
+            },
+            {"Read": {"path": "a.txt"}, "Write": {"path": "b.txt"}},
+        )
+
     def test_web_hyphenated_keepalive_is_ignored(self):
         async def events():
             yield "keep-alive", {"message": "heartbeat"}
